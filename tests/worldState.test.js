@@ -6,6 +6,7 @@ import {
   captureWorldState,
   cloneWorldState,
   decodeWorldStateJson,
+  MAX_RACE_LEG,
   MAX_WORLD_STATE_BYTES,
 } from '../src/net/worldState.js';
 
@@ -327,6 +328,13 @@ test('world-state schema accepts only explicit race-state enum values', () => {
   snapshot.race.state = 'teleporting';
 
   assert.throws(() => cloneWorldState(snapshot), /prestart.*racing.*finished/i);
+});
+
+test('world-state schema rejects race legs beyond the canonical course', () => {
+  const { snapshot } = captureFixture();
+  snapshot.race.entries[0].leg = MAX_RACE_LEG + 1;
+
+  assert.throws(() => cloneWorldState(snapshot), /leg.*between 0 and 5/i);
 });
 
 test('decodeWorldStateJson enforces the 64 KiB encoded payload limit before parsing', () => {

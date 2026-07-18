@@ -124,6 +124,11 @@ export class IntegrityMonitor {
         return outcome('invalidated', [`schema: ${errorText(error)}`]);
       }
 
+      const authorizationReasons = this.#authorizationReasons(snapshot, authorization);
+      if (authorizationReasons.length > 0) {
+        return outcome('invalidated', authorizationReasons);
+      }
+
       const stateReasons = this.#stateReasons(snapshot);
       if (stateReasons.length > 0) return outcome('invalidated', stateReasons);
 
@@ -135,6 +140,42 @@ export class IntegrityMonitor {
     } catch (error) {
       return outcome('invalidated', [`schema: ${errorText(error)}`]);
     }
+  }
+
+  #authorizationReasons(snapshot, authorization) {
+    const reasons = [];
+    if (Object.hasOwn(authorization ?? {}, 'expectedBoatIds')) {
+      if (!Array.isArray(authorization.expectedBoatIds)) {
+        reasons.push('authorized roster must be an array');
+      } else {
+        const expected = new Set(authorization.expectedBoatIds);
+        const actual = new Set(snapshot.boats.map((boat) => boat.boatId));
+        addReason(reasons, !sameSet(expected, actual), 'world state does not match authorized roster');
+      }
+    }
+    if (Object.hasOwn(authorization ?? {}, 'expectedSeed')) {
+      addReason(
+        reasons,
+        !Object.is(snapshot.seed, authorization.expectedSeed),
+        'world state does not match authorized seed',
+      );
+    }
+    if (Object.hasOwn(authorization ?? {}, 'expectedStartTick')) {
+      const startTick = authorization.expectedStartTick;
+      if (!Number.isSafeInteger(startTick) || startTick < 0) {
+        reasons.push('authorized start tick must be a non-negative safe integer');
+      } else {
+        const elapsedTicks = snapshot.tick - startTick;
+        const expectedWorldTime = elapsedTicks / this.#tickRate;
+        addReason(
+          reasons,
+          elapsedTicks < 0
+            || Math.abs(snapshot.worldTime - expectedWorldTime) > this.#maxTickTimeDrift,
+          `tick/worldTime does not match the authorized 60 Hz start timeline`,
+        );
+      }
+    }
+    return reasons;
   }
 
   #classifyEnvelope(candidate, authorization) {

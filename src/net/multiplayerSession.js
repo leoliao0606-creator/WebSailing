@@ -1,5 +1,9 @@
 import { IntegrityMonitor } from './integrityMonitor.js';
-import { validatePeerMessage } from './protocol.js';
+import {
+  normalizeStartDescriptor,
+  startDescriptorsEqual,
+  validatePeerMessage,
+} from './protocol.js';
 import { cloneWorldState } from './worldState.js';
 
 const AUTHORITY_TYPES = new Set([
@@ -12,6 +16,8 @@ const AUTHORITY_TYPES = new Set([
 
 const GUEST_TYPES = new Set(['control', 'chat', 'rescue-request']);
 const DEFAULT_CHAT_LIMIT = Object.freeze({ maxMessages: 5, windowMs: 5_000 });
+const DEFAULT_MIGRATION_READY_TIMEOUT_MS = 500;
+const MAX_MIGRATION_READY_TIMEOUT_MS = 5_000;
 const MAX_ROLLBACK_SECONDS = 0.5;
 const ROLLBACK_EPSILON = 1e-9;
 const CADENCE_EPSILON = 1e-9;
@@ -86,6 +92,13 @@ function normalizeRoom(value) {
   if (value.phase !== 'lobby' && value.phase !== 'racing') {
     throw new TypeError('room.phase must be lobby or racing');
   }
+  let start = null;
+  if (Object.hasOwn(value, 'start')) {
+    if (value.phase !== 'racing') throw new TypeError('only a racing room may contain start');
+    const normalized = normalizeStartDescriptor(value.start);
+    if (!normalized.ok) throw new TypeError(`room.start is invalid: ${normalized.error}`);
+    start = normalized.value;
+  }
   if (!Array.isArray(value.members) || value.members.length > 8) {
     throw new TypeError('room.members must be an array of at most eight members');
   }
@@ -117,7 +130,7 @@ function normalizeRoom(value) {
   if (hostId !== null && !memberIds.has(hostId)) {
     throw new TypeError('room.hostId must identify a room member');
   }
-  return deepFreeze({ roomCode, hostId, hostEpoch, phase: value.phase, members });
+  return deepFreeze({ roomCode, hostId, hostEpoch, phase: value.phase, start, members });
 }
 
 function playerIdFromSignaling(signaling) {
@@ -131,6 +144,15 @@ function clockFunction(clock) {
   if (typeof clock === 'function') return clock;
   if (clock && typeof clock.now === 'function') return () => clock.now();
   throw new TypeError('clock must be a function or provide now()');
+}
+
+function timerFunctions(timers) {
+  if (!timers
+    || typeof timers.setTimeout !== 'function'
+    || typeof timers.clearTimeout !== 'function') {
+    throw new TypeError('timers must provide setTimeout() and clearTimeout()');
+  }
+  return timers;
 }
 
 function normalizeChatLimit(value) {
@@ -193,6 +215,10 @@ export class MultiplayerSession extends EventTarget {
 
   #chatLimit;
 
+  #timers;
+
+  #migrationReadyTimeoutMs;
+
   #listeners = [];
 
   #playerId;
@@ -206,6 +232,10 @@ export class MultiplayerSession extends EventTarget {
   #invalidated = false;
 
   #raceStarted = false;
+
+  #raceIdentity = null;
+
+  #pendingStartRace = null;
 
   #closed = false;
 
@@ -243,6 +273,8 @@ export class MultiplayerSession extends EventTarget {
 
   #readyPeerIds = new Set();
 
+  #promotionFallback = null;
+
   constructor({
     signaling,
     transport,
@@ -253,6 +285,8 @@ export class MultiplayerSession extends EventTarget {
     snapshotHz = 20,
     checkpointHz = 2,
     chatLimit = DEFAULT_CHAT_LIMIT,
+    timers = globalThis,
+    migrationReadyTimeoutMs = DEFAULT_MIGRATION_READY_TIMEOUT_MS,
   } = {}) {
     super();
     this.#signaling = requireEventTarget(signaling, 'signaling');
@@ -277,6 +311,12 @@ export class MultiplayerSession extends EventTarget {
     );
     this.#checkpointInterval = 1_000 / positiveRate(checkpointHz, 'checkpointHz');
     this.#chatLimit = normalizeChatLimit(chatLimit);
+    this.#timers = timerFunctions(timers);
+    this.#migrationReadyTimeoutMs = positiveRate(
+      migrationReadyTimeoutMs,
+      'migrationReadyTimeoutMs',
+      { minimum: 1, maximum: MAX_MIGRATION_READY_TIMEOUT_MS },
+    );
     this.#playerId = playerIdFromSignaling(signaling);
 
     this.#listen(this.#signaling, 'session', (event) => this.#handleSessionEvent(event));
@@ -302,6 +342,7 @@ export class MultiplayerSession extends EventTarget {
       hostId: this.#room?.hostId ?? null,
       hostEpoch: this.#room?.hostEpoch ?? null,
       phase: this.#room?.phase ?? null,
+      start: this.#room?.start ?? null,
       role: this.#role,
       migrating: this.#migrating,
       invalidated: this.#invalidated,
@@ -401,6 +442,9 @@ export class MultiplayerSession extends EventTarget {
 
   leaveRoom() {
     if (this.#closed) return false;
+    this.#clearPromotionFallback();
+    this.#pendingStartRace = null;
+    this.#raceIdentity = null;
     if (typeof this.#signaling.leave !== 'function') return false;
     return this.#signaling.leave() !== false;
   }
@@ -415,6 +459,9 @@ export class MultiplayerSession extends EventTarget {
     }
     if (connectedMembers.some((member) => !member.ready)) {
       throw new Error('every connected member must be ready before starting the race');
+    }
+    if (this.#room.phase !== 'racing') {
+      throw new Error('room must be locked in racing phase before starting the race');
     }
     if (!isRecord(configOrMessage)) {
       throw new TypeError('startRace configuration must be a plain object');
@@ -448,7 +495,14 @@ export class MultiplayerSession extends EventTarget {
     if (!this.#startRosterMatchesRoom(message.config.roster)) {
       throw new TypeError('start-race roster must exactly match the active room roster');
     }
-    if (this.#raceStarted) throw new Error('race has already started');
+    if (this.#raceStarted) {
+      if (this.#room.start !== null) {
+        const descriptor = { tick: message.tick, seed: message.seed, config: message.config };
+        if (startDescriptorsEqual(this.#room.start, descriptor)) return true;
+        throw new Error('start-race does not match the authoritative room descriptor');
+      }
+      throw new Error('race has already started');
+    }
     const guestIds = connectedMembers
       .map((member) => member.playerId)
       .filter((playerId) => playerId !== this.#playerId);
@@ -458,6 +512,7 @@ export class MultiplayerSession extends EventTarget {
     }
     const accepted = this.#transport.broadcast(message, { reliable: true });
     if (accepted === false) return false;
+    this.#setRaceIdentityFromStart(message);
     this.#raceStarted = true;
     this.#dispatch('start-race', {
       hostEpoch: message.hostEpoch,
@@ -472,6 +527,8 @@ export class MultiplayerSession extends EventTarget {
     if (this.#closed) return;
     this.#closed = true;
     this.#migrating = false;
+    this.#raceIdentity = null;
+    this.#clearPromotionFallback();
     for (const [target, type, listener] of this.#listeners) {
       target.removeEventListener(type, listener);
     }
@@ -687,6 +744,13 @@ export class MultiplayerSession extends EventTarget {
       });
       return;
     }
+    if (previousRoom?.roomCode === nextRoom.roomCode
+      && previousRoom.start !== null
+      && nextRoom.start !== null
+      && !startDescriptorsEqual(previousRoom.start, nextRoom.start)) {
+      this.#invalidate(['authoritative start descriptor changed after the room began racing']);
+      return;
+    }
 
     const changedRoom = previousRoom && previousRoom.roomCode !== nextRoom.roomCode;
     if (changedRoom) this.#resetForRoom();
@@ -711,9 +775,17 @@ export class MultiplayerSession extends EventTarget {
       : (nextRoom.hostId === this.#playerId ? 'host' : 'guest');
     this.#role = nextRole;
 
+    if (nextRoom.start !== null && !this.#raceStarted) {
+      this.#startGuestRace({ hostEpoch: nextRoom.hostEpoch, ...nextRoom.start });
+    }
+
     const epochChanged = previousEpoch !== null && previousEpoch !== nextRoom.hostEpoch;
     const hostChanged = previousRoom !== null && previousRoom.hostId !== nextRoom.hostId;
     const roleChanged = previousRole !== nextRole;
+    if (changedRoom || epochChanged || hostChanged || roleChanged) {
+      this.#clearPromotionFallback();
+    }
+    if (changedRoom || epochChanged || hostChanged) this.#pendingStartRace = null;
     if (!changedRoom && (epochChanged || hostChanged || roleChanged)) {
       this.#resetIntegrityMonitors();
     }
@@ -742,6 +814,8 @@ export class MultiplayerSession extends EventTarget {
       this.#rescueSeqBySource.clear();
       this.#chatTimesBySource.clear();
     }
+
+    this.#flushPendingStartRace();
 
     this.#reconcileTopology();
     this.#dispatch('statechange', this.state);
@@ -781,21 +855,26 @@ export class MultiplayerSession extends EventTarget {
       });
       return;
     }
-    this.#applyRoom(normalizeRoom({
+    const nextRoom = {
       roomCode: this.#room.roomCode,
       hostId: detail.hostId,
       hostEpoch: detail.hostEpoch,
       phase: this.#room.phase,
       members,
-    }));
+    };
+    if (this.#room.start !== null) nextRoom.start = this.#room.start;
+    this.#applyRoom(normalizeRoom(nextRoom));
   }
 
   #resetForRoom() {
+    this.#clearPromotionFallback();
     this.#latestCheckpoint = null;
     this.#latestAuthorityWorldTime = null;
     this.#promotedEpoch = null;
     this.#invalidated = false;
     this.#raceStarted = false;
+    this.#raceIdentity = null;
+    this.#pendingStartRace = null;
     this.#migrating = false;
     this.#controlSeq = 0;
     this.#rescueSeq = 0;
@@ -841,11 +920,22 @@ export class MultiplayerSession extends EventTarget {
       this.#latestCheckpoint = null;
       this.#latestAuthorityWorldTime = null;
       this.#migrating = true;
+      if (!this.#schedulePromotionFallback()) return;
       this.#dispatch('promote', { checkpoint: null });
       return;
     }
     const checkpoint = this.#latestCheckpoint;
     if (!checkpoint || checkpoint.hostEpoch !== previousEpoch) {
+      const authorityTime = this.#latestAuthorityWorldTime ?? 0;
+      if (this.#raceStarted
+        && this.#room.start !== null
+        && authorityTime <= MAX_ROLLBACK_SECONDS + ROLLBACK_EPSILON) {
+        this.#latestCheckpoint = null;
+        this.#migrating = true;
+        if (!this.#schedulePromotionFallback()) return;
+        this.#dispatch('promote', { checkpoint: null });
+        return;
+      }
       this.#invalidate(['host migration requires a checkpoint from the previous host epoch']);
       return;
     }
@@ -863,7 +953,51 @@ export class MultiplayerSession extends EventTarget {
     migrated.hostEpoch = this.#room.hostEpoch;
     this.#latestCheckpoint = immutableWorldState(migrated);
     this.#migrating = true;
+    if (!this.#schedulePromotionFallback()) return;
     this.#dispatch('promote', { checkpoint: this.#latestCheckpoint });
+  }
+
+  #schedulePromotionFallback() {
+    this.#clearPromotionFallback();
+    const pending = {
+      id: null,
+      roomCode: this.#room?.roomCode ?? null,
+      hostEpoch: this.#room?.hostEpoch ?? null,
+    };
+    this.#promotionFallback = pending;
+    try {
+      pending.id = this.#timers.setTimeout(() => {
+        if (this.#promotionFallback !== pending) return;
+        this.#promotionFallback = null;
+        if (this.#closed
+          || this.#invalidated
+          || !this.#migrating
+          || this.#role !== 'host'
+          || this.#room?.roomCode !== pending.roomCode
+          || this.#room?.hostEpoch !== pending.hostEpoch) return;
+        this.#finishPromotion(pending.hostEpoch, { allowPartial: true });
+      }, this.#migrationReadyTimeoutMs);
+      pending.id?.unref?.();
+      return true;
+    } catch (error) {
+      if (this.#promotionFallback === pending) this.#promotionFallback = null;
+      this.#invalidate([
+        `host migration fallback timer failed: ${error instanceof Error ? error.message : String(error)}`,
+      ]);
+      return false;
+    }
+  }
+
+  #clearPromotionFallback() {
+    const pending = this.#promotionFallback;
+    if (pending === null) return;
+    this.#promotionFallback = null;
+    if (pending.id === null) return;
+    try {
+      this.#timers.clearTimeout(pending.id);
+    } catch {
+      // The identity guard above still makes a retained callback harmless.
+    }
   }
 
   #reconcileTopology(room = this.#room) {
@@ -926,7 +1060,7 @@ export class MultiplayerSession extends EventTarget {
     this.#finishPromotion(event?.detail?.hostEpoch);
   }
 
-  #finishPromotion(hostEpoch) {
+  #finishPromotion(hostEpoch, { allowPartial = false } = {}) {
     if (!this.#migrating || hostEpoch !== this.#room?.hostEpoch) return;
     try {
       const tick = this.#latestCheckpoint?.tick ?? this.#latestTick;
@@ -952,17 +1086,28 @@ export class MultiplayerSession extends EventTarget {
         : this.#room.members
           .filter((member) => member.connected && member.playerId !== this.#playerId)
           .map((member) => member.playerId);
-      if (typeof this.#transport.canBroadcastReliable !== 'function'
-        || this.#transport.canBroadcastReliable(messages, { playerIds }) !== true) {
-        this.#readyPeerIds.clear();
-        return;
-      }
-      for (const message of messages) {
-        if (this.#transport.broadcast(message, { reliable: true }) === false) {
+      if (!allowPartial) {
+        if (typeof this.#transport.canBroadcastReliable !== 'function'
+          || this.#transport.canBroadcastReliable(messages, { playerIds }) !== true) {
           this.#readyPeerIds.clear();
           return;
         }
+        for (const message of messages) {
+          if (this.#transport.broadcast(message, { reliable: true }) === false) {
+            this.#readyPeerIds.clear();
+            return;
+          }
+        }
+      } else {
+        for (const message of messages) {
+          try {
+            this.#transport.broadcast(message, { reliable: true });
+          } catch {
+            // Continue the bounded fallback; later checkpoints repair lagging guests.
+          }
+        }
       }
+      this.#clearPromotionFallback();
       this.#migrating = false;
       this.#dispatch('migration-ready', {
         hostEpoch: this.#room.hostEpoch,
@@ -992,6 +1137,11 @@ export class MultiplayerSession extends EventTarget {
     const validated = validatePeerMessage(rawMessage, this.#room.hostEpoch);
     if (!validated.ok) {
       this.#rejectMessage(validated.error, sourceId, rawMessage?.type);
+      if (this.#isMalformedActiveAuthorityState(sourceId, rawMessage)) {
+        this.#invalidate([
+          `malformed authoritative ${rawMessage.type}: ${validated.error}`,
+        ]);
+      }
       return;
     }
     const message = validated.value;
@@ -1012,6 +1162,16 @@ export class MultiplayerSession extends EventTarget {
     return this.#room.members.some((member) => (
       member.playerId === playerId && member.connected
     ));
+  }
+
+  #isMalformedActiveAuthorityState(sourceId, rawMessage) {
+    return this.#role === 'guest'
+      && isRecord(rawMessage)
+      && (rawMessage.type === 'snapshot' || rawMessage.type === 'checkpoint')
+      && sourceId === this.#room.hostId
+      && this.#isConnectedMember(sourceId)
+      && rawMessage.roomCode === this.#room.roomCode
+      && rawMessage.hostEpoch === this.#room.hostEpoch;
   }
 
   #handleGuestMessage(sourceId, message, reliable) {
@@ -1072,7 +1232,7 @@ export class MultiplayerSession extends EventTarget {
       return;
     }
     if (message.type === 'snapshot' || message.type === 'checkpoint') {
-      this.#inspectAuthorityState(message);
+      this.#inspectAuthorityState(message, sourceId);
       return;
     }
     if (message.type === 'chat-delivery') {
@@ -1085,6 +1245,11 @@ export class MultiplayerSession extends EventTarget {
     }
     if (message.type === 'start-race') {
       if (this.#raceStarted) {
+        if (this.#room.start !== null && startDescriptorsEqual(this.#room.start, {
+          tick: message.tick,
+          seed: message.seed,
+          config: message.config,
+        })) return;
         this.#rejectMessage('race has already started', sourceId, message.type);
         return;
       }
@@ -1096,13 +1261,15 @@ export class MultiplayerSession extends EventTarget {
         );
         return;
       }
-      this.#raceStarted = true;
-      this.#dispatch('start-race', {
-        hostEpoch: message.hostEpoch,
-        tick: message.tick,
-        seed: message.seed,
-        config: message.config,
-      });
+      if (this.#room.phase !== 'racing') {
+        if (this.#pendingStartRace === null) {
+          this.#pendingStartRace = { sourceId, message };
+        } else {
+          this.#rejectMessage('a start-race message is already pending room lock', sourceId, message.type);
+        }
+        return;
+      }
+      this.#startGuestRace(message);
       return;
     }
     this.#dispatch('host-ready', {
@@ -1126,7 +1293,29 @@ export class MultiplayerSession extends EventTarget {
     return true;
   }
 
-  #inspectAuthorityState(message) {
+  #setRaceIdentityFromStart(message) {
+    if (this.#raceIdentity !== null) return false;
+    const expectedBoatIds = [
+      ...message.config.roster.map(({ playerId }) => playerId),
+      ...Array.from({ length: message.config.aiFill }, (_, index) => `ai:${index}`),
+    ];
+    this.#raceIdentity = Object.freeze({
+      expectedBoatIds: Object.freeze(expectedBoatIds),
+      expectedSeed: message.seed,
+      expectedStartTick: message.tick,
+    });
+    return true;
+  }
+
+  #inspectAuthorityState(message, sourceId) {
+    if (this.#raceIdentity === null) {
+      this.#rejectMessage(
+        'authoritative state requires accepted start-race metadata',
+        sourceId,
+        message.type,
+      );
+      return;
+    }
     let outcome;
     try {
       const monitor = message.type === 'checkpoint'
@@ -1134,6 +1323,9 @@ export class MultiplayerSession extends EventTarget {
         : this.#integrityMonitor;
       outcome = monitor.inspect(message.state, {
         expectedEpoch: this.#room.hostEpoch,
+        expectedBoatIds: this.#raceIdentity.expectedBoatIds,
+        expectedSeed: this.#raceIdentity.expectedSeed,
+        expectedStartTick: this.#raceIdentity.expectedStartTick,
       });
     } catch (error) {
       this.#invalidate([`integrity monitor failed: ${error instanceof Error ? error.message : String(error)}`]);
@@ -1169,6 +1361,32 @@ export class MultiplayerSession extends EventTarget {
     } else {
       this.#dispatch('snapshot', { snapshot });
     }
+  }
+
+  #flushPendingStartRace() {
+    if (this.#pendingStartRace === null || this.#room?.phase !== 'racing') return false;
+    const pending = this.#pendingStartRace;
+    this.#pendingStartRace = null;
+    if (this.#role !== 'guest'
+      || pending.sourceId !== this.#room.hostId
+      || pending.message.roomCode !== this.#room.roomCode
+      || pending.message.hostEpoch !== this.#room.hostEpoch
+      || !this.#isConnectedMember(pending.sourceId)
+      || !this.#startRosterMatchesRoom(pending.message.config.roster)
+      || this.#raceStarted) return false;
+    this.#startGuestRace(pending.message);
+    return true;
+  }
+
+  #startGuestRace(message) {
+    this.#setRaceIdentityFromStart(message);
+    this.#raceStarted = true;
+    this.#dispatch('start-race', {
+      hostEpoch: message.hostEpoch,
+      tick: message.tick,
+      seed: message.seed,
+      config: message.config,
+    });
   }
 
   #relayChat(sourceId, text) {
@@ -1231,6 +1449,7 @@ export class MultiplayerSession extends EventTarget {
     if (this.#invalidated) return;
     this.#invalidated = true;
     this.#migrating = false;
+    this.#clearPromotionFallback();
     const normalized = Array.isArray(reasons) && reasons.length > 0
       ? reasons.map(String)
       : ['multiplayer session was invalidated'];

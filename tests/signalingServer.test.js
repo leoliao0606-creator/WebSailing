@@ -100,6 +100,26 @@ function send(socket, message) {
   socket.send(JSON.stringify(message));
 }
 
+function startDescriptor(hostSession, guestSession, tick = 0) {
+  const countdown = 30;
+  return {
+    tick,
+    seed: 'recoverable-race',
+    config: {
+      windPsi: 0.35,
+      windKn: 14,
+      gustiness: 0.3,
+      countdown,
+      startTick: tick + countdown * 60,
+      roster: [
+        { playerId: hostSession.playerId, nickname: 'Host' },
+        { playerId: guestSession.playerId, nickname: 'Guest' },
+      ],
+      aiFill: 2,
+    },
+  };
+}
+
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -221,12 +241,17 @@ test('only the ready host can lock a room and racing rejects late joins', async 
   await host.inbox.next((message) => (
     message.type === 'ready-changed' && message.playerId === guestSession.playerId
   ));
+  const start = startDescriptor(hostSession, guestSession);
 
-  send(guest.socket, { type: 'lock-room' });
+  send(host.socket, { type: 'lock-room' });
+  const malformed = await host.inbox.next((message) => message.type === 'error');
+  assert.equal(malformed.code, 'INVALID_MESSAGE');
+
+  send(guest.socket, { type: 'lock-room', start });
   const denied = await guest.inbox.next((message) => message.type === 'error');
   assert.equal(denied.code, 'NOT_HOST');
 
-  send(host.socket, { type: 'lock-room' });
+  send(host.socket, { type: 'lock-room', start });
   const hostLocked = await host.inbox.next((message) => message.type === 'room-locked');
   const guestLocked = await guest.inbox.next((message) => message.type === 'room-locked');
   assert.deepEqual(hostLocked, {
@@ -234,12 +259,14 @@ test('only the ready host can lock a room and racing rejects late joins', async 
     roomCode: hostSession.roomCode,
     playerId: hostSession.playerId,
     phase: 'racing',
+    start,
   });
   assert.deepEqual(guestLocked, hostLocked);
   const racingView = await host.inbox.next((message) => (
     message.type === 'room-view' && message.room.phase === 'racing'
   ));
   assert.equal(racingView.room.members.length, 2);
+  assert.deepEqual(racingView.room.start, start);
 
   const late = await connect(instance);
   send(late.socket, {
@@ -248,6 +275,43 @@ test('only the ready host can lock a room and racing rejects late joins', async 
   const rejected = await late.inbox.next((message) => message.type === 'error');
   assert.equal(rejected.code, 'ROOM_IN_PROGRESS');
   await late.inbox.expectNone((message) => message.type === 'session');
+});
+
+test('a racing resume session exposes the immutable lock start after host migration', async (t) => {
+  const instance = await startServer(t, { hostLossMs: 0, reconnectGraceMs: 500 });
+  const host = await connect(instance);
+  const hostSession = await createRoom(host);
+  const guest = await connect(instance);
+  const guestSession = await joinRoom(guest, hostSession.roomCode);
+  send(host.socket, { type: 'set-ready', ready: true });
+  await guest.inbox.next((message) => (
+    message.type === 'ready-changed' && message.playerId === hostSession.playerId
+  ));
+  send(guest.socket, { type: 'set-ready', ready: true });
+  await host.inbox.next((message) => (
+    message.type === 'ready-changed' && message.playerId === guestSession.playerId
+  ));
+  const start = startDescriptor(hostSession, guestSession);
+  send(host.socket, { type: 'lock-room', start });
+  await guest.inbox.next((message) => message.type === 'room-locked');
+
+  await closeSocket(host.socket);
+  const migrated = await guest.inbox.next((message) => (
+    message.type === 'room-view' && message.room.hostId === guestSession.playerId
+  ));
+  assert.deepEqual(migrated.room.start, start);
+
+  const resumed = await connect(instance);
+  send(resumed.socket, {
+    type: 'resume',
+    roomCode: hostSession.roomCode,
+    playerId: hostSession.playerId,
+    resumeToken: hostSession.resumeToken,
+  });
+  const resumedSession = await resumed.inbox.next((message) => message.type === 'session');
+  assert.equal(resumedSession.room.phase, 'racing');
+  assert.deepEqual(resumedSession.room.start, start);
+  assert.equal(resumedSession.room.hostId, guestSession.playerId);
 });
 
 test('targeted WebRTC signals relay only to a peer in the same room', async (t) => {
@@ -357,10 +421,11 @@ test('payloads over 64 KiB close the offending WebSocket', async (t) => {
 
 test('per-socket rate limits reject and close only the flooding client', async (t) => {
   const instance = await startServer(t, {
+    trustProxy: true,
     rateLimit: { maxMessages: 2, windowMs: 10_000 },
   });
-  const flooding = await connect(instance);
-  const healthy = await connect(instance);
+  const flooding = await connect(instance, { headers: { 'x-forwarded-for': '198.51.100.10' } });
+  const healthy = await connect(instance, { headers: { 'x-forwarded-for': '198.51.100.11' } });
   const floodingClosed = once(flooding.socket, 'close');
 
   send(flooding.socket, { type: 'ping' });
@@ -382,6 +447,177 @@ test('per-socket rate limits reject and close only the flooding client', async (
 
   send(healthy.socket, { type: 'ping' });
   assert.deepEqual(await healthy.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
+});
+
+test('unauthenticated address message limits survive reconnects', async (t) => {
+  const options = { headers: { 'x-forwarded-for': '198.51.100.20' } };
+  const instance = await startServer(t, {
+    trustProxy: true,
+    rateLimit: { maxMessages: 2, maxBytes: 64 * 1024, windowMs: 10_000 },
+  });
+  const first = await connect(instance, options);
+  send(first.socket, { type: 'ping' });
+  assert.deepEqual(await first.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
+  await closeSocket(first.socket);
+
+  const second = await connect(instance, options);
+  const closed = once(second.socket, 'close');
+  send(second.socket, { type: 'ping' });
+  send(second.socket, { type: 'ping' });
+  assert.deepEqual(await second.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
+  assert.equal((await second.inbox.next((message) => message.type === 'error')).code, 'RATE_LIMIT');
+  await closed;
+});
+
+test('address message limits remain active after authentication and identity rotation', async (t) => {
+  const options = { headers: { 'x-forwarded-for': '198.51.100.21' } };
+  const instance = await startServer(t, {
+    trustProxy: true,
+    addressRateMultiplier: 1,
+    rateLimit: { maxMessages: 4, maxBytes: 64 * 1024, windowMs: 10_000 },
+  });
+  const first = await connect(instance, options);
+  await createRoom(first);
+  send(first.socket, { type: 'ping' });
+  send(first.socket, { type: 'ping' });
+  await first.inbox.next((message) => message.type === 'pong');
+  await first.inbox.next((message) => message.type === 'pong');
+  await closeSocket(first.socket);
+
+  const second = await connect(instance, options);
+  await createRoom(second);
+  const closed = once(second.socket, 'close');
+  send(second.socket, { type: 'ping' });
+  assert.equal((await second.inbox.next((message) => message.type === 'error')).code, 'RATE_LIMIT');
+  await closed;
+});
+
+test('coarse address limits leave normal same-address player quotas independent', async (t) => {
+  const options = { headers: { 'x-forwarded-for': '198.51.100.24' } };
+  const instance = await startServer(t, {
+    trustProxy: true,
+    rateLimit: { maxMessages: 3, maxBytes: 64 * 1024, windowMs: 10_000 },
+  });
+  const first = await connect(instance, options);
+  const second = await connect(instance, options);
+  await createRoom(first);
+  await createRoom(second);
+
+  for (const client of [first, second]) {
+    send(client.socket, { type: 'ping' });
+    send(client.socket, { type: 'ping' });
+    assert.deepEqual(await client.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
+    assert.deepEqual(await client.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
+  }
+});
+
+test('authenticated byte limits survive a socket reconnect and stop signaling amplification', async (t) => {
+  const instance = await startServer(t, {
+    trustProxy: true,
+    rateLimit: { maxMessages: 120, maxBytes: 600, windowMs: 10_000 },
+  });
+  const first = await connect(instance, {
+    headers: { 'x-forwarded-for': '198.51.100.22' },
+  });
+  const session = await createRoom(first);
+  const offer = {
+    type: 'signal',
+    targetId: session.playerId,
+    data: { type: 'offer', sdp: `v=0\r\n${'a'.repeat(360)}` },
+  };
+
+  send(first.socket, offer);
+  await first.inbox.next((message) => message.type === 'signal');
+  await closeSocket(first.socket);
+
+  const resumed = await connect(instance, {
+    headers: { 'x-forwarded-for': '198.51.100.23' },
+  });
+  send(resumed.socket, {
+    type: 'resume',
+    roomCode: session.roomCode,
+    playerId: session.playerId,
+    resumeToken: session.resumeToken,
+  });
+  await resumed.inbox.next((message) => message.type === 'session');
+  const closed = once(resumed.socket, 'close');
+  send(resumed.socket, offer);
+
+  const error = await resumed.inbox.next((message) => message.type === 'error');
+  assert.equal(error.code, 'RATE_LIMIT');
+  await closed;
+});
+
+test('connection and per-address admission limits reject excess WebSocket upgrades', async (t) => {
+  const totalLimited = await startServer(t, { maxConnections: 1, maxConnectionsPerIp: 10 });
+  await connect(totalLimited);
+  await expectConnectionFailure(totalLimited.signalUrl, {}, 503);
+
+  const addressLimited = await startServer(t, { maxConnections: 10, maxConnectionsPerIp: 1 });
+  await connect(addressLimited);
+  await expectConnectionFailure(addressLimited.signalUrl, {}, 429);
+});
+
+test('forwarded client addresses are trusted only when explicitly enabled', async (t) => {
+  const trusted = await startServer(t, {
+    trustProxy: true,
+    maxConnections: 10,
+    maxConnectionsPerIp: 1,
+  });
+  await connect(trusted, { headers: { 'x-forwarded-for': '198.51.100.30' } });
+  await connect(trusted, { headers: { 'x-forwarded-for': '198.51.100.31' } });
+  await expectConnectionFailure(
+    trusted.signalUrl,
+    { headers: { 'x-forwarded-for': '198.51.100.30' } },
+    429,
+  );
+
+  const untrusted = await startServer(t, { maxConnections: 10, maxConnectionsPerIp: 1 });
+  await connect(untrusted, { headers: { 'x-forwarded-for': '198.51.100.40' } });
+  await expectConnectionFailure(
+    untrusted.signalUrl,
+    { headers: { 'x-forwarded-for': '198.51.100.41' } },
+    429,
+  );
+});
+
+test('trusted forwarded addresses accept proxy-emitted IPv4 and bracketed IPv6 ports', async (t) => {
+  const instance = await startServer(t, {
+    trustProxy: true,
+    maxConnections: 10,
+    maxConnectionsPerIp: 1,
+  });
+  await connect(instance, {
+    headers: { 'x-forwarded-for': '198.51.100.50:54321, 10.0.0.2' },
+  });
+  await expectConnectionFailure(instance.signalUrl, {
+    headers: { 'x-forwarded-for': '198.51.100.50:60000, 10.0.0.2' },
+  }, 429);
+  await connect(instance, {
+    headers: { 'x-forwarded-for': '198.51.100.51:54321, 10.0.0.2' },
+  });
+  await connect(instance, {
+    headers: { 'x-forwarded-for': '[2001:db8::50]:54321, 2001:db8::ffff' },
+  });
+  await expectConnectionFailure(instance.signalUrl, {
+    headers: { 'x-forwarded-for': '[2001:db8::50]:60000, 2001:db8::ffff' },
+  }, 429);
+  await connect(instance, {
+    headers: { 'x-forwarded-for': '[2001:db8::51]:54321, 2001:db8::ffff' },
+  });
+});
+
+test('room capacity is bounded and a rejected creator keeps a usable connection', async (t) => {
+  const instance = await startServer(t, { maxRooms: 1 });
+  const first = await connect(instance);
+  await createRoom(first);
+  const rejected = await connect(instance);
+
+  send(rejected.socket, { type: 'create-room', nickname: 'No capacity' });
+  const error = await rejected.inbox.next((message) => message.type === 'error');
+  assert.equal(error.code, 'SERVER_CAPACITY');
+  send(rejected.socket, { type: 'ping' });
+  assert.deepEqual(await rejected.inbox.next((message) => message.type === 'pong'), { type: 'pong' });
 });
 
 test('WebSocket upgrades require the signal path and an allowed origin', async (t) => {
@@ -474,7 +710,7 @@ test('default heartbeat cadence keeps worst-case host migration within five seco
   }
 });
 
-test('direct server API rejects heartbeat and host-loss settings over five seconds', async () => {
+test('direct server API rejects heartbeat and host-loss settings beyond the reserved detection budget', async () => {
   let acceptedInstance;
   let rejection;
   try {
@@ -736,6 +972,14 @@ test('server entrypoint parses networking environment configuration', () => {
     HOST_LOSS_MS: '2500',
     HEARTBEAT_MS: '750',
     RECONNECT_GRACE_MS: '30000',
+    MAX_CONNECTIONS: '200',
+    MAX_CONNECTIONS_PER_IP: '20',
+    MAX_ROOMS: '100',
+    SIGNAL_RATE_MAX_MESSAGES: '90',
+    SIGNAL_RATE_MAX_BYTES: '131072',
+    SIGNAL_RATE_WINDOW_MS: '1000',
+    SIGNAL_ADDRESS_RATE_MULTIPLIER: '6',
+    TRUST_PROXY: 'true',
   });
 
   assert.deepEqual(config, {
@@ -747,14 +991,61 @@ test('server entrypoint parses networking environment configuration', () => {
     hostLossMs: 2500,
     heartbeatMs: 750,
     reconnectGraceMs: 30000,
+    maxConnections: 200,
+    maxConnectionsPerIp: 20,
+    maxRooms: 100,
+    rateLimit: {
+      maxMessages: 90,
+      maxBytes: 131072,
+      windowMs: 1000,
+    },
+    addressRateMultiplier: 6,
+    trustProxy: true,
   });
+});
+
+test('server entrypoint requires an explicit Boolean TRUST_PROXY value', () => {
+  assert.equal(configFromEnv({ TRUST_PROXY: 'true' }).trustProxy, true);
+  assert.equal(configFromEnv({ TRUST_PROXY: 'false' }).trustProxy, false);
+  assert.throws(() => configFromEnv({ TRUST_PROXY: 'yes' }), /TRUST_PROXY|true|false/i);
+});
+
+test('server entrypoint rejects zero capacity and signaling rate limits', () => {
+  for (const field of [
+    'MAX_CONNECTIONS',
+    'MAX_CONNECTIONS_PER_IP',
+    'MAX_ROOMS',
+    'SIGNAL_RATE_MAX_MESSAGES',
+    'SIGNAL_RATE_MAX_BYTES',
+    'SIGNAL_RATE_WINDOW_MS',
+    'SIGNAL_ADDRESS_RATE_MULTIPLIER',
+  ]) {
+    assert.throws(() => configFromEnv({ [field]: '0' }), /positive|greater|non-zero/i);
+  }
 });
 
 test('server entrypoint defaults keep heartbeat detection plus host loss under five seconds', () => {
   const config = configFromEnv({});
 
   assert.equal(config.heartbeatMs, 1_000);
-  assert.ok((2 * config.heartbeatMs) + config.hostLossMs <= 5_000);
+  assert.ok((2 * config.heartbeatMs) + config.hostLossMs <= 4_500);
+});
+
+test('server reserves the final 500ms of the five-second migration budget for client readiness', async () => {
+  assert.throws(
+    () => configFromEnv({ HEARTBEAT_MS: '1000', HOST_LOSS_MS: '2501' }),
+    /migration.*budget|4500/i,
+  );
+
+  await assert.rejects(
+    createSignalingServer({
+      port: 0,
+      host: '127.0.0.1',
+      heartbeatMs: 1_000,
+      hostLossMs: 2_501,
+    }),
+    /migration.*budget|4500/i,
+  );
 });
 
 test('server entrypoint rejects an over-budget heartbeat configuration without echoing values', () => {

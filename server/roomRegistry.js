@@ -1,5 +1,7 @@
 import { randomBytes as cryptoRandomBytes } from 'node:crypto';
 
+import { normalizeStartDescriptor } from '../src/net/protocol.js';
+
 const ROOM_CODE_LENGTH = 6;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const ROOM_CODE_SAMPLE_LIMIT = Math.floor(256 / ROOM_CODE_ALPHABET.length)
@@ -27,6 +29,8 @@ export class RoomRegistry {
   #players = new Map();
 
   #rooms = new Map();
+
+  get roomCount() { return this.#rooms.size; }
 
   constructor({
     now = Date.now,
@@ -81,6 +85,7 @@ export class RoomRegistry {
       hostId: member.playerId,
       hostEpoch: 1,
       phase: 'lobby',
+      start: null,
       nextJoinOrder: 2,
       members: new Map(),
     };
@@ -285,7 +290,7 @@ export class RoomRegistry {
     return room ? this.#view(room) : null;
   }
 
-  lockRoom(playerId) {
+  lockRoom(playerId, startDescriptor) {
     const member = this.#players.get(playerId);
     if (!member?.roomCode) {
       throw new RoomRegistryError('PLAYER_NOT_FOUND', 'Player is not in a room');
@@ -311,6 +316,32 @@ export class RoomRegistry {
       throw new RoomRegistryError('PLAYERS_NOT_READY', 'Every connected player must be ready');
     }
 
+    const normalizedStart = normalizeStartDescriptor(startDescriptor);
+    if (!normalizedStart.ok) {
+      throw new RoomRegistryError('INVALID_START_DESCRIPTOR', normalizedStart.error);
+    }
+    if (normalizedStart.value.tick !== 0) {
+      throw new RoomRegistryError(
+        'INVALID_START_DESCRIPTOR',
+        'Initial race start tick must be zero',
+      );
+    }
+    const reservedRoster = [...room.members.values()]
+      .sort((left, right) => left.joinOrder - right.joinOrder);
+    const startRoster = normalizedStart.value.config.roster;
+    const rosterMatches = startRoster.length === reservedRoster.length
+      && reservedRoster.every((reserved, index) => (
+        startRoster[index].playerId === reserved.playerId
+        && startRoster[index].nickname === reserved.nickname
+      ));
+    if (!rosterMatches) {
+      throw new RoomRegistryError(
+        'START_ROSTER_MISMATCH',
+        'Start roster must exactly match the reserved room roster',
+      );
+    }
+
+    room.start = normalizedStart.value;
     room.phase = 'racing';
     return {
       room: this.#view(room),
@@ -319,6 +350,7 @@ export class RoomRegistry {
         roomCode: room.roomCode,
         playerId,
         phase: room.phase,
+        start: room.start,
       }],
     };
   }
@@ -380,13 +412,15 @@ export class RoomRegistry {
         isHost: member.playerId === room.hostId,
       }));
 
-    return {
+    const view = {
       roomCode: room.roomCode,
       hostId: room.hostId,
       hostEpoch: room.hostEpoch,
       phase: room.phase,
       members,
     };
+    if (room.phase === 'racing') view.start = room.start;
+    return view;
   }
 
   #hostChangedEvent(room, previousHostId) {

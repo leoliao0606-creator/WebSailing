@@ -474,6 +474,49 @@ test('guest host-clock estimate catches up safely after a five second background
   assert.ok(Math.abs(environments.at(-1).worldTime - 7) < 1e-9);
 });
 
+for (const type of ['snapshot', 'checkpoint']) {
+  test(`${type} hard-rebases a guest when a throttled host falls behind wall-clock extrapolation`, () => {
+    let now = 1_000;
+    const session = new FakeSession('guest');
+    const boats = [makeBoat('player-a'), makeBoat('player-b')];
+    const race = makeRace(boats);
+    const controller = new MultiplayerRaceController({
+      session,
+      boats,
+      race,
+      seed: 'private-race',
+      localPlayerId: 'player-b',
+      tick: 120,
+      startTick: 1_920,
+      worldTime: 2,
+      now: () => now,
+    });
+    session.emit('snapshot', {
+      snapshot: makeCheckpoint(boats, race, {
+        hostEpoch: 1,
+        tick: 120,
+        worldTime: 2,
+      }),
+    });
+
+    now = 6_000;
+    controller.advanceFrame(0.09, { now });
+    assert.equal(controller.tick, 420);
+    assert.ok(Math.abs(controller.worldTime - 7) < 1e-9);
+
+    const authority = makeCheckpoint(boats, race, {
+      hostEpoch: 1,
+      tick: 126,
+      worldTime: 2.1,
+    });
+    session.emit(type, { [type]: authority });
+
+    assert.equal(controller.tick, 126);
+    assert.ok(Math.abs(controller.worldTime - 2.1) < 1e-9);
+    assert.ok(Math.abs(controller.estimatedHostWorldTime(now) - 2.1) < 1e-9);
+  });
+}
+
 test('a reliable checkpoint also rebases the guest authoritative clock', () => {
   let now = 1_000;
   const session = new FakeSession('guest');
@@ -686,6 +729,51 @@ test('promotion applies the latest checkpoint before host fixed-step simulation 
   session.emit('migration-ready', { hostEpoch: 2, tick: 120 });
   assert.equal(controller.advanceFrame(1 / 30, { now: 2_034 }), 2);
   assert.equal(authorityCalls, 2);
+});
+
+test('promotion without a checkpoint restores the complete authoritative start state', () => {
+  const session = new FakeSession('guest');
+  const boats = [makeBoat('player-a'), makeBoat('player-b')];
+  const race = makeRace(boats);
+  const appliedEnvironments = [];
+  const controller = new MultiplayerRaceController({
+    session,
+    boats,
+    race,
+    seed: 'private-race',
+    localPlayerId: 'player-b',
+    tick: 0,
+    startTick: 1_800,
+    worldTime: 0,
+    onApplyEnvironment: (state) => appliedEnvironments.push(structuredClone(state)),
+  });
+  const initialState = controller.captureWorldState(2);
+
+  session.emit('snapshot', {
+    snapshot: makeCheckpoint(boats, race, {
+      tick: 30,
+      worldTime: 0.5,
+      hostEpoch: 1,
+    }),
+  });
+  boats[0].phys.x = 111;
+  boats[0].rudderCmd = 0.75;
+  boats[1].phys.x = 222;
+  boats[1].phys.ctl.sheet = 0.25;
+  race.state = 'racing';
+  race.t = 9;
+  race.entries.get(boats[0]).leg = 1;
+  race.entries.get(boats[0]).splits.push(4.5);
+
+  session.state = { ...session.state, hostEpoch: 2 };
+  session.setRole('host', true);
+  session.emit('promote', { checkpoint: null });
+
+  assert.deepEqual(controller.captureWorldState(2), initialState);
+  assert.equal(controller.tick, 0);
+  assert.equal(controller.worldTime, 0);
+  assert.equal(controller.snapshotBuffer.size, 0);
+  assert.deepEqual(appliedEnvironments.at(-1), initialState);
 });
 
 test('host demotion pauses and accepts a complete new-epoch checkpoint with 0.5s rollback', () => {

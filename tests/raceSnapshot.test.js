@@ -138,6 +138,17 @@ test('RaceManager rejects incomplete or mismatched boatId snapshots before mutat
   assert.deepEqual(race.captureState(), before);
 });
 
+test('RaceManager rejects out-of-course leg indexes before mutation', () => {
+  const boats = [makeBoat('player-a', 5), makeBoat('player-b', 15)];
+  const race = new RaceManager(makeCourse(), boats, 30);
+  const before = race.captureState();
+  const invalid = structuredClone(before);
+  invalid.entries[0].leg = race.course.legs.length;
+
+  assert.throws(() => race.applyState(invalid), /leg.*course/i);
+  assert.deepEqual(race.captureState(), before);
+});
+
 test('race finish messages use the temporary multiplayer nickname', () => {
   const boat = makeBoat('player-a', 5);
   boat.displayName = 'Skipper 七';

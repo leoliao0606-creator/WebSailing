@@ -135,6 +135,8 @@ class FakeSession extends EventTarget {
   constructor() {
     super();
     this.sent = [];
+    this.sendResult = true;
+    this.rateLimitedOnSend = false;
     this.state = {
       roomCode: 'AB2CD9',
       playerId: 'me',
@@ -149,7 +151,13 @@ class FakeSession extends EventTarget {
     };
   }
 
-  sendChat(text) { this.sent.push(text); return true; }
+  sendChat(text) {
+    this.sent.push(text);
+    if (this.rateLimitedOnSend) {
+      this.dispatchEvent(detailEvent('chat-rate-limited', { sourceId: this.state.playerId }));
+    }
+    return this.sendResult;
+  }
   receive(sourceId, text) { this.dispatchEvent(detailEvent('chat', { sourceId, text })); }
   changeRoom(roomCode) {
     this.state = { ...this.state, roomCode };
@@ -298,6 +306,32 @@ test('panel enforces local send-rate feedback and forwards accepted content unch
   assert.equal(session.sent.at(-1), 'after window');
 });
 
+test('a transport send failure is reported as unavailable rather than rate limited', () => {
+  const documentRef = new FakeDocument();
+  const session = new FakeSession();
+  session.sendResult = false;
+  const panel = new ChatPanel({ documentRef, mountRoot: documentRef.body, session });
+
+  assert.equal(panel.send('hello'), false);
+  const error = panel.element.querySelector('[data-testid="chat-error"]').textContent;
+  assert.match(error, /无法|unavailable/i);
+  assert.doesNotMatch(error, /过快|quickly|rate/i);
+});
+
+test('a synchronous authoritative rate-limit signal keeps rate feedback', () => {
+  const documentRef = new FakeDocument();
+  const session = new FakeSession();
+  session.sendResult = false;
+  session.rateLimitedOnSend = true;
+  const panel = new ChatPanel({ documentRef, mountRoot: documentRef.body, session });
+
+  assert.equal(panel.send('hello'), false);
+  assert.match(
+    panel.element.querySelector('[data-testid="chat-error"]').textContent,
+    /过快|quickly|rate/i,
+  );
+});
+
 test('counter uses Unicode characters; Enter sends and Escape blurs without leaking keys', () => {
   const documentRef = new FakeDocument();
   const session = new FakeSession();
@@ -344,9 +378,27 @@ test('IME composition Enter never sends or prevents the composition keystroke', 
 
 test('chat and lobby CSS stay bounded and responsive around the sailing HUD', () => {
   const css = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8');
-  assert.match(css, /\.chat-panel\s*\{/);
-  assert.match(css, /\.multiplayer-screen\s+/);
-  assert.match(css, /max-height:\s*(?:min\(|calc\(|[0-9]+vh)/);
-  assert.match(css, /@media\s*\(max-width:\s*720px\)/);
-  assert.match(css, /\.chat-panel[\s\S]*pointer-events:\s*auto/);
+  const desktop = css.match(/\.chat-panel\s*\{([^}]*)\}/)?.[1] ?? '';
+  const desktopRight = Number(desktop.match(/right:\s*([0-9]+)px/)?.[1]);
+  const desktopClearance = Number(
+    desktop.match(/width:\s*min\(340px,\s*calc\(100vw\s*-\s*([0-9]+)px\)\)/)?.[1],
+  );
+  assert.ok(desktopRight >= 236, 'desktop chat must end left of the right-side HUD circles');
+  assert.ok(
+    desktopClearance >= 464,
+    'desktop chat must also clear the lower-left instruments at the 721px breakpoint',
+  );
+
+  const mobileSource = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
+  const mobile = mobileSource.match(/\.chat-panel\s*\{([^}]*)\}/)?.[1] ?? '';
+  const mobileTop = Number(mobile.match(/top:\s*([0-9]+)px/)?.[1]);
+  const mobileBottom = Number(mobile.match(/bottom:\s*([0-9]+)px/)?.[1]);
+  assert.ok(mobileTop >= 238, 'mobile chat must start below the wind dial');
+  assert.ok(mobileBottom >= 250, 'mobile chat must end above the minimap and instruments');
+
+  for (const height of [560, 720, 844]) {
+    const chatBottom = height - mobileBottom;
+    const minimapTop = height - 232;
+    assert.ok(chatBottom <= minimapTop - 18, `chat overlaps minimap at ${height}px high`);
+  }
 });

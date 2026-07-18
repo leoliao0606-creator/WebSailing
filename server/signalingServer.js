@@ -1,5 +1,6 @@
 import { realpath, readFile, stat } from 'node:fs/promises';
 import http from 'node:http';
+import { isIP } from 'node:net';
 import path from 'node:path';
 
 import { WebSocket, WebSocketServer } from 'ws';
@@ -8,8 +9,17 @@ import { MAX_PLAYERS, validateSignalMessage } from '../src/net/protocol.js';
 import { RoomRegistry, RoomRegistryError } from './roomRegistry.js';
 
 const MAX_PAYLOAD_BYTES = 64 * 1024;
-const DEFAULT_RATE_LIMIT = Object.freeze({ maxMessages: 120, windowMs: 1_000 });
+const DEFAULT_RATE_LIMIT = Object.freeze({
+  maxMessages: 120,
+  maxBytes: 256 * 1024,
+  windowMs: 1_000,
+});
+const DEFAULT_MAX_CONNECTIONS = 1_024;
+const DEFAULT_MAX_CONNECTIONS_PER_IP = 64;
+const DEFAULT_MAX_ROOMS = 512;
 export const MAX_HOST_MIGRATION_MS = 5_000;
+export const MIGRATION_READY_RESERVE_MS = 500;
+export const MAX_HOST_DETECTION_MS = MAX_HOST_MIGRATION_MS - MIGRATION_READY_RESERVE_MS;
 
 const MIME_TYPES = new Map([
   ['.css', 'text/css; charset=utf-8'],
@@ -61,10 +71,22 @@ function normalizeRateLimit(value) {
   if (!Number.isFinite(rateLimit.windowMs) || rateLimit.windowMs <= 0) {
     throw new TypeError('rateLimit.windowMs must be a positive finite number');
   }
+  const maxBytes = rateLimit.maxBytes ?? DEFAULT_RATE_LIMIT.maxBytes;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new TypeError('rateLimit.maxBytes must be a positive safe integer');
+  }
   return Object.freeze({
     maxMessages: rateLimit.maxMessages,
+    maxBytes,
     windowMs: rateLimit.windowMs,
   });
+}
+
+function positiveCapacity(value, field) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${field} must be a positive safe integer`);
+  }
+  return value;
 }
 
 function normalizeAllowedOrigins(value) {
@@ -100,6 +122,33 @@ function normalizeIceServers(value) {
   }));
 }
 
+function forwardedIp(value) {
+  if (isIP(value)) return value;
+
+  const bracketed = /^\[([^\]]+)]:(\d{1,5})$/.exec(value);
+  if (bracketed && isIP(bracketed[1]) === 6) {
+    const port = Number(bracketed[2]);
+    if (port >= 1 && port <= 65_535) return bracketed[1];
+  }
+
+  const ipv4WithPort = /^([^:[\]]+):(\d{1,5})$/.exec(value);
+  if (ipv4WithPort && isIP(ipv4WithPort[1]) === 4) {
+    const port = Number(ipv4WithPort[2]);
+    if (port >= 1 && port <= 65_535) return ipv4WithPort[1];
+  }
+  return null;
+}
+
+function clientAddress(request, trustProxy) {
+  const directAddress = request.socket.remoteAddress ?? 'unknown';
+  if (!trustProxy) return directAddress;
+
+  const forwarded = request.headers['x-forwarded-for'];
+  if (typeof forwarded !== 'string') return directAddress;
+  const candidate = forwarded.split(',', 1)[0].trim();
+  return forwardedIp(candidate) ?? directAddress;
+}
+
 export async function createSignalingServer({
   port = 8787,
   host = '127.0.0.1',
@@ -111,6 +160,11 @@ export async function createSignalingServer({
   rateLimit,
   heartbeatMs = 1_000,
   maxBufferedAmount = 1024 * 1024,
+  maxConnections = DEFAULT_MAX_CONNECTIONS,
+  maxConnectionsPerIp = DEFAULT_MAX_CONNECTIONS_PER_IP,
+  maxRooms = DEFAULT_MAX_ROOMS,
+  addressRateMultiplier = MAX_PLAYERS,
+  trustProxy = false,
   randomBytes,
 } = {}) {
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
@@ -128,13 +182,29 @@ export async function createSignalingServer({
   if (!Number.isFinite(maxBufferedAmount) || maxBufferedAmount < 0) {
     throw new TypeError('maxBufferedAmount must be a non-negative finite number');
   }
-  if ((2 * heartbeatMs) + hostLossMs > MAX_HOST_MIGRATION_MS) {
-    throw new TypeError(`heartbeat and host-loss migration budget cannot exceed ${MAX_HOST_MIGRATION_MS}ms`);
+  if ((2 * heartbeatMs) + hostLossMs > MAX_HOST_DETECTION_MS) {
+    throw new TypeError(`heartbeat and host-loss migration budget cannot exceed ${MAX_HOST_DETECTION_MS}ms`);
+  }
+  positiveCapacity(maxConnections, 'maxConnections');
+  positiveCapacity(maxConnectionsPerIp, 'maxConnectionsPerIp');
+  positiveCapacity(maxRooms, 'maxRooms');
+  positiveCapacity(addressRateMultiplier, 'addressRateMultiplier');
+  if (typeof trustProxy !== 'boolean') {
+    throw new TypeError('trustProxy must be a Boolean');
   }
 
   const origins = normalizeAllowedOrigins(allowedOrigins);
   const clientIceServers = normalizeIceServers(iceServers);
   const messageRateLimit = normalizeRateLimit(rateLimit);
+  const addressRateLimit = Object.freeze({
+    maxMessages: messageRateLimit.maxMessages * addressRateMultiplier,
+    maxBytes: messageRateLimit.maxBytes * addressRateMultiplier,
+    windowMs: messageRateLimit.windowMs,
+  });
+  if (!Number.isSafeInteger(addressRateLimit.maxMessages)
+    || !Number.isSafeInteger(addressRateLimit.maxBytes)) {
+    throw new TypeError('addressRateMultiplier produces an unsafe rate limit');
+  }
   const registryOptions = { reconnectGraceMs };
   if (randomBytes !== undefined) registryOptions.randomBytes = randomBytes;
   const registry = new RoomRegistry(registryOptions);
@@ -154,7 +224,10 @@ export async function createSignalingServer({
   const socketSessions = new Map();
   const playerBindings = new Map();
   const socketRates = new WeakMap();
+  const ingressRates = new Map();
   const socketHealth = new WeakMap();
+  const socketAddresses = new WeakMap();
+  const addressConnections = new Map();
   const pendingHostLosses = new Map();
 
   async function serveStatic(request, response) {
@@ -365,6 +438,9 @@ export async function createSignalingServer({
 
     if (message.type === 'create-room') {
       if (!requireUnauthenticated(socket)) return;
+      if (registry.roomCount >= maxRooms) {
+        throw new RoomRegistryError('SERVER_CAPACITY', 'The signaling server is at room capacity');
+      }
       const player = registry.createPlayer(message.nickname);
       const result = registry.createRoom(player);
       bindSocket(socket, player.playerId, result.roomCode);
@@ -417,7 +493,7 @@ export async function createSignalingServer({
     if (message.type === 'lock-room') {
       const session = requireSession(socket);
       if (!session) return;
-      publishResult(registry.lockRoom(session.playerId));
+      publishResult(registry.lockRoom(session.playerId, message.start));
       return;
     }
 
@@ -455,7 +531,19 @@ export async function createSignalingServer({
     socket.close(1000, 'left room');
   }
 
-  function consumeRateLimit(socket) {
+  function consumeIngress(key, byteLength, limit, now) {
+    let ingress = ingressRates.get(key);
+    if (!ingress || now - ingress.windowStart >= limit.windowMs) {
+      ingress = { windowStart: now, count: 0, bytes: 0, lastSeen: now };
+      ingressRates.set(key, ingress);
+    }
+    ingress.lastSeen = now;
+    ingress.bytes += byteLength;
+    ingress.count += 1;
+    return ingress.bytes <= limit.maxBytes && ingress.count <= limit.maxMessages;
+  }
+
+  function consumeRateLimit(socket, byteLength) {
     const now = Date.now();
     let state = socketRates.get(socket);
     if (!state || now - state.windowStart >= messageRateLimit.windowMs) {
@@ -463,7 +551,24 @@ export async function createSignalingServer({
       socketRates.set(socket, state);
     }
     state.count += 1;
-    return state.count <= messageRateLimit.maxMessages;
+    if (state.count > messageRateLimit.maxMessages) return false;
+
+    const session = socketSessions.get(socket);
+    const address = socketAddresses.get(socket) ?? 'unknown';
+    if (!consumeIngress(`address:${address}`, byteLength, addressRateLimit, now)) return false;
+    const sourceKey = session
+      ? `player:${session.playerId}`
+      : `unauthenticated-address:${address}`;
+    return consumeIngress(sourceKey, byteLength, messageRateLimit, now);
+  }
+
+  function releaseAddress(socket) {
+    const address = socketAddresses.get(socket);
+    if (address === undefined) return;
+    socketAddresses.delete(socket);
+    const remaining = (addressConnections.get(address) ?? 1) - 1;
+    if (remaining > 0) addressConnections.set(address, remaining);
+    else addressConnections.delete(address);
   }
 
   webSocketServer.on('connection', (socket) => {
@@ -482,12 +587,15 @@ export async function createSignalingServer({
     socket.on('message', (data, isBinary) => {
       const rateState = socketRates.get(socket);
       if (rateState?.limited) return;
-      if (!consumeRateLimit(socket)) {
+      const byteLength = typeof data === 'string'
+        ? Buffer.byteLength(data)
+        : (data?.byteLength ?? Buffer.byteLength(data.toString()));
+      if (!consumeRateLimit(socket, byteLength)) {
         const limitedState = socketRates.get(socket);
         limitedState.limited = true;
         const sent = sendJson(
           socket,
-          { type: 'error', code: 'RATE_LIMIT', message: 'Too many messages from this connection' },
+          { type: 'error', code: 'RATE_LIMIT', message: 'Too much signaling traffic from this source' },
           () => socket.terminate(),
         );
         if (!sent) socket.terminate();
@@ -524,6 +632,7 @@ export async function createSignalingServer({
     });
 
     socket.on('close', () => {
+      releaseAddress(socket);
       const session = unbindSocket(socket);
       if (!session || !session.isCurrent || shuttingDown) return;
       const room = registry.roomView(session.roomCode);
@@ -554,7 +663,18 @@ export async function createSignalingServer({
       rejectUpgrade(socket, 403, 'Forbidden');
       return;
     }
+    if (webSocketServer.clients.size >= maxConnections) {
+      rejectUpgrade(socket, 503, 'Service Unavailable');
+      return;
+    }
+    const address = clientAddress(request, trustProxy);
+    if ((addressConnections.get(address) ?? 0) >= maxConnectionsPerIp) {
+      rejectUpgrade(socket, 429, 'Too Many Requests');
+      return;
+    }
     webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+      socketAddresses.set(webSocket, address);
+      addressConnections.set(address, (addressConnections.get(address) ?? 0) + 1);
       webSocketServer.emit('connection', webSocket, request);
     });
   });
@@ -582,7 +702,13 @@ export async function createSignalingServer({
   }
 
   const cleanupIntervalMs = Math.max(10, Math.min(1_000, reconnectGraceMs || 10));
-  cleanupTimer = setInterval(() => publishResult(registry.removeExpired()), cleanupIntervalMs);
+  cleanupTimer = setInterval(() => {
+    publishResult(registry.removeExpired());
+    const now = Date.now();
+    for (const [key, rate] of ingressRates) {
+      if (now - rate.lastSeen >= messageRateLimit.windowMs * 2) ingressRates.delete(key);
+    }
+  }, cleanupIntervalMs);
   cleanupTimer.unref?.();
   heartbeatTimer = setInterval(() => {
     const now = Date.now();

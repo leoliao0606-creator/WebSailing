@@ -164,6 +164,7 @@ table.results tr.me td { color: var(--gold); font-weight: 700; }
 .lobby-code-row button { padding: 7px 12px; font-size: 13px; border-radius: 8px; }
 .lobby-members {
   width: min(620px, 92vw); max-height: min(46vh, 430px); overflow-y: auto;
+  list-style: none;
   border: 1px solid rgba(255,255,255,0.1); border-radius: 13px;
   background: rgba(8,22,33,0.68); backdrop-filter: blur(7px);
 }
@@ -188,8 +189,8 @@ table.results tr.me td { color: var(--gold); font-weight: 700; }
 
 /* —— 赛前 / 赛中聊天：避开右上风表与右下小地图 —— */
 .chat-panel {
-  position: fixed; z-index: 15; right: 18px; top: 242px;
-  width: min(340px, calc(100vw - 36px)); max-height: min(46vh, 440px);
+  position: fixed; z-index: 15; right: 236px; top: 242px;
+  width: min(340px, calc(100vw - 464px)); max-height: min(46vh, 440px);
   display: flex; flex-direction: column; overflow: hidden;
   color: var(--ink); background: rgba(8,22,33,0.84); backdrop-filter: blur(9px);
   border: 1px solid rgba(255,255,255,0.12); border-radius: 13px;
@@ -241,12 +242,12 @@ table.results tr.me td { color: var(--gold); font-weight: 700; }
   .lobby-member-badges { text-align: left; }
   .lobby-actions button { flex: 1 1 130px; padding-inline: 12px; }
   .chat-panel {
-    top: auto; right: 10px; bottom: 158px;
-    width: min(300px, calc(100vw - 20px)); max-height: min(34vh, 300px);
+    top: 238px; right: 10px; bottom: 250px;
+    width: min(300px, calc(100vw - 20px)); max-height: none;
   }
 }
 
-@media (max-height: 560px) {
+@media (max-height: 560px) and (min-width: 721px) {
   .chat-panel { top: auto; bottom: 78px; max-height: 42vh; }
   .chat-log { min-height: 36px; }
 }

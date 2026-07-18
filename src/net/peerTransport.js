@@ -1,10 +1,19 @@
+import {
+  MAX_ICE_CANDIDATE_BYTES,
+  MAX_ICE_METADATA_BYTES,
+  MAX_NEGOTIATION_ID_BYTES,
+} from './protocol.js';
+
 const CONTROL_CHANNEL = 'control';
 const STATE_CHANNEL = 'state';
 const INVALID_ICE = Symbol('invalid ICE candidate');
 const MAX_PEER_MESSAGE_BYTES = 64 * 1024;
-const MAX_ICE_CANDIDATE_BYTES = 4 * 1024;
 const MAX_REMOTE_ICE_CANDIDATES = 64;
-const MAX_NEGOTIATION_ID_BYTES = 128;
+const DEFAULT_INBOUND_RATE_LIMIT = Object.freeze({
+  windowMs: 1000,
+  maxMessages: 120,
+  maxBytes: 512 * 1024,
+});
 const textEncoder = new TextEncoder();
 
 function isRecord(value) {
@@ -87,6 +96,39 @@ function serializeMessage(message) {
   }
 }
 
+function inboundMessageBytes(data) {
+  if (typeof data === 'string') return textEncoder.encode(data).byteLength;
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  if (typeof Blob !== 'undefined' && data instanceof Blob) return data.size;
+  return 0;
+}
+
+function normalizeInboundRateLimit(value) {
+  if (!isRecord(value)) {
+    throw new TypeError('inboundRateLimit must be a plain object');
+  }
+  const windowMs = Object.hasOwn(value, 'windowMs')
+    ? value.windowMs
+    : DEFAULT_INBOUND_RATE_LIMIT.windowMs;
+  const maxMessages = Object.hasOwn(value, 'maxMessages')
+    ? value.maxMessages
+    : DEFAULT_INBOUND_RATE_LIMIT.maxMessages;
+  const maxBytes = Object.hasOwn(value, 'maxBytes')
+    ? value.maxBytes
+    : DEFAULT_INBOUND_RATE_LIMIT.maxBytes;
+  if (typeof windowMs !== 'number' || !Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new TypeError('inboundRateLimit.windowMs must be a positive finite number');
+  }
+  if (!Number.isSafeInteger(maxMessages) || maxMessages < 1) {
+    throw new TypeError('inboundRateLimit.maxMessages must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new TypeError('inboundRateLimit.maxBytes must be a positive safe integer');
+  }
+  return Object.freeze({ windowMs, maxMessages, maxBytes });
+}
+
 function localDescriptionData(description, expectedType, negotiationId) {
   if (!description || description.type !== expectedType || typeof description.sdp !== 'string') {
     return null;
@@ -108,6 +150,10 @@ function outgoingIceData(candidate, negotiationId) {
   }
   if (!source || typeof source !== 'object' || typeof source.candidate !== 'string') return null;
   if (textEncoder.encode(source.candidate).byteLength > MAX_ICE_CANDIDATE_BYTES) return null;
+  if (typeof source.sdpMid === 'string'
+    && textEncoder.encode(source.sdpMid).byteLength > MAX_ICE_METADATA_BYTES) return null;
+  if (typeof source.usernameFragment === 'string'
+    && textEncoder.encode(source.usernameFragment).byteLength > MAX_ICE_METADATA_BYTES) return null;
 
   const data = { type: 'ice', candidate: source.candidate, negotiationId };
   if (source.sdpMid === null || typeof source.sdpMid === 'string') data.sdpMid = source.sdpMid;
@@ -132,6 +178,8 @@ function incomingIceCandidate(data) {
   const candidate = { candidate: data.candidate };
   if (Object.hasOwn(data, 'sdpMid')) {
     if (data.sdpMid !== null && typeof data.sdpMid !== 'string') return INVALID_ICE;
+    if (typeof data.sdpMid === 'string'
+      && textEncoder.encode(data.sdpMid).byteLength > MAX_ICE_METADATA_BYTES) return INVALID_ICE;
     candidate.sdpMid = data.sdpMid;
   }
   if (Object.hasOwn(data, 'sdpMLineIndex')) {
@@ -145,6 +193,10 @@ function incomingIceCandidate(data) {
   }
   if (Object.hasOwn(data, 'usernameFragment')) {
     if (data.usernameFragment !== null && typeof data.usernameFragment !== 'string') {
+      return INVALID_ICE;
+    }
+    if (typeof data.usernameFragment === 'string'
+      && textEncoder.encode(data.usernameFragment).byteLength > MAX_ICE_METADATA_BYTES) {
       return INVALID_ICE;
     }
     candidate.usernameFragment = data.usernameFragment;
@@ -167,6 +219,12 @@ export class PeerTransport extends EventTarget {
 
   #maxSeenNegotiations;
 
+  #inboundRateLimit;
+
+  #clock;
+
+  #lastClockTime;
+
   #signalListener;
 
   #peers = new Map();
@@ -183,6 +241,8 @@ export class PeerTransport extends EventTarget {
 
   #exhaustedRetries = new Set();
 
+  #rateLimitedRetryChains = new Set();
+
   #seenNegotiations = new Map();
 
   #closed = false;
@@ -195,6 +255,8 @@ export class PeerTransport extends EventTarget {
     retryDelaysMs = [0, 100, 500],
     maxSeenNegotiations = 64,
     timers = globalThis,
+    inboundRateLimit = {},
+    clock = globalThis.performance ?? Date,
   } = {}) {
     super();
     if (
@@ -231,6 +293,19 @@ export class PeerTransport extends EventTarget {
       || typeof timers.clearTimeout !== 'function') {
       throw new TypeError('timers must provide setTimeout() and clearTimeout()');
     }
+    const normalizedInboundRateLimit = normalizeInboundRateLimit(inboundRateLimit);
+    if (!clock || typeof clock.now !== 'function') {
+      throw new TypeError('clock must provide now()');
+    }
+    let initialClockTime;
+    try {
+      initialClockTime = clock.now();
+    } catch {
+      throw new TypeError('clock.now() must return a finite number');
+    }
+    if (typeof initialClockTime !== 'number' || !Number.isFinite(initialClockTime)) {
+      throw new TypeError('clock.now() must return a finite number');
+    }
 
     this.#signaling = signaling;
     this.#RTCPeerConnectionImpl = RTCPeerConnectionImpl;
@@ -239,6 +314,9 @@ export class PeerTransport extends EventTarget {
     this.#retryDelaysMs = Object.freeze([...retryDelaysMs]);
     this.#timers = timers;
     this.#maxSeenNegotiations = maxSeenNegotiations;
+    this.#inboundRateLimit = normalizedInboundRateLimit;
+    this.#clock = clock;
+    this.#lastClockTime = initialClockTime;
     this.#signalListener = (event) => this.#handleSignalEvent(event);
     this.#signaling.addEventListener('signal', this.#signalListener);
   }
@@ -431,6 +509,8 @@ export class PeerTransport extends EventTarget {
       iceInFlight: false,
       sdpChain: Promise.resolve(),
       remoteDescriptionSet: false,
+      inboundEvents: [],
+      inboundBytes: 0,
       active: true,
     };
     this.#peers.set(playerId, record);
@@ -637,7 +717,8 @@ export class PeerTransport extends EventTarget {
       if (record.openChannels.has(label)) return;
       record.openChannels.add(label);
       if (record.openChannels.has(CONTROL_CHANNEL)
-        && record.openChannels.has(STATE_CHANNEL)) {
+        && record.openChannels.has(STATE_CHANNEL)
+        && !this.#rateLimitedRetryChains.has(record.playerId)) {
         this.#clearRetry(record.playerId);
       }
       if (label === CONTROL_CHANNEL) {
@@ -653,8 +734,10 @@ export class PeerTransport extends EventTarget {
     };
     const onMessage = (event) => {
       if (!this.#isCurrentChannel(record, label, dataChannel)) return;
+      const bytes = inboundMessageBytes(event?.data);
+      if (!this.#acceptInbound(record, label, bytes)) return;
       if (typeof event?.data !== 'string') return;
-      if (textEncoder.encode(event.data).byteLength > MAX_PEER_MESSAGE_BYTES) return;
+      if (bytes > MAX_PEER_MESSAGE_BYTES) return;
       let message;
       try {
         message = JSON.parse(event.data);
@@ -818,6 +901,61 @@ export class PeerTransport extends EventTarget {
     }));
   }
 
+  #acceptInbound(record, label, bytes) {
+    let now;
+    try {
+      now = this.#clock.now();
+    } catch {
+      now = NaN;
+    }
+    if (typeof now !== 'number' || !Number.isFinite(now) || now < this.#lastClockTime) {
+      this.#rateLimitedRetryChains.add(record.playerId);
+      this.#dispatchInboundRateLimit(record, label, 'clock',
+        record.inboundEvents.length + 1, record.inboundBytes + bytes);
+      this.#failPeer(record);
+      return false;
+    }
+    this.#lastClockTime = now;
+
+    while (record.inboundEvents.length > 0
+      && now - record.inboundEvents[0].receivedAt >= this.#inboundRateLimit.windowMs) {
+      record.inboundBytes -= record.inboundEvents.shift().bytes;
+    }
+    record.inboundEvents.push({ receivedAt: now, bytes });
+    record.inboundBytes += bytes;
+
+    let reason = null;
+    if (record.inboundEvents.length > this.#inboundRateLimit.maxMessages) reason = 'messages';
+    else if (record.inboundBytes > this.#inboundRateLimit.maxBytes) reason = 'bytes';
+    if (reason === null) return true;
+
+    this.#rateLimitedRetryChains.add(record.playerId);
+    this.#dispatchInboundRateLimit(
+      record,
+      label,
+      reason,
+      record.inboundEvents.length,
+      record.inboundBytes,
+    );
+    this.#failPeer(record);
+    return false;
+  }
+
+  #dispatchInboundRateLimit(record, label, reason, observedMessages, observedBytes) {
+    this.dispatchEvent(new CustomEvent('peer-rate-limit', {
+      detail: {
+        playerId: record.playerId,
+        channel: label,
+        reliable: label === CONTROL_CHANNEL,
+        hostEpoch: record.hostEpoch,
+        reason,
+        observedMessages,
+        observedBytes,
+        ...this.#inboundRateLimit,
+      },
+    }));
+  }
+
   #isCurrent(record) {
     return !this.#closed
       && record.active
@@ -873,6 +1011,7 @@ export class PeerTransport extends EventTarget {
     this.#retryTimers.delete(playerId);
     this.#retryAttempts.delete(playerId);
     this.#exhaustedRetries.delete(playerId);
+    this.#rateLimitedRetryChains.delete(playerId);
   }
 
   #clearAllRetries() {
@@ -880,6 +1019,7 @@ export class PeerTransport extends EventTarget {
     this.#retryTimers.clear();
     this.#retryAttempts.clear();
     this.#exhaustedRetries.clear();
+    this.#rateLimitedRetryChains.clear();
   }
 
   #closeAllPeers() {
@@ -893,6 +1033,8 @@ export class PeerTransport extends EventTarget {
     record.active = false;
     record.reliableQueue.length = 0;
     record.pendingIce.length = 0;
+    record.inboundEvents.length = 0;
+    record.inboundBytes = 0;
     record.peerConnection.onicecandidate = null;
     record.peerConnection.ondatachannel = null;
     record.peerConnection.onconnectionstatechange = null;

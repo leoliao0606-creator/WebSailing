@@ -45,6 +45,23 @@ function join(registry, code, nickname) {
   return { player, result };
 }
 
+function startDescriptor(players, tick = 0) {
+  const countdown = 30;
+  return {
+    tick,
+    seed: 'recoverable-race',
+    config: {
+      windPsi: 0.35,
+      windKn: 14,
+      gustiness: 0.3,
+      countdown,
+      startTick: tick + countdown * 60,
+      roster: players.map(({ playerId, nickname }) => ({ playerId, nickname })),
+      aiFill: 2,
+    },
+  };
+}
+
 test('room codes are unique six-character strings using only unambiguous characters', () => {
   let identityCall = 0;
   const roomBytes = [
@@ -148,6 +165,7 @@ test('a room may wait with one player and accepts eight ordered human seats', ()
 
   const room = registry.roomView(code);
   assert.equal(room.phase, 'lobby');
+  assert.equal(Object.hasOwn(room, 'start'), false);
   assert.equal(room.members.length, 8);
   assert.deepEqual(room.members.map((member) => member.joinOrder), [1, 2, 3, 4, 5, 6, 7, 8]);
 });
@@ -155,32 +173,100 @@ test('a room may wait with one player and accepts eight ordered human seats', ()
 test('only a ready host with two connected humans can lock a lobby', () => {
   const { registry } = createHarness();
   const { player: host, code } = createRoom(registry, 'Host');
+  const preJoinStart = startDescriptor([
+    host,
+    { playerId: 'future-guest', nickname: 'Guest' },
+  ]);
 
   assert.throws(
-    () => registry.lockRoom(host.playerId),
+    () => registry.lockRoom(host.playerId, preJoinStart),
     (error) => error.code === 'NOT_ENOUGH_PLAYERS',
   );
 
   const { player: guest } = join(registry, code, 'Guest');
+  const start = startDescriptor([host, guest]);
   registry.setReady(host.playerId, true);
   assert.throws(
-    () => registry.lockRoom(host.playerId),
+    () => registry.lockRoom(host.playerId, start),
     (error) => error.code === 'PLAYERS_NOT_READY',
   );
   registry.setReady(guest.playerId, true);
   assert.throws(
-    () => registry.lockRoom(guest.playerId),
+    () => registry.lockRoom(guest.playerId, start),
     (error) => error.code === 'NOT_HOST',
   );
 
-  const locked = registry.lockRoom(host.playerId);
+  const locked = registry.lockRoom(host.playerId, start);
   assert.equal(locked.room.phase, 'racing');
+  assert.deepEqual(locked.room.start, start);
+  assert.equal(Object.isFrozen(locked.room.start), true);
+  assert.equal(Object.isFrozen(locked.room.start.config.roster), true);
   assert.deepEqual(locked.events, [{
     type: 'room-locked',
     roomCode: code,
     playerId: host.playerId,
     phase: 'racing',
+    start,
   }]);
+});
+
+test('lock atomically stores a canonical start and cannot be mutated after racing begins', () => {
+  const { registry } = createHarness();
+  const { player: host, code } = createRoom(registry, 'Host');
+  const { player: guest } = join(registry, code, 'Guest');
+  registry.setReady(host.playerId, true);
+  registry.setReady(guest.playerId, true);
+  const input = startDescriptor([host, guest]);
+
+  assert.throws(
+    () => registry.lockRoom(host.playerId, { ...input, tick: input.tick + 1 }),
+    (error) => error.code === 'INVALID_START_DESCRIPTOR',
+  );
+  assert.equal(registry.roomView(code).phase, 'lobby');
+  assert.equal(Object.hasOwn(registry.roomView(code), 'start'), false);
+
+  const locked = registry.lockRoom(host.playerId, input);
+  input.seed = 'mutated';
+  input.config.roster[0].nickname = 'mutated';
+  assert.equal(registry.roomView(code).start.seed, 'recoverable-race');
+  assert.equal(registry.roomView(code).start.config.roster[0].nickname, 'Host');
+
+  assert.throws(
+    () => registry.lockRoom(host.playerId, startDescriptor([host, guest], 240)),
+    (error) => error.code === 'ROOM_IN_PROGRESS',
+  );
+  assert.deepEqual(registry.roomView(code).start, locked.room.start);
+});
+
+test('a room rejects a valid initial start descriptor with a non-zero tick', () => {
+  const { registry } = createHarness();
+  const { player: host, code } = createRoom(registry, 'Host');
+  const { player: guest } = join(registry, code, 'Guest');
+  registry.setReady(host.playerId, true);
+  registry.setReady(guest.playerId, true);
+
+  assert.throws(
+    () => registry.lockRoom(host.playerId, startDescriptor([host, guest], 120)),
+    (error) => error.code === 'INVALID_START_DESCRIPTOR' && /tick.*zero/i.test(error.message),
+  );
+  assert.equal(registry.roomView(code).phase, 'lobby');
+  assert.equal(Object.hasOwn(registry.roomView(code), 'start'), false);
+});
+
+test('lock rejects a descriptor whose reserved human roster differs from the room', () => {
+  const { registry } = createHarness();
+  const { player: host, code } = createRoom(registry, 'Host');
+  const { player: guest } = join(registry, code, 'Guest');
+  registry.setReady(host.playerId, true);
+  registry.setReady(guest.playerId, true);
+  const start = startDescriptor([host, guest]);
+  start.config.roster[1].playerId = 'not-the-guest';
+
+  assert.throws(
+    () => registry.lockRoom(host.playerId, start),
+    (error) => error.code === 'START_ROSTER_MISMATCH',
+  );
+  assert.equal(registry.roomView(code).phase, 'lobby');
 });
 
 test('a racing room rejects late joins without changing its reserved roster', () => {
@@ -189,7 +275,7 @@ test('a racing room rejects late joins without changing its reserved roster', ()
   const { player: guest } = join(registry, code, 'Guest');
   registry.setReady(host.playerId, true);
   registry.setReady(guest.playerId, true);
-  registry.lockRoom(host.playerId);
+  registry.lockRoom(host.playerId, startDescriptor([host, guest]));
   const late = registry.createPlayer('Late');
 
   assert.throws(
@@ -209,10 +295,12 @@ test('host migration and resume preserve the racing phase', () => {
   const { player: guest } = join(registry, code, 'Guest');
   registry.setReady(host.playerId, true);
   registry.setReady(guest.playerId, true);
-  registry.lockRoom(host.playerId);
+  const start = startDescriptor([host, guest]);
+  registry.lockRoom(host.playerId, start);
 
   const migrated = registry.disconnect(host.playerId);
   assert.equal(migrated.room.phase, 'racing');
+  assert.deepEqual(migrated.room.start, start);
   assert.equal(migrated.room.hostId, guest.playerId);
   const resumed = registry.resume({
     roomCode: code,
@@ -221,6 +309,7 @@ test('host migration and resume preserve the racing phase', () => {
   });
   assert.equal(resumed.room.phase, 'racing');
   assert.equal(resumed.room.hostId, guest.playerId);
+  assert.deepEqual(resumed.room.start, start);
 });
 
 test('a ninth player is rejected without changing the room', () => {

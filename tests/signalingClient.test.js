@@ -134,6 +134,26 @@ function createTimers(start = 1_000) {
   };
 }
 
+function startDescriptor(tick = 120) {
+  const countdown = 30;
+  return {
+    tick,
+    seed: 'recoverable-race',
+    config: {
+      windPsi: 0.35,
+      windKn: 14,
+      gustiness: 0.3,
+      countdown,
+      startTick: tick + countdown * 60,
+      roster: [
+        { playerId: 'player-a', nickname: 'Host' },
+        { playerId: 'player-b', nickname: 'Guest' },
+      ],
+      aiFill: 2,
+    },
+  };
+}
+
 function roomView({
   roomCode = 'ABC234',
   hostId = 'player-a',
@@ -141,7 +161,7 @@ function roomView({
   guestReady = false,
   phase = 'lobby',
 } = {}) {
-  return {
+  const room = {
     roomCode,
     hostId,
     hostEpoch,
@@ -165,6 +185,8 @@ function roomView({
       },
     ],
   };
+  if (phase === 'racing') room.start = startDescriptor();
+  return room;
 }
 
 function serverMessage(socket, message) {
@@ -313,10 +335,11 @@ test('lockRoom sends once and resolves from the matching room-locked event', asy
   const socket = await openClient(client);
   serverMessage(socket, sessionMessage());
 
-  const first = client.lockRoom({ timeoutMs: 1_000 });
-  const duplicate = client.lockRoom({ timeoutMs: 1_000 });
+  const start = startDescriptor();
+  const first = client.lockRoom(start, { timeoutMs: 1_000 });
+  const duplicate = client.lockRoom(startDescriptor(240), { timeoutMs: 1_000 });
   assert.equal(first, duplicate);
-  assert.deepEqual(sentMessages(socket).at(-1), { type: 'lock-room' });
+  assert.deepEqual(sentMessages(socket).at(-1), { type: 'lock-room', start });
   assert.equal(sentMessages(socket).filter(({ type }) => type === 'lock-room').length, 1);
 
   serverMessage(socket, {
@@ -324,6 +347,7 @@ test('lockRoom sends once and resolves from the matching room-locked event', asy
     roomCode: 'ABC234',
     playerId: 'player-a',
     phase: 'racing',
+    start,
   });
 
   assert.deepEqual(await first, {
@@ -331,8 +355,11 @@ test('lockRoom sends once and resolves from the matching room-locked event', asy
     roomCode: 'ABC234',
     playerId: 'player-a',
     phase: 'racing',
+    start,
   });
   assert.equal(client.state.room.phase, 'racing');
+  assert.deepEqual(client.state.room.start, start);
+  assert.equal(Object.isFrozen(client.state.room.start.config.roster), true);
 });
 
 test('lockRoom rejects on server error and injected timeout', async () => {
@@ -340,13 +367,57 @@ test('lockRoom rejects on server error and injected timeout', async () => {
   const socket = await openClient(client);
   serverMessage(socket, sessionMessage());
 
-  const denied = client.lockRoom({ timeoutMs: 1_000 });
+  const denied = client.lockRoom(startDescriptor(), { timeoutMs: 1_000 });
   serverMessage(socket, { type: 'error', code: 'NOT_HOST', message: 'Only host may lock' });
   await assert.rejects(denied, /NOT_HOST|Only host/i);
 
-  const timedOut = client.lockRoom({ timeoutMs: 25 });
+  const timedOut = client.lockRoom(startDescriptor(), { timeoutMs: 25 });
   timers.advance(25);
   await assert.rejects(timedOut, /timed out/i);
+});
+
+test('a delayed lock acknowledgement cannot resolve a newer request with a different start', async () => {
+  const { client, timers } = createHarness();
+  const socket = await openClient(client);
+  serverMessage(socket, sessionMessage());
+  const firstStart = startDescriptor(120);
+  const secondStart = startDescriptor(240);
+
+  const first = client.lockRoom(firstStart, { timeoutMs: 25 });
+  timers.advance(25);
+  await assert.rejects(first, /timed out/i);
+
+  const second = client.lockRoom(secondStart, { timeoutMs: 1_000 });
+  serverMessage(socket, {
+    type: 'room-locked',
+    roomCode: 'ABC234',
+    playerId: 'player-a',
+    phase: 'racing',
+    start: firstStart,
+  });
+
+  await assert.rejects(second, /different start descriptor/i);
+  assert.deepEqual(client.state.room.start, firstStart);
+  assert.equal(sentMessages(socket).filter(({ type }) => type === 'lock-room').length, 2);
+});
+
+test('lockRoom rejects malformed descriptors before sending and racing views require start', async () => {
+  const { client, timers } = createHarness();
+  const socket = await openClient(client);
+  serverMessage(socket, sessionMessage());
+  const errors = [];
+  client.addEventListener('protocol-error', (event) => errors.push(event.detail));
+
+  const invalidLock = client.lockRoom({ ...startDescriptor(), tick: 121 });
+  timers.advance(3_000);
+  await assert.rejects(invalidLock, /startTick|countdown/i);
+  assert.equal(sentMessages(socket).filter(({ type }) => type === 'lock-room').length, 0);
+
+  const invalidRacingRoom = roomView({ phase: 'racing' });
+  delete invalidRacingRoom.start;
+  serverMessage(socket, { type: 'room-view', room: invalidRacingRoom });
+  assert.equal(errors.length, 1);
+  assert.equal(client.state.room.phase, 'lobby');
 });
 
 test('session messages persist private credentials without exposing the resume token in state', async () => {
@@ -602,7 +673,12 @@ test('signal relay accepts only exact bounded RTC descriptions and ICE candidate
   serverMessage(socket, {
     type: 'signal',
     sourceId: 'player-b',
-    data: { type: 'ice', candidate: 'candidate:ok', sdpMLineIndex: 0 },
+    data: {
+      type: 'ice',
+      candidate: 'candidate:ok',
+      sdpMid: `${'界'.repeat(85)}a`,
+      sdpMLineIndex: 0,
+    },
   });
   serverMessage(socket, {
     type: 'signal',
@@ -614,16 +690,38 @@ test('signal relay accepts only exact bounded RTC descriptions and ICE candidate
     { type: 'ice', candidate: 'candidate:bad', sdpMLineIndex: -1 },
     { type: 'offer', sdp: 'x'.repeat((64 * 1024) + 1) },
     { type: 'ice', candidate: null, negotiationId: '界'.repeat(43) },
+    { type: 'offer', sdp: 'x'.repeat((48 * 1024) + 1) },
+    { type: 'ice', candidate: 'x'.repeat((4 * 1024) + 1) },
+    { type: 'ice', candidate: 'candidate:bad', sdpMid: '界'.repeat(86) },
+    { type: 'ice', candidate: 'candidate:bad', usernameFragment: '界'.repeat(86) },
   ]) {
     serverMessage(socket, { type: 'signal', sourceId: 'player-b', data });
   }
 
   assert.equal(signals.length, 2);
   assert.deepEqual(signals[0].data, {
-    type: 'ice', candidate: 'candidate:ok', sdpMLineIndex: 0,
+    type: 'ice', candidate: 'candidate:ok', sdpMid: `${'界'.repeat(85)}a`, sdpMLineIndex: 0,
   });
   assert.equal(signals[1].data.negotiationId, 'epoch-2-attempt-1');
-  assert.equal(errors.length, 4);
+  assert.equal(errors.length, 8);
+});
+
+test('outgoing RTC signaling applies the same field bounds before writing the socket', async () => {
+  const { client } = createHarness();
+  const socket = await openClient(client);
+  assert.equal(client.sendSignal('player-b', {
+    type: 'ice', candidate: 'candidate:ok', usernameFragment: `${'界'.repeat(85)}a`,
+  }), true);
+
+  for (const data of [
+    { type: 'offer', sdp: 'x'.repeat((48 * 1024) + 1) },
+    { type: 'ice', candidate: 'x'.repeat((4 * 1024) + 1) },
+    { type: 'ice', candidate: 'candidate:bad', sdpMid: '界'.repeat(86) },
+    { type: 'ice', candidate: 'candidate:bad', usernameFragment: '界'.repeat(86) },
+  ]) {
+    assert.throws(() => client.sendSignal('player-b', data), /signal|sdp|candidate|256|4096|49152/i);
+  }
+  assert.equal(sentMessages(socket).length, 1);
 });
 
 test('events from an old socket generation cannot mutate state or schedule reconnects', async () => {
@@ -810,6 +908,56 @@ test('leave clears room credentials, keeps an open socket reusable, and later re
   replacement.open();
   assert.deepEqual(sentMessages(replacement), []);
   assert.equal(client.state.connection, 'open');
+});
+
+test('leave tombstones delayed session, room-view, and domain messages from the departed room', async () => {
+  const { client, storage } = createHarness();
+  const socket = await openClient(client);
+  const departedSession = sessionMessage();
+  serverMessage(socket, departedSession);
+  const events = [];
+  for (const type of ['session', 'room-view', 'domain-event']) {
+    client.addEventListener(type, () => events.push(type));
+  }
+
+  client.leave();
+  serverMessage(socket, departedSession);
+  serverMessage(socket, { type: 'room-view', room: departedSession.room });
+  serverMessage(socket, {
+    type: 'ready-changed',
+    roomCode: departedSession.roomCode,
+    playerId: departedSession.playerId,
+    ready: true,
+  });
+
+  assert.equal(client.state.playerId, null);
+  assert.equal(client.state.roomCode, null);
+  assert.equal(client.state.room, null);
+  assert.equal(storage.getItem(SIGNALING_SESSION_KEY), null);
+  assert.deepEqual(events, []);
+});
+
+test('a client can create a new room after leave without accepting the departed session', async () => {
+  const { client } = createHarness();
+  const socket = await openClient(client);
+  const departedSession = sessionMessage();
+  serverMessage(socket, departedSession);
+  client.leave();
+
+  client.createRoom('新船长');
+  serverMessage(socket, departedSession);
+  assert.equal(client.state.room, null);
+
+  const nextRoom = roomView({ roomCode: 'NEW234', hostId: 'player-b' });
+  serverMessage(socket, sessionMessage({
+    playerId: 'player-b',
+    resumeToken: 'new-private-resume-token',
+    room: nextRoom,
+  }));
+
+  assert.equal(client.state.playerId, 'player-b');
+  assert.equal(client.state.roomCode, 'NEW234');
+  assert.deepEqual(client.state.room, nextRoom);
 });
 
 test('leave during an in-flight connect clears stale credentials without aborting the connection', async () => {

@@ -115,6 +115,56 @@ class FakeClock {
   }
 }
 
+class FakeTimers {
+  constructor() {
+    this.time = 0;
+    this.nextId = 1;
+    this.tasks = new Map();
+    this.callbacks = new Map();
+  }
+
+  setTimeout = (callback, delay) => {
+    const id = this.nextId;
+    this.nextId += 1;
+    this.tasks.set(id, { at: this.time + delay, callback });
+    this.callbacks.set(id, callback);
+    return id;
+  };
+
+  clearTimeout = (id) => {
+    this.tasks.delete(id);
+  };
+
+  get pendingCount() {
+    return this.tasks.size;
+  }
+
+  pendingDelays() {
+    return [...this.tasks.values()]
+      .map(({ at }) => at - this.time)
+      .sort((left, right) => left - right);
+  }
+
+  callback(id) {
+    return this.callbacks.get(id);
+  }
+
+  advance(milliseconds) {
+    const target = this.time + milliseconds;
+    while (true) {
+      const next = [...this.tasks.entries()]
+        .filter(([, task]) => task.at <= target)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+      if (!next) break;
+      const [id, task] = next;
+      this.tasks.delete(id);
+      this.time = task.at;
+      task.callback();
+    }
+    this.time = target;
+  }
+}
+
 class FakeIntegrityMonitor {
   constructor() {
     this.calls = [];
@@ -150,11 +200,12 @@ function makeRoom({
   localId = 'guest',
   includeGuest = true,
   phase = 'lobby',
+  start,
 } = {}) {
   const ids = includeGuest ? ['host', 'guest'] : [localId];
   if (!ids.includes(hostId)) ids.push(hostId);
   if (!ids.includes(localId)) ids.push(localId);
-  return {
+  const room = {
     roomCode: 'AB2CD9',
     hostId,
     hostEpoch,
@@ -168,6 +219,8 @@ function makeRoom({
       isHost: playerId === hostId,
     })),
   };
+  if (start !== undefined) room.start = start;
+  return room;
 }
 
 function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 } = {}) {
@@ -224,6 +277,34 @@ function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 } = {})
   };
 }
 
+function makeAuthorizedWorldState({
+  tick = 60,
+  worldTime = 1,
+  hostEpoch = 1,
+  seed = 'race-seed',
+  boatIds = ['host', 'guest', 'ai:0'],
+  x = 0,
+} = {}) {
+  const state = makeWorldState({ tick, worldTime, hostEpoch, x });
+  const boatTemplate = state.boats[0];
+  const entryTemplate = state.race.entries[0];
+  state.seed = seed;
+  state.boats = boatIds.map((boatId, index) => ({
+    ...structuredClone(boatTemplate),
+    boatId,
+    phys: {
+      ...structuredClone(boatTemplate.phys),
+      x: x + index,
+    },
+  }));
+  state.race.entries = boatIds.map((boatId, index) => ({
+    ...structuredClone(entryTemplate),
+    boatId,
+    prevX: x + index,
+  }));
+  return state;
+}
+
 const CONTROL = Object.freeze({
   steerLeft: true,
   steerRight: false,
@@ -257,9 +338,37 @@ function startConfigForTick(tick, playerIds = ['host', 'guest']) {
   };
 }
 
+function startDescriptorForTick(tick = 120, playerIds = ['host', 'guest']) {
+  return {
+    tick,
+    seed: 'race-seed',
+    config: startConfigForTick(tick, playerIds),
+  };
+}
+
+function receiveStartRace(transport, {
+  tick = 0,
+  seed = 'race-seed',
+  playerIds = ['host', 'guest'],
+  aiFill = START_CONFIG.aiFill,
+  sourceId = 'host',
+  roomCode = 'AB2CD9',
+  hostEpoch = 1,
+} = {}) {
+  transport.receive(sourceId, {
+    type: 'start-race',
+    roomCode,
+    hostEpoch,
+    tick,
+    seed,
+    config: { ...startConfigForTick(tick, playerIds), aiFill },
+  }, { reliable: true });
+}
+
 function makeHarness({
   playerId = 'guest',
   clock = new FakeClock(),
+  timers = new FakeTimers(),
   integrityMonitor = new FakeIntegrityMonitor(),
   ...options
 } = {}) {
@@ -270,9 +379,10 @@ function makeHarness({
     transport,
     integrityMonitor,
     clock,
+    timers,
     ...options,
   });
-  return { signaling, transport, integrityMonitor, clock, session };
+  return { signaling, transport, integrityMonitor, clock, timers, session };
 }
 
 function collect(target, type) {
@@ -282,7 +392,7 @@ function collect(target, type) {
 }
 
 function enterGuestHostGuestEpochs(signaling, transport) {
-  const room = makeRoom();
+  const room = makeRoom({ phase: 'racing' });
   room.members.push({
     playerId: 'new-host',
     nickname: 'new-host',
@@ -292,23 +402,31 @@ function enterGuestHostGuestEpochs(signaling, transport) {
     isHost: false,
   });
   signaling.room(room);
+  receiveStartRace(transport, {
+    tick: 0,
+    playerIds: ['host', 'guest', 'new-host'],
+  });
   transport.receive('host', {
     type: 'snapshot',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
+    state: makeAuthorizedWorldState({
+      tick: 600,
+      worldTime: 10,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
   });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 606,
-    state: makeWorldState({ tick: 606, worldTime: 10.1 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 610, seed: 'race-seed',
-    config: startConfigForTick(610, ['host', 'guest', 'new-host']),
+    state: makeAuthorizedWorldState({
+      tick: 606,
+      worldTime: 10.1,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
   }, { reliable: true });
   signaling.hostChanged({
     roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
@@ -650,15 +768,278 @@ test('lossy state channel close does not reset source identity watermarks', () =
   );
 });
 
+test('guest ignores authority state until a canonical start establishes race identity', () => {
+  const checkpointIntegrityMonitor = new FakeIntegrityMonitor();
+  const {
+    signaling,
+    transport,
+    integrityMonitor,
+    session,
+  } = makeHarness({ checkpointIntegrityMonitor });
+  signaling.room(makeRoom({ phase: 'racing' }));
+  const snapshots = collect(session, 'snapshot');
+  const checkpoints = collect(session, 'checkpoint');
+  const rejected = collect(session, 'message-rejected');
+
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 60,
+    state: makeAuthorizedWorldState({ tick: 60, worldTime: 1 }),
+  });
+  transport.receive('host', {
+    type: 'checkpoint', roomCode: 'AB2CD9', hostEpoch: 1, tick: 66,
+    state: makeAuthorizedWorldState({ tick: 66, worldTime: 1.1 }),
+  }, { reliable: true });
+
+  assert.equal(integrityMonitor.calls.length, 0);
+  assert.equal(checkpointIntegrityMonitor.calls.length, 0);
+  assert.equal(snapshots.length, 0);
+  assert.equal(checkpoints.length, 0);
+  assert.equal(session.state.invalidated, false);
+  assert.equal(rejected.length, 2);
+  assert.match(rejected[0].reason, /start|race identity|metadata/i);
+
+  transport.receive('host', {
+    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 70, seed: 'race-seed',
+    config: startConfigForTick(70),
+  }, { reliable: true });
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 72,
+    state: makeAuthorizedWorldState({ tick: 72, worldTime: 1.2 }),
+  });
+  transport.receive('host', {
+    type: 'checkpoint', roomCode: 'AB2CD9', hostEpoch: 1, tick: 78,
+    state: makeAuthorizedWorldState({ tick: 78, worldTime: 1.3 }),
+  }, { reliable: true });
+
+  const authorization = {
+    expectedEpoch: 1,
+    expectedBoatIds: ['host', 'guest', 'ai:0'],
+    expectedSeed: 'race-seed',
+    expectedStartTick: 70,
+  };
+  assert.deepEqual(integrityMonitor.calls[0].authorization, authorization);
+  assert.deepEqual(checkpointIntegrityMonitor.calls[0].authorization, authorization);
+  assert.equal(snapshots.length, 1);
+  assert.equal(checkpoints.length, 1);
+});
+
+for (const type of ['snapshot', 'checkpoint']) {
+  test(`${type} invalidates a schema-valid foreign first authority state`, () => {
+    const { signaling, transport, session } = makeHarness({
+      integrityMonitor: new IntegrityMonitor(),
+      checkpointIntegrityMonitor: new IntegrityMonitor(),
+    });
+    signaling.room(makeRoom({ phase: 'racing' }));
+    const invalidations = collect(session, 'invalidated');
+    transport.receive('host', {
+      type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 60, seed: 'race-seed',
+      config: startConfigForTick(60),
+    }, { reliable: true });
+
+    transport.receive('host', {
+      type, roomCode: 'AB2CD9', hostEpoch: 1, tick: 66,
+      state: makeWorldState({ tick: 66, worldTime: 1.1 }),
+    }, { reliable: type === 'checkpoint' });
+
+    assert.equal(session.state.invalidated, true);
+    assert.match(invalidations[0].reasons.join(' '), /authorized roster|authorized seed/i);
+  });
+}
+
+test('guest invalidates a schema-valid first authority state outside the authorized start timeline', () => {
+  const { signaling, transport, session } = makeHarness({
+    integrityMonitor: new IntegrityMonitor(),
+    checkpointIntegrityMonitor: new IntegrityMonitor(),
+  });
+  const start = startDescriptorForTick(0);
+  signaling.room(makeRoom({ phase: 'racing', start }));
+  const invalidations = collect(session, 'invalidated');
+
+  transport.receive('host', {
+    type: 'snapshot',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 600,
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 0.1 }),
+  });
+
+  assert.equal(session.state.invalidated, true);
+  assert.match(invalidations[0].reasons.join(' '), /tick|worldTime|60 Hz|timeline/i);
+});
+
+test('guest accepts legal first authority states before and after host migration', () => {
+  const { signaling, transport, session } = makeHarness({
+    integrityMonitor: new IntegrityMonitor(),
+    checkpointIntegrityMonitor: new IntegrityMonitor(),
+  });
+  const boatIds = ['host', 'guest', 'new-host', 'ai:0'];
+  const room = makeRoom({
+    phase: 'racing',
+    start: startDescriptorForTick(0, ['host', 'guest', 'new-host']),
+  });
+  room.members.push({
+    playerId: 'new-host', nickname: 'new-host', joinOrder: 3,
+    connected: true, ready: true, isHost: false,
+  });
+  const snapshots = collect(session, 'snapshot');
+  signaling.room(room);
+
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 6,
+    state: makeAuthorizedWorldState({ tick: 6, worldTime: 0.1, boatIds }),
+  });
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'new-host', hostEpoch: 2,
+  });
+  transport.receive('new-host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 2, tick: 12,
+    state: makeAuthorizedWorldState({ tick: 12, worldTime: 0.2, hostEpoch: 2, boatIds, x: 1 }),
+  });
+
+  assert.equal(session.state.invalidated, false);
+  assert.deepEqual(snapshots.map(({ snapshot }) => snapshot.hostEpoch), [1, 2]);
+});
+
+test('race seed authorization uses Object.is semantics', () => {
+  const { signaling, transport, session } = makeHarness({
+    integrityMonitor: new IntegrityMonitor(),
+    checkpointIntegrityMonitor: new IntegrityMonitor(),
+  });
+  signaling.room(makeRoom({ phase: 'racing' }));
+  const invalidations = collect(session, 'invalidated');
+  transport.receive('host', {
+    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 60, seed: -0,
+    config: startConfigForTick(60),
+  }, { reliable: true });
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 66,
+    state: makeAuthorizedWorldState({ tick: 66, worldTime: 1.1, seed: 0 }),
+  });
+
+  assert.equal(session.state.invalidated, true);
+  assert.match(invalidations[0].reasons.join(' '), /authorized seed/i);
+});
+
+for (const type of ['snapshot', 'checkpoint']) {
+  test(`malformed active-host ${type} invalidates the guest session`, () => {
+    const { signaling, transport, session } = makeHarness();
+    signaling.room(makeRoom({ phase: 'racing' }));
+    const invalidations = collect(session, 'invalidated');
+    transport.receive('host', {
+      type, roomCode: 'AB2CD9', hostEpoch: 1, tick: 60,
+      state: { ...makeWorldState(), injected: true },
+    }, { reliable: type === 'checkpoint' });
+
+    assert.equal(session.state.invalidated, true);
+    assert.match(invalidations[0].reasons.join(' '), /malformed|invalid|authority/i);
+  });
+}
+
+test('malformed state from a non-host or stale authority is rejected without invalidation', () => {
+  for (const { sourceId, roomCode, hostEpoch } of [
+    { sourceId: 'guest', roomCode: 'AB2CD9', hostEpoch: 1 },
+    { sourceId: 'host', roomCode: 'ZZ2ZZ9', hostEpoch: 1 },
+    { sourceId: 'host', roomCode: 'AB2CD9', hostEpoch: 0 },
+  ]) {
+    const { signaling, transport, session } = makeHarness();
+    signaling.room(makeRoom({ phase: 'racing' }));
+    const rejected = collect(session, 'message-rejected');
+    transport.receive(sourceId, {
+      type: 'snapshot', roomCode, hostEpoch, tick: 60,
+      state: { ...makeWorldState({ hostEpoch }), injected: true },
+    });
+
+    assert.equal(session.state.invalidated, false);
+    assert.equal(rejected.length, 1);
+  }
+});
+
+test('race identity survives host epochs but resets on leave and room change', () => {
+  const checkpointIntegrityMonitor = new FakeIntegrityMonitor();
+  const {
+    signaling,
+    transport,
+    integrityMonitor,
+    session,
+  } = makeHarness({ checkpointIntegrityMonitor });
+  const room = makeRoom({ phase: 'racing' });
+  room.members.push({
+    playerId: 'new-host', nickname: 'new-host', joinOrder: 3,
+    connected: true, ready: true, isHost: false,
+  });
+  signaling.room(room);
+  receiveStartRace(transport, {
+    tick: 0,
+    playerIds: ['host', 'guest', 'guest-b'],
+  });
+  transport.receive('host', {
+    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 60, seed: 'race-seed',
+    config: startConfigForTick(60, ['host', 'guest', 'new-host']),
+  }, { reliable: true });
+  transport.receive('host', {
+    type: 'checkpoint', roomCode: 'AB2CD9', hostEpoch: 1, tick: 66,
+    state: makeAuthorizedWorldState({
+      tick: 66,
+      worldTime: 1.1,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
+  }, { reliable: true });
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'guest', hostId: 'new-host', hostEpoch: 3,
+  });
+  transport.receive('new-host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 3, tick: 72,
+    state: makeAuthorizedWorldState({
+      tick: 72,
+      worldTime: 1.2,
+      hostEpoch: 3,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
+  });
+  assert.deepEqual(integrityMonitor.calls.at(-1).authorization, {
+    expectedEpoch: 3,
+    expectedBoatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    expectedSeed: 'race-seed',
+    expectedStartTick: 60,
+  });
+
+  const callsBeforeLeave = integrityMonitor.calls.length;
+  assert.equal(session.leaveRoom(), true);
+  transport.receive('new-host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 3, tick: 78,
+    state: makeAuthorizedWorldState({
+      tick: 78,
+      worldTime: 1.3,
+      hostEpoch: 3,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
+  });
+  assert.equal(integrityMonitor.calls.length, callsBeforeLeave);
+
+  signaling.room({ ...makeRoom({ phase: 'racing' }), roomCode: 'XY7ZW8' });
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'XY7ZW8', hostEpoch: 1, tick: 84,
+    state: makeAuthorizedWorldState({ tick: 84, worldTime: 1.4 }),
+  });
+  assert.equal(integrityMonitor.calls.length, callsBeforeLeave);
+  assert.equal(session.state.invalidated, false);
+});
+
 test('guest audits authority, deep-caches checkpoints, ignores old state, and freezes on invalidation', () => {
-  const { signaling, transport, integrityMonitor, session } = makeHarness();
-  signaling.room(makeRoom());
+  const { signaling, transport, integrityMonitor, session } = makeHarness({
+    checkpointIntegrityMonitor: new FakeIntegrityMonitor(),
+  });
+  signaling.room(makeRoom({ phase: 'racing' }));
+  receiveStartRace(transport);
   session.configure({ controlProvider: () => CONTROL });
   const snapshots = collect(session, 'snapshot');
   const checkpoints = collect(session, 'checkpoint');
   const invalidations = collect(session, 'invalidated');
-  const snapshotState = makeWorldState({ tick: 60, worldTime: 1 });
-  const checkpointState = makeWorldState({ tick: 66, worldTime: 1.1, x: 1 });
+  const snapshotState = makeAuthorizedWorldState({ tick: 60, worldTime: 1 });
+  const checkpointState = makeAuthorizedWorldState({ tick: 66, worldTime: 1.1, x: 1 });
 
   transport.receive('host', {
     type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 60, state: snapshotState,
@@ -674,7 +1055,7 @@ test('guest audits authority, deep-caches checkpoints, ignores old state, and fr
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 72,
-    state: makeWorldState({ tick: 72, worldTime: 1.2 }),
+    state: makeAuthorizedWorldState({ tick: 72, worldTime: 1.2 }),
   });
   integrityMonitor.queue({
     status: 'invalidated',
@@ -688,13 +1069,18 @@ test('guest audits authority, deep-caches checkpoints, ignores old state, and fr
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 78,
-    state: makeWorldState({ tick: 78, worldTime: 1.3 }),
+    state: makeAuthorizedWorldState({ tick: 78, worldTime: 1.3 }),
   });
 
   assert.equal(snapshots.length, 1);
   assert.equal(checkpoints.length, 1);
   assert.equal(session.latestCheckpoint.boats[0].phys.x, 1);
-  assert.deepEqual(integrityMonitor.calls[0].authorization, { expectedEpoch: 1 });
+  assert.deepEqual(integrityMonitor.calls[0].authorization, {
+    expectedEpoch: 1,
+    expectedBoatIds: ['host', 'guest', 'ai:0'],
+    expectedSeed: 'race-seed',
+    expectedStartTick: 0,
+  });
   assert.equal(session.state.invalidated, true);
   assert.deepEqual(invalidations[0].reasons, ['impossible displacement']);
   session.update({ tick: 80, now: 2_000 });
@@ -713,47 +1099,44 @@ test('checkpoint audit remains independent when lossy snapshots overtake the rel
     integrityMonitor: new IntegrityMonitor(),
     checkpointIntegrityMonitor: new IntegrityMonitor(),
   });
-  signaling.room(makeRoom());
+  signaling.room(makeRoom({ phase: 'racing' }));
   const checkpoints = collect(session, 'checkpoint');
   const promotions = collect(session, 'promote');
+  receiveStartRace(transport, { tick: 0 });
 
   transport.receive('host', {
     type: 'snapshot',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10 }),
   });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 606,
-    state: makeWorldState({ tick: 606, worldTime: 10.1 }),
+    state: makeAuthorizedWorldState({ tick: 606, worldTime: 10.1 }),
   }, { reliable: true });
   transport.receive('host', {
     type: 'snapshot',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 642,
-    state: makeWorldState({ tick: 642, worldTime: 10.7 }),
+    state: makeAuthorizedWorldState({ tick: 642, worldTime: 10.7 }),
   });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 618,
-    state: makeWorldState({ tick: 618, worldTime: 10.3, x: 1 }),
+    state: makeAuthorizedWorldState({ tick: 618, worldTime: 10.3, x: 1 }),
   }, { reliable: true });
 
   assert.deepEqual(checkpoints.map(({ checkpoint }) => checkpoint.tick), [606, 618]);
   assert.equal(session.latestCheckpoint.tick, 618);
   assert.equal(session.latestCheckpoint.boats[0].phys.x, 1);
 
-  transport.receive('host', {
-    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 650, seed: 'race-seed',
-    config: startConfigForTick(650),
-  }, { reliable: true });
   signaling.hostChanged({
     roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
   });
@@ -767,12 +1150,13 @@ test('a conflicting checkpoint at the same tick cannot replace the cached state'
     integrityMonitor: new IntegrityMonitor(),
     checkpointIntegrityMonitor: new IntegrityMonitor(),
   });
-  signaling.room(makeRoom());
+  signaling.room(makeRoom({ phase: 'racing' }));
   const checkpoints = collect(session, 'checkpoint');
+  receiveStartRace(transport, { tick: 0 });
 
   for (const state of [
-    makeWorldState({ tick: 600, worldTime: 10, x: 0 }),
-    makeWorldState({ tick: 600, worldTime: 10, x: 9 }),
+    makeAuthorizedWorldState({ tick: 600, worldTime: 10, x: 0 }),
+    makeAuthorizedWorldState({ tick: 600, worldTime: 10, x: 9 }),
   ]) {
     transport.receive('host', {
       type: 'checkpoint',
@@ -787,28 +1171,261 @@ test('a conflicting checkpoint at the same tick cannot replace the cached state'
   assert.equal(session.latestCheckpoint.boats[0].phys.x, 0);
 });
 
-test('promotion exposes a checkpoint within 0.5s rollback and announces host readiness', () => {
-  const { signaling, transport, session } = makeHarness();
+test('migration fallback timing dependencies and deadline are validated', () => {
+  assert.throws(
+    () => makeHarness({ timers: { setTimeout() {} } }),
+    /timers.*setTimeout.*clearTimeout/i,
+  );
+  assert.throws(
+    () => makeHarness({ migrationReadyTimeoutMs: 0 }),
+    /migrationReadyTimeoutMs/i,
+  );
+  assert.throws(
+    () => makeHarness({ migrationReadyTimeoutMs: 5_001 }),
+    /migrationReadyTimeoutMs/i,
+  );
+});
+
+test('promotion schedules a 500ms fallback so total host-loss recovery stays within five seconds', () => {
+  const { signaling, timers, session } = makeHarness();
   signaling.room(makeRoom());
-  const promotions = collect(session, 'promote');
+
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+
+  assert.deepEqual(timers.pendingDelays(), [500]);
+  session.close();
+});
+
+test('migration fallback resumes authority when one reliable peer remains stuck', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  const room = makeRoom({ phase: 'racing' });
+  room.members.push({
+    playerId: 'guest-b',
+    nickname: 'guest-b',
+    joinOrder: 3,
+    connected: true,
+    ready: true,
+    isHost: false,
+  });
+  signaling.room(room);
+  receiveStartRace(transport, {
+    tick: 0,
+    playerIds: ['host', 'guest', 'guest-b'],
+  });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
+    state: makeAuthorizedWorldState({
+      tick: 600,
+      worldTime: 10,
+      boatIds: ['host', 'guest', 'guest-b', 'ai:0'],
+    }),
+  }, { reliable: true });
+  const readyEvents = collect(session, 'migration-ready');
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  assert.equal(timers.pendingCount, 1);
+  transport.topology({
+    roomCode: 'AB2CD9',
+    hostId: 'guest',
+    hostEpoch: 2,
+    selfId: 'guest',
+    isHost: true,
+    peerIds: ['host', 'guest-b'],
+  });
+  transport.peerOpen({
+    playerId: 'guest-b', channel: 'control', reliable: true, hostEpoch: 2,
+  });
+
+  timers.advance(249);
+  assert.equal(session.state.migrating, true);
+  assert.deepEqual(transport.broadcasts, []);
+
+  // A false aggregate result models the stuck peer rejecting the reliable batch;
+  // broadcast still gives every available peer a chance to send or queue it.
+  transport.broadcastResults.push(false, false);
+  timers.advance(1);
+
+  assert.equal(session.state.migrating, false);
+  assert.deepEqual(
+    transport.broadcasts.map(({ message }) => message.type),
+    ['checkpoint', 'host-ready'],
+  );
+  assert.deepEqual(readyEvents, [{ hostEpoch: 2, tick: 600 }]);
+
+  session.configure({
+    snapshotProvider: () => makeWorldState({ tick: 601, worldTime: 10.1, hostEpoch: 2 }),
+  });
+  assert.equal(session.update({ tick: 601, now: 250 }), true);
+  assert.deepEqual(
+    transport.broadcasts.slice(2).map(({ message }) => message.type),
+    ['snapshot', 'checkpoint'],
+  );
+});
+
+test('normal all-ready promotion cancels its fallback timer', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  signaling.room(makeRoom());
+  const readyEvents = collect(session, 'migration-ready');
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  transport.topology({
+    roomCode: 'AB2CD9',
+    hostId: 'guest',
+    hostEpoch: 2,
+    selfId: 'guest',
+    isHost: true,
+    peerIds: ['host'],
+  });
+  transport.peerOpen({
+    playerId: 'host', channel: 'control', reliable: true, hostEpoch: 2,
+  });
+
+  assert.equal(session.state.migrating, false);
+  assert.equal(timers.pendingCount, 0);
+  assert.equal(readyEvents.length, 1);
+  timers.advance(250);
+  assert.equal(readyEvents.length, 1);
+  assert.deepEqual(transport.broadcasts.map(({ message }) => message.type), ['host-ready']);
+});
+
+test('a stale promotion timer cannot act after demotion into another host epoch', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  const room = makeRoom({ phase: 'racing' });
+  room.members.push({
+    playerId: 'new-host',
+    nickname: 'new-host',
+    joinOrder: 3,
+    connected: true,
+    ready: true,
+    isHost: false,
+  });
+  signaling.room(room);
+  receiveStartRace(transport, {
+    tick: 0,
+    playerIds: ['host', 'guest', 'new-host'],
+  });
+  transport.receive('host', {
+    type: 'checkpoint',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 600,
+    state: makeAuthorizedWorldState({
+      tick: 600,
+      worldTime: 10,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
+  }, { reliable: true });
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  assert.equal(timers.pendingCount, 1);
+  const staleCallback = timers.callback(1);
+
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'guest', hostId: 'new-host', hostEpoch: 3,
+  });
+  assert.equal(timers.pendingCount, 0);
+  staleCallback();
+
+  assert.equal(session.role, 'guest');
+  assert.equal(session.state.hostEpoch, 3);
+  assert.equal(session.state.migrating, false);
+  assert.deepEqual(transport.broadcasts, []);
+});
+
+test('changing rooms clears promotion fallback and suppresses its retained callback', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  signaling.room(makeRoom());
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  const retainedCallback = timers.callback(1);
+
+  signaling.room({
+    ...makeRoom(),
+    roomCode: 'XY7ZW8',
+  });
+  assert.equal(timers.pendingCount, 0);
+  retainedCallback();
+
+  assert.equal(session.state.roomCode, 'XY7ZW8');
+  assert.equal(session.role, 'guest');
+  assert.deepEqual(transport.broadcasts, []);
+});
+
+test('leaving clears promotion fallback and suppresses a retained callback', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  signaling.room(makeRoom());
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  const retainedCallback = timers.callback(1);
+
+  assert.equal(session.leaveRoom(), true);
+  assert.equal(timers.pendingCount, 0);
+  retainedCallback();
+
+  assert.equal(signaling.leaveCalls, 1);
+  assert.deepEqual(transport.broadcasts, []);
+});
+
+test('closing clears promotion fallback and suppresses all post-close action', () => {
+  const { signaling, transport, timers, session } = makeHarness({
+    migrationReadyTimeoutMs: 250,
+  });
+  signaling.room(makeRoom());
+  const readyEvents = collect(session, 'migration-ready');
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+  const retainedCallback = timers.callback(1);
+
+  session.close();
+  assert.equal(timers.pendingCount, 0);
+  retainedCallback();
+
+  assert.equal(session.state.closed, true);
+  assert.equal(session.state.migrating, false);
+  assert.deepEqual(transport.broadcasts, []);
+  assert.deepEqual(readyEvents, []);
+});
+
+test('promotion exposes a checkpoint within 0.5s rollback and announces host readiness', () => {
+  const { signaling, transport, session } = makeHarness();
+  signaling.room(makeRoom({ phase: 'racing' }));
+  const promotions = collect(session, 'promote');
+  receiveStartRace(transport, { tick: 0 });
+  transport.receive('host', {
+    type: 'checkpoint',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 600,
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10 }),
   }, { reliable: true });
   transport.receive('host', {
     type: 'snapshot',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 624,
-    state: makeWorldState({ tick: 624, worldTime: 10.4 }),
+    state: makeAuthorizedWorldState({ tick: 624, worldTime: 10.4 }),
   });
-  transport.receive('host', {
-    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 630, seed: 'race-seed',
-    config: startConfigForTick(630),
-  }, { reliable: true });
 
   signaling.hostChanged({ roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2 });
 
@@ -827,21 +1444,14 @@ test('promotion exposes a checkpoint within 0.5s rollback and announces host rea
 
 test('promotion preflights checkpoint and host-ready as one reliable batch before completing', () => {
   const { signaling, transport, session } = makeHarness();
-  signaling.room(makeRoom());
+  signaling.room(makeRoom({ phase: 'racing' }));
+  receiveStartRace(transport, { tick: 0 });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'start-race',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 606,
-    seed: 'race-seed',
-    config: startConfigForTick(606),
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10 }),
   }, { reliable: true });
   signaling.hostChanged({
     roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
@@ -944,6 +1554,28 @@ test('lobby host migration promotes without a checkpoint and becomes ready', () 
   assert.deepEqual(transport.broadcasts.map(({ message }) => message.type), ['host-ready']);
 });
 
+test('a server start descriptor recovers the first half-second after host loss without a checkpoint', () => {
+  const { signaling, transport, session } = makeHarness();
+  const start = startDescriptorForTick(0);
+  const promotions = collect(session, 'promote');
+  const snapshots = collect(session, 'snapshot');
+  signaling.room(makeRoom({ phase: 'racing', start }));
+  transport.receive('host', {
+    type: 'snapshot', roomCode: 'AB2CD9', hostEpoch: 1, tick: 30,
+    state: makeAuthorizedWorldState({ tick: 30, worldTime: 0.5 }),
+  });
+  assert.equal(snapshots.length, 1);
+
+  signaling.hostChanged({
+    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
+  });
+
+  assert.equal(session.state.invalidated, false);
+  assert.equal(session.state.migrating, true);
+  assert.deepEqual(session.state.start, start);
+  assert.deepEqual(promotions, [{ checkpoint: null }]);
+});
+
 test('closing reentrantly from promote stops all subsequent promotion work', () => {
   const { signaling, transport, session } = makeHarness();
   signaling.room(makeRoom());
@@ -967,7 +1599,7 @@ test('closing reentrantly from promote stops all subsequent promotion work', () 
 
 test('a started race still requires a migration checkpoint', () => {
   const { signaling, transport, session } = makeHarness();
-  signaling.room(makeRoom());
+  signaling.room(makeRoom({ phase: 'racing' }));
   transport.receive('host', {
     type: 'start-race',
     roomCode: 'AB2CD9',
@@ -987,7 +1619,7 @@ test('a started race still requires a migration checkpoint', () => {
 
 test('duplicate topology events preserve already-open peers during migration', () => {
   const { signaling, transport, session } = makeHarness();
-  const room = makeRoom();
+  const room = makeRoom({ phase: 'racing' });
   room.members.push({
     playerId: 'guest-b',
     nickname: 'guest-b',
@@ -997,16 +1629,20 @@ test('duplicate topology events preserve already-open peers during migration', (
     isHost: false,
   });
   signaling.room(room);
+  receiveStartRace(transport, {
+    tick: 0,
+    playerIds: ['host', 'guest', 'guest-b'],
+  });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 606, seed: 'race-seed',
-    config: startConfigForTick(606, ['host', 'guest', 'guest-b']),
+    state: makeAuthorizedWorldState({
+      tick: 600,
+      worldTime: 10,
+      boatIds: ['host', 'guest', 'guest-b', 'ai:0'],
+    }),
   }, { reliable: true });
   signaling.hostChanged({
     roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
@@ -1083,26 +1719,23 @@ test('migration waits for a reliable peer that closes and reopens before another
 
 test('promotion invalidates a checkpoint requiring more than 0.5s rollback', () => {
   const { signaling, transport, session } = makeHarness();
-  signaling.room(makeRoom());
+  signaling.room(makeRoom({ phase: 'racing' }));
   const promotions = collect(session, 'promote');
+  receiveStartRace(transport, { tick: 0 });
   transport.receive('host', {
     type: 'checkpoint',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10 }),
   }, { reliable: true });
   transport.receive('host', {
     type: 'snapshot',
     roomCode: 'AB2CD9',
     hostEpoch: 1,
     tick: 636,
-    state: makeWorldState({ tick: 636, worldTime: 10.6 }),
+    state: makeAuthorizedWorldState({ tick: 636, worldTime: 10.6 }),
   });
-  transport.receive('host', {
-    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, tick: 640, seed: 'race-seed',
-    config: startConfigForTick(640),
-  }, { reliable: true });
 
   signaling.hostChanged({ roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2 });
 
@@ -1123,7 +1756,13 @@ test('snapshot audit accepts authority after a guest-host-guest epoch transition
     roomCode: 'AB2CD9',
     hostEpoch: 3,
     tick: 612,
-    state: makeWorldState({ tick: 612, worldTime: 10.2, hostEpoch: 3, x: 1 }),
+    state: makeAuthorizedWorldState({
+      tick: 612,
+      worldTime: 10.2,
+      hostEpoch: 3,
+      x: 1,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
   });
 
   assert.equal(session.state.invalidated, false);
@@ -1143,7 +1782,13 @@ test('checkpoint audit accepts authority after a guest-host-guest epoch transiti
     roomCode: 'AB2CD9',
     hostEpoch: 3,
     tick: 618,
-    state: makeWorldState({ tick: 618, worldTime: 10.3, hostEpoch: 3, x: 1 }),
+    state: makeAuthorizedWorldState({
+      tick: 618,
+      worldTime: 10.3,
+      hostEpoch: 3,
+      x: 1,
+      boatIds: ['host', 'guest', 'new-host', 'ai:0'],
+    }),
   }, { reliable: true });
 
   assert.equal(session.state.invalidated, false);
@@ -1212,7 +1857,7 @@ test('host chat is not displayed locally unless reliable delivery preflight and 
 
 test('rescue and start-race messages remain room, source, and epoch scoped', () => {
   const guestHarness = makeHarness();
-  guestHarness.signaling.room(makeRoom());
+  guestHarness.signaling.room(makeRoom({ phase: 'racing' }));
   guestHarness.session.update({ tick: 42, now: 0 });
   guestHarness.session.requestRescue();
   assert.deepEqual(guestHarness.transport.toHost[0], {
@@ -1253,9 +1898,137 @@ test('rescue and start-race messages remain room, source, and epoch scoped', () 
   assert.equal(starts.length, 1);
 });
 
+test('host startRace requires the signaling room to be locked in racing phase', () => {
+  const { signaling, transport, session } = makeHarness({ playerId: 'host' });
+  signaling.room(makeRoom({ localId: 'host', phase: 'lobby' }));
+
+  assert.throws(() => session.startRace({
+    tick: 120,
+    seed: 'race-seed',
+    config: startConfigForTick(120),
+  }), /phase|locked|racing/i);
+  assert.equal(transport.broadcasts.length, 0);
+});
+
+test('guest buffers one canonical start-race until its room view has racing phase', () => {
+  const { signaling, transport, session } = makeHarness();
+  signaling.room(makeRoom({ phase: 'lobby' }));
+  const starts = collect(session, 'start-race');
+  const rejected = collect(session, 'message-rejected');
+  const message = {
+    type: 'start-race',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 120,
+    seed: 'race-seed',
+    config: startConfigForTick(120),
+  };
+
+  transport.receive('host', message, { reliable: true });
+  assert.equal(starts.length, 0);
+  assert.equal(rejected.length, 0);
+  transport.receive('host', {
+    ...message,
+    tick: 121,
+    seed: 'conflicting-race-seed',
+    config: startConfigForTick(121),
+  }, { reliable: true });
+  assert.equal(starts.length, 0);
+
+  signaling.room(makeRoom({ phase: 'racing' }));
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].seed, 'race-seed');
+});
+
+test('a racing room start descriptor starts a guest exactly once without a peer start message', () => {
+  const { signaling, transport, session } = makeHarness();
+  const starts = collect(session, 'start-race');
+  const rejected = collect(session, 'message-rejected');
+  const start = startDescriptorForTick(120);
+
+  signaling.room(makeRoom({ phase: 'racing', start }));
+
+  assert.deepEqual(starts, [{ hostEpoch: 1, ...start }]);
+  assert.deepEqual(session.state.start, start);
+
+  transport.receive('host', {
+    type: 'start-race', roomCode: 'AB2CD9', hostEpoch: 1, ...start,
+  }, { reliable: true });
+  assert.equal(starts.length, 1);
+  assert.equal(rejected.length, 0);
+});
+
+test('the host callback is idempotent when the authoritative room already started the same race', () => {
+  const { signaling, transport, session } = makeHarness({ playerId: 'host' });
+  const starts = collect(session, 'start-race');
+  const start = startDescriptorForTick(120);
+  signaling.room(makeRoom({ localId: 'host', phase: 'racing', start }));
+
+  assert.equal(session.startRace(structuredClone(start)), true);
+  assert.equal(starts.length, 1);
+  assert.deepEqual(transport.broadcasts, []);
+
+  const conflicting = structuredClone(start);
+  conflicting.seed = 'conflicting-seed';
+  assert.throws(() => session.startRace(conflicting), /authoritative|descriptor|different|match/i);
+  assert.equal(starts.length, 1);
+});
+
+test('a racing room cannot replace its authoritative start descriptor', () => {
+  const { signaling, session } = makeHarness();
+  const invalidations = collect(session, 'invalidated');
+  const start = startDescriptorForTick(120);
+  signaling.room(makeRoom({ phase: 'racing', start }));
+  const changed = structuredClone(start);
+  changed.seed = 'replacement-seed';
+
+  signaling.room(makeRoom({ phase: 'racing', start: changed }));
+
+  assert.equal(session.state.invalidated, true);
+  assert.deepEqual(session.state.start, start);
+  assert.match(invalidations[0].reasons.join(' '), /start|descriptor|changed/i);
+});
+
+test('guest clears a buffered start-race when the host epoch changes before room lock', () => {
+  const { signaling, transport, session } = makeHarness();
+  signaling.room(makeRoom({ phase: 'lobby' }));
+  const starts = collect(session, 'start-race');
+  transport.receive('host', {
+    type: 'start-race',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 120,
+    seed: 'stale-race-seed',
+    config: startConfigForTick(120),
+  }, { reliable: true });
+
+  signaling.room(makeRoom({ phase: 'racing', hostEpoch: 2 }));
+
+  assert.equal(starts.length, 0);
+});
+
+test('leaveRoom clears a buffered start-race before a later racing room view', () => {
+  const { signaling, transport, session } = makeHarness();
+  signaling.room(makeRoom({ phase: 'lobby' }));
+  const starts = collect(session, 'start-race');
+  transport.receive('host', {
+    type: 'start-race',
+    roomCode: 'AB2CD9',
+    hostEpoch: 1,
+    tick: 120,
+    seed: 'departed-race-seed',
+    config: startConfigForTick(120),
+  }, { reliable: true });
+
+  assert.equal(session.leaveRoom(), true);
+  signaling.room(makeRoom({ phase: 'racing' }));
+
+  assert.equal(starts.length, 0);
+});
+
 test('host startRace broadcasts a canonical reliable message and starts locally', () => {
   const { signaling, transport, session } = makeHarness({ playerId: 'host' });
-  signaling.room(makeRoom({ localId: 'host' }));
+  signaling.room(makeRoom({ localId: 'host', phase: 'racing' }));
   const starts = collect(session, 'start-race');
 
   assert.equal(session.startRace({
@@ -1284,7 +2057,7 @@ test('host startRace broadcasts a canonical reliable message and starts locally'
 
 test('startRace rejects a duplicate start after the local race has begun', () => {
   const { signaling, transport, session } = makeHarness({ playerId: 'host' });
-  signaling.room(makeRoom({ localId: 'host' }));
+  signaling.room(makeRoom({ localId: 'host', phase: 'racing' }));
   const start = {
     tick: 120,
     seed: 'race-seed',
@@ -1298,7 +2071,7 @@ test('startRace rejects a duplicate start after the local race has begun', () =>
 
 test('startRace preflights every connected guest before any reliable broadcast or local start', () => {
   const { signaling, transport, session } = makeHarness({ playerId: 'host' });
-  const room = makeRoom({ localId: 'host' });
+  const room = makeRoom({ localId: 'host', phase: 'racing' });
   room.members.push({
     playerId: 'guest-b',
     nickname: 'guest-b',
@@ -1329,7 +2102,7 @@ test('startRace preflights every connected guest before any reliable broadcast o
 
 test('startRace strictly canonicalizes and forwards the complete multiplayer race config', () => {
   const { signaling, transport, session } = makeHarness({ playerId: 'host' });
-  signaling.room(makeRoom({ localId: 'host' }));
+  signaling.room(makeRoom({ localId: 'host', phase: 'racing' }));
   const starts = collect(session, 'start-race');
 
   assert.equal(session.startRace({
@@ -1371,7 +2144,7 @@ test('startRace strictly canonicalizes and forwards the complete multiplayer rac
 
 test('startRace accepts only a strict message for the active room and epoch', () => {
   const { signaling, transport, session } = makeHarness({ playerId: 'host' });
-  signaling.room(makeRoom({ localId: 'host' }));
+  signaling.room(makeRoom({ localId: 'host', phase: 'racing' }));
   const message = {
     type: 'start-race',
     roomCode: 'AB2CD9',

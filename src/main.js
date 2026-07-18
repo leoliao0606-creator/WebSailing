@@ -20,7 +20,12 @@ import { resolveBoatCollisions } from './sim/collision.js';
 import { RulesEngine, PENALTY_SECONDS } from './game/rules.js';
 import { GhostRecorder, GhostBoat, saveGhost, loadGhost } from './game/ghost.js';
 import { Tutorial } from './game/tutorial.js';
-import { Menu, loadSettings } from './game/menu.js';
+import {
+  Menu,
+  loadSettings,
+  resolveSimulationEnvironment,
+  simulationControlSettings,
+} from './game/menu.js';
 import {
   buildRaceRoster,
   buildStartGrid,
@@ -107,9 +112,15 @@ export class App {
   // —— 设置应用 ——
   applySettings() {
     const s = this.settings;
-    this.wind.setBase(this.wind.baseFromPsi, s.windKn);
-    this.wind.gustiness = s.gustiness;
-    this.waveField.setConditions(this.wind.baseFromPsi, s.windKn);
+    const environment = resolveSimulationEnvironment({
+      mode: this.mode,
+      settings: s,
+      multiplayerStart: this._multiplayerStart,
+      currentWindPsi: this.wind.baseFromPsi,
+    });
+    this.wind.setBase(environment.windPsi, environment.windKn);
+    this.wind.gustiness = environment.gustiness;
+    this.waveField.setConditions(environment.windPsi, environment.windKn);
     this.audio.setVolume(s.volume);
 
     // —— 画质 ——
@@ -679,6 +690,7 @@ export class App {
     this.wind.update(dt);
     this.waveField.update(dt);
 
+    const controlSettings = simulationControlSettings(this.mode, this.settings);
     for (const boat of this.boats) {
       const aiControlled = !boat.playerId || takeoverPlayerIds.has(boat.playerId);
       if (aiControlled) {
@@ -689,7 +701,7 @@ export class App {
           helm.update(this.wind, this.race.targetFor(boat), worldTime, dt);
         }
       } else {
-        boat.applyControlIntent(controlFor(boat.playerId), this.settings, dt, worldTime);
+        boat.applyControlIntent(controlFor(boat.playerId), controlSettings, dt, worldTime);
       }
     }
 
@@ -717,7 +729,7 @@ export class App {
     if (!this.player) return;
     this.player.applyControlIntent(
       controlFor(this.player.playerId),
-      this.settings,
+      simulationControlSettings(this.mode, this.settings),
       dt,
       worldTime,
     );
@@ -781,7 +793,7 @@ export class App {
             ? this.race.entries.get(boat).finishT
             : null,
         }));
-        this.menu.showResults(rows, false);
+        this.menu.showResults(rows, false, { allowRestart: false });
       }, 1800);
     }
   }

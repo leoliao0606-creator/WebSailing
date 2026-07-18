@@ -34,6 +34,7 @@ export const MAX_BOAT_ID_BYTES = 128;
 export const MAX_SEED_BYTES = 256;
 export const MAX_RACE_SPLITS = 16;
 export const MAX_RACE_RESULTS = 8;
+export const MAX_RACE_LEG = 5;
 export const MAX_WORLD_STATE_BYTES = 64 * 1024;
 export const RACE_STATES = Object.freeze(['prestart', 'racing', 'finished']);
 
@@ -176,9 +177,12 @@ function cloneRaceEntry(value, index, boatIds) {
     fail(`${path}.splits cannot exceed ${MAX_RACE_SPLITS} entries`);
   }
 
+  const leg = nonNegativeInteger(value.leg, `${path}.leg`);
+  if (leg > MAX_RACE_LEG) fail(`${path}.leg must be between 0 and ${MAX_RACE_LEG}`);
+
   return {
     boatId,
-    leg: nonNegativeInteger(value.leg, `${path}.leg`),
+    leg,
     ocs: booleanValue(value.ocs, `${path}.ocs`),
     splits: value.splits.map((split, splitIndex) => (
       finiteNumber(split, `${path}.splits[${splitIndex}]`)

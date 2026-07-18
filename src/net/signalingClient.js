@@ -1,12 +1,18 @@
 import {
+  MAX_ICE_CANDIDATE_BYTES,
+  MAX_ICE_METADATA_BYTES,
   MAX_PLAYER_ID_BYTES,
   MAX_RESUME_TOKEN_BYTES,
+  MAX_SDP_BYTES,
+  normalizeStartDescriptor,
+  startDescriptorsEqual,
 } from './protocol.js';
 
 export const SIGNALING_SESSION_KEY = 'windchaser.signaling.session.v1';
 
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
+const MAX_DEPARTED_SESSION_TOMBSTONES = 16;
 const MAX_SIGNAL_DATA_BYTES = 64 * 1024;
 const MAX_NEGOTIATION_ID_BYTES = 128;
 const MAX_ICE_SERVERS = 32;
@@ -72,6 +78,13 @@ function boundedStringValue(value, path, maximumBytes, options) {
     throw new TypeError(`${path} cannot exceed ${maximumBytes} UTF-8 bytes`);
   }
   return normalized;
+}
+
+function enforceTextBytes(value, path, maximumBytes) {
+  if (UTF8_ENCODER.encode(value).byteLength > maximumBytes) {
+    throw new TypeError(`${path} cannot exceed ${maximumBytes} UTF-8 bytes`);
+  }
+  return value;
 }
 
 function canonicalRoomCode(value, path) {
@@ -173,21 +186,29 @@ function sanitizeMember(value, index) {
 }
 
 function sanitizeRoom(value) {
+  if (!isRecord(value)) throw new TypeError('room must be a plain object');
+  if (typeof value.phase !== 'string' || !ROOM_PHASES.has(value.phase)) {
+    throw new TypeError('room.phase must be lobby or racing');
+  }
   const fields = ['roomCode', 'hostId', 'hostEpoch', 'phase', 'members'];
+  if (value.phase === 'racing') fields.push('start');
   exactRecord(value, fields, fields, 'room');
   if (!Array.isArray(value.members) || value.members.length > 8) {
     throw new TypeError('room.members must be an array of at most eight members');
   }
-  if (typeof value.phase !== 'string' || !ROOM_PHASES.has(value.phase)) {
-    throw new TypeError('room.phase must be lobby or racing');
-  }
-  return {
+  const room = {
     roomCode: stringValue(value.roomCode, 'room.roomCode'),
     hostId: stringValue(value.hostId, 'room.hostId', { nullable: true }),
     hostEpoch: nonNegativeInteger(value.hostEpoch, 'room.hostEpoch'),
     phase: value.phase,
     members: value.members.map(sanitizeMember),
   };
+  if (value.phase === 'racing') {
+    const start = normalizeStartDescriptor(value.start);
+    if (!start.ok) throw new TypeError(`room.start is invalid: ${start.error}`);
+    room.start = start.value;
+  }
+  return room;
 }
 
 function sanitizeCredentials(value) {
@@ -260,7 +281,10 @@ function sanitizeRtcSignalData(value) {
       'signal.data',
     );
     if (typeof value.sdp !== 'string') throw new TypeError('signal.data.sdp must be a string');
-    const normalized = { type: value.type, sdp: value.sdp };
+    const normalized = {
+      type: value.type,
+      sdp: enforceTextBytes(value.sdp, 'signal.data.sdp', MAX_SDP_BYTES),
+    };
     copyNegotiationId(value, normalized);
     return deepFreeze(boundedJson(normalized, 'signal.data'));
   }
@@ -278,12 +302,23 @@ function sanitizeRtcSignalData(value) {
   if (value.candidate !== null && typeof value.candidate !== 'string') {
     throw new TypeError('signal.data.candidate must be a string or null');
   }
-  const normalized = { type: 'ice', candidate: value.candidate };
+  const normalized = {
+    type: 'ice',
+    candidate: value.candidate === null
+      ? null
+      : enforceTextBytes(
+        value.candidate,
+        'signal.data.candidate',
+        MAX_ICE_CANDIDATE_BYTES,
+      ),
+  };
   if (Object.hasOwn(value, 'sdpMid')) {
     if (value.sdpMid !== null && typeof value.sdpMid !== 'string') {
       throw new TypeError('signal.data.sdpMid must be a string or null');
     }
-    normalized.sdpMid = value.sdpMid;
+    normalized.sdpMid = value.sdpMid === null
+      ? null
+      : enforceTextBytes(value.sdpMid, 'signal.data.sdpMid', MAX_ICE_METADATA_BYTES);
   }
   if (Object.hasOwn(value, 'sdpMLineIndex')) {
     if (value.sdpMLineIndex !== null
@@ -296,7 +331,13 @@ function sanitizeRtcSignalData(value) {
     if (value.usernameFragment !== null && typeof value.usernameFragment !== 'string') {
       throw new TypeError('signal.data.usernameFragment must be a string or null');
     }
-    normalized.usernameFragment = value.usernameFragment;
+    normalized.usernameFragment = value.usernameFragment === null
+      ? null
+      : enforceTextBytes(
+        value.usernameFragment,
+        'signal.data.usernameFragment',
+        MAX_ICE_METADATA_BYTES,
+      );
   }
   copyNegotiationId(value, normalized);
   return deepFreeze(boundedJson(normalized, 'signal.data'));
@@ -360,15 +401,23 @@ function sanitizeDomainEvent(message) {
     };
   }
   if (message.type === 'room-locked') {
-    exactRecord(message, [...base, 'phase'], [...base, 'phase'], message.type);
+    exactRecord(
+      message,
+      [...base, 'phase', 'start'],
+      [...base, 'phase', 'start'],
+      message.type,
+    );
     if (message.phase !== 'racing') {
       throw new TypeError('room-locked.phase must be racing');
     }
+    const start = normalizeStartDescriptor(message.start);
+    if (!start.ok) throw new TypeError(`room-locked.start is invalid: ${start.error}`);
     return {
       type: message.type,
       roomCode: stringValue(message.roomCode, `${message.type}.roomCode`),
       playerId: stringValue(message.playerId, `${message.type}.playerId`),
       phase: message.phase,
+      start: start.value,
     };
   }
   if (message.type === 'room-removed') {
@@ -403,6 +452,14 @@ export class SignalingClient extends EventTarget {
   #socket = null;
 
   #generation = 0;
+
+  #roomGeneration = 0;
+
+  #roomAdmission = 'open';
+
+  #pendingRoomGeneration = null;
+
+  #departedSessions = new Map();
 
   #manualClose = false;
 
@@ -474,22 +531,24 @@ export class SignalingClient extends EventTarget {
   }
 
   createRoom(nickname) {
-    return this.#send({ type: 'create-room', nickname });
+    return this.#sendRoomCommand({ type: 'create-room', nickname });
   }
 
   joinRoom(roomCode, nickname) {
-    return this.#send({ type: 'join-room', roomCode, nickname });
+    return this.#sendRoomCommand({ type: 'join-room', roomCode, nickname });
   }
 
   setReady(ready) {
     return this.#send({ type: 'set-ready', ready });
   }
 
-  lockRoom({ timeoutMs = DEFAULT_LOCK_TIMEOUT_MS } = {}) {
+  lockRoom(startDescriptor, { timeoutMs = DEFAULT_LOCK_TIMEOUT_MS } = {}) {
     if (this.#pendingLock) return this.#pendingLock.promise;
     if (!this.#state.roomCode || !this.#state.playerId) {
       return Promise.reject(new Error('A room session is required before locking'));
     }
+    const start = normalizeStartDescriptor(startDescriptor);
+    if (!start.ok) return Promise.reject(new TypeError(start.error));
     if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       return Promise.reject(new TypeError('timeoutMs must be a positive finite number'));
     }
@@ -505,11 +564,12 @@ export class SignalingClient extends EventTarget {
       reject: rejectLock,
       roomCode: this.#state.roomCode,
       playerId: this.#state.playerId,
+      start: start.value,
       timer: null,
     };
     this.#pendingLock = pending;
     try {
-      this.#send({ type: 'lock-room' });
+      this.#send({ type: 'lock-room', start: start.value });
     } catch (error) {
       this.#settlePendingLock(error);
       return promise;
@@ -522,12 +582,16 @@ export class SignalingClient extends EventTarget {
   }
 
   sendSignal(targetId, data) {
-    return this.#send({ type: 'signal', targetId, data });
+    return this.#send({ type: 'signal', targetId, data: sanitizeRtcSignalData(data) });
   }
 
   leave() {
     this.#manualClose = false;
     this.#settlePendingLock(new Error('Room lock cancelled by leave'));
+    this.#roomGeneration += 1;
+    this.#rememberDepartedSession(this.#roomGeneration);
+    this.#roomAdmission = 'blocked';
+    this.#pendingRoomGeneration = null;
     this.#clearCredentials();
     const socket = this.#socket;
     if (socket?.readyState === this.#openState()) {
@@ -751,6 +815,16 @@ export class SignalingClient extends EventTarget {
     return this.#sendOn(socket, message);
   }
 
+  #sendRoomCommand(message) {
+    const sent = this.#send(message);
+    if (this.#roomAdmission === 'blocked') {
+      this.#roomGeneration += 1;
+      this.#pendingRoomGeneration = this.#roomGeneration;
+      this.#roomAdmission = 'awaiting-session';
+    }
+    return sent;
+  }
+
   #sendOn(socket, message) {
     socket.send(JSON.stringify(message));
     return true;
@@ -808,8 +882,11 @@ export class SignalingClient extends EventTarget {
       throw new TypeError('session roomCode must match room.roomCode');
     }
     const iceServers = sanitizeIceServers(message.iceServers);
+    if (!this.#canAcceptSession(credentials)) return;
 
     this.#credentials = credentials;
+    this.#roomAdmission = 'open';
+    this.#pendingRoomGeneration = null;
     this.#saveCredentials();
     this.#manualClose = false;
     this.#reconnectAttempt = 0;
@@ -832,12 +909,16 @@ export class SignalingClient extends EventTarget {
   #handleRoomView(message) {
     exactRecord(message, ['type', 'room'], ['type', 'room'], 'room-view');
     const room = sanitizeRoom(message.room);
+    if (!this.#canAcceptRoom(room)) return;
     this.#commit({ roomCode: room.roomCode, room });
     this.dispatchEvent(eventWithDetail('room-view', deepFreeze(jsonClone(room))));
   }
 
   #handleDomainEvent(message) {
     const event = sanitizeDomainEvent(message);
+    if (this.#roomAdmission !== 'open'
+      || !this.#state.room
+      || event.roomCode !== this.#state.room.roomCode) return;
     this.#applyDomainEvent(event);
     const detail = deepFreeze(jsonClone(event));
     this.dispatchEvent(eventWithDetail('domain-event', detail));
@@ -845,7 +926,13 @@ export class SignalingClient extends EventTarget {
     if (event.type === 'room-locked'
       && this.#pendingLock?.roomCode === event.roomCode
       && this.#pendingLock?.playerId === event.playerId) {
-      this.#settlePendingLock(null, detail);
+      if (startDescriptorsEqual(this.#pendingLock.start, event.start)) {
+        this.#settlePendingLock(null, detail);
+      } else {
+        this.#settlePendingLock(
+          new Error('Room lock acknowledged a different start descriptor'),
+        );
+      }
     }
     if (event.type === 'host-changed') {
       this.dispatchEvent(eventWithDetail('host-change', detail));
@@ -872,6 +959,7 @@ export class SignalingClient extends EventTarget {
       member.ready = event.ready;
     } else if (event.type === 'room-locked') {
       room.phase = event.phase;
+      room.start = event.start;
     } else if (event.type === 'member-left' && member) {
       member.connected = false;
       member.ready = false;
@@ -957,6 +1045,33 @@ export class SignalingClient extends EventTarget {
     try {
       this.#storage.setItem(SIGNALING_SESSION_KEY, JSON.stringify(this.#credentials));
     } catch {}
+  }
+
+  #sessionKey({ playerId, roomCode }) {
+    return `${roomCode}\u0000${playerId}`;
+  }
+
+  #rememberDepartedSession(generation) {
+    const credentials = this.#credentials;
+    if (!credentials) return;
+    const key = this.#sessionKey(credentials);
+    this.#departedSessions.delete(key);
+    this.#departedSessions.set(key, generation);
+    while (this.#departedSessions.size > MAX_DEPARTED_SESSION_TOMBSTONES) {
+      this.#departedSessions.delete(this.#departedSessions.keys().next().value);
+    }
+  }
+
+  #canAcceptSession(credentials) {
+    if (this.#roomAdmission === 'blocked') return false;
+    return !this.#departedSessions.has(this.#sessionKey(credentials));
+  }
+
+  #canAcceptRoom(room) {
+    if (this.#roomAdmission !== 'open'
+      || !this.#state.playerId
+      || room.roomCode !== this.#state.roomCode) return false;
+    return room.members.some((member) => member.playerId === this.#state.playerId);
   }
 
   #clearCredentials() {

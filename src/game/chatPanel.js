@@ -135,6 +135,7 @@ export class ChatPanel {
     this.listeners = [];
     this.collapsed = false;
     this.errorKey = null;
+    this.rateLimitedDuringSend = false;
     this.roomCode = undefined;
     this._build();
     mountRoot.append(this.root);
@@ -236,6 +237,7 @@ export class ChatPanel {
     this._listen(session, 'rolechange', () => this.refresh());
     this._listen(session, 'chat-rate-limited', (event) => {
       if (event?.detail?.sourceId === this.session?.state?.playerId) {
+        this.rateLimitedDuringSend = true;
         this._showError('chat.error.rate');
       }
     });
@@ -308,6 +310,7 @@ export class ChatPanel {
       return false;
     }
     let accepted;
+    this.rateLimitedDuringSend = false;
     try {
       accepted = this.session.sendChat(validated.text);
     } catch {
@@ -315,7 +318,7 @@ export class ChatPanel {
       return false;
     }
     if (accepted === false) {
-      this._showError('chat.error.rate');
+      this._showError(this.rateLimitedDuringSend ? 'chat.error.rate' : 'chat.error.unavailable');
       return false;
     }
     this.model.recordOutgoing(timestamp);
