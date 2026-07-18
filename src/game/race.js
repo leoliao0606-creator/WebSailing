@@ -6,6 +6,8 @@ import { DEG, formatTime, headingToDir, wrapPi } from '../util/math.js';
 import { createBuoy, createCommitteeBoat } from '../render/terrain.js';
 import { t } from '../i18n.js';
 
+export const MARK_RADIUS = 16; // 绕标判定半径 m(与水面判定圈所见一致)
+
 export class RaceCourse {
   // 沿起赛时风向搭建赛道
   constructor(scene, waveField, windFromPsi, center = { x: 0, z: 0 }) {
@@ -51,13 +53,62 @@ export class RaceCourse {
       this.objects.push(b);
     }
     for (const o of this.objects) scene.add(o);
+
+    // —— 当前目标高亮:标记 = 判定圈(半径与判定一致) + 光柱;起终点线 = 两端小圈 ——
+    this.highlight = [];
+    this.ringMat = new THREE.MeshBasicMaterial({
+      color: 0xffd35c, transparent: true, opacity: 0.45,
+      side: THREE.DoubleSide, depthWrite: false, depthTest: false, fog: false,
+    });
+    const ringGeo = new THREE.RingGeometry(MARK_RADIUS - 1.4, MARK_RADIUS, 64);
+    ringGeo.rotateX(-Math.PI / 2);
+    this.markRing = new THREE.Mesh(ringGeo, this.ringMat);
+    this.markRing.renderOrder = 4;
+    this.beamMat = new THREE.MeshBasicMaterial({
+      color: 0xffd35c, transparent: true, opacity: 0.13,
+      side: THREE.DoubleSide, depthWrite: false, fog: false,
+    });
+    this.beam = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 1.1, 30, 12, 1, true), this.beamMat);
+    this.beam.renderOrder = 4;
+    this.lineRingMat = new THREE.MeshBasicMaterial({
+      color: 0x7fe0a8, transparent: true, opacity: 0.45,
+      side: THREE.DoubleSide, depthWrite: false, depthTest: false, fog: false,
+    });
+    const endGeo = new THREE.RingGeometry(4.2, 5.4, 48);
+    endGeo.rotateX(-Math.PI / 2);
+    this.lineRingA = new THREE.Mesh(endGeo, this.lineRingMat);
+    this.lineRingB = new THREE.Mesh(endGeo, this.lineRingMat);
+    this.lineRingA.renderOrder = 4;
+    this.lineRingB.renderOrder = 4;
+    this.highlight.push(this.markRing, this.beam, this.lineRingA, this.lineRingB);
+    for (const o of this.highlight) {
+      o.visible = false;
+      o.position.y = 0.12;
+      scene.add(o);
+    }
+  }
+
+  // 当前目标高亮:target = {type:'mark', mark} | {type:'line'} | null
+  setActiveTarget(target) {
+    const isMark = target?.type === 'mark';
+    const isLine = target?.type === 'line';
+    this.markRing.visible = this.beam.visible = isMark;
+    this.lineRingA.visible = this.lineRingB.visible = isLine;
+    if (isMark) {
+      const m = this.marks[target.mark];
+      this.markRing.position.set(m.x, 0.12, m.z);
+      this.beam.position.set(m.x, 15, m.z);
+    } else if (isLine) {
+      this.lineRingA.position.set(this.pin.x, 0.12, this.pin.z);
+      this.lineRingB.position.set(this.committee.x, 0.12, this.committee.z);
+    }
   }
 
   legLabel(leg) {
     return t(leg.key, { n: leg.lap ?? '' });
   }
 
-  // 浮标随浪起伏
+  // 浮标随浪起伏 + 目标高亮呼吸脉冲
   update(time) {
     for (const o of this.objects) {
       const w = this.waveField.sample(o.position.x, o.position.z);
@@ -65,6 +116,10 @@ export class RaceCourse {
       o.rotation.x = -w.nz * 0.4;
       o.rotation.z = w.nx * 0.4;
     }
+    const pulse = 0.5 + 0.5 * Math.sin(time * 2.6);
+    this.ringMat.opacity = 0.3 + 0.25 * pulse;
+    this.lineRingMat.opacity = 0.3 + 0.25 * pulse;
+    this.beamMat.opacity = 0.09 + 0.06 * pulse;
   }
 
   // 点在起航线的上风侧？
@@ -83,6 +138,7 @@ export class RaceCourse {
 
   dispose() {
     for (const o of this.objects) this.scene.remove(o);
+    for (const o of this.highlight) this.scene.remove(o);
   }
 }
 
@@ -272,7 +328,7 @@ export class RaceManager {
         const leg = c.legs[e.leg];
         if (leg.type === 'mark') {
           const m = c.marks[leg.mark];
-          if (Math.hypot(p.x - m.x, p.z - m.z) < 16) {
+          if (Math.hypot(p.x - m.x, p.z - m.z) < MARK_RADIUS) {
             e.splits.push(this.t);
             e.leg++;
             if (b.isPlayer) this.emit(t('race.msg.rounded', { mark: t(m.nameKey), next: c.legLabel(c.legs[e.leg]) }));
@@ -294,6 +350,16 @@ export class RaceManager {
     }
 
     if (this.boats.every((b) => this.entries.get(b).finished)) this.state = 'finished';
+  }
+
+  // 给赛道高亮:某船当前目标的类型({type:'mark',mark}|{type:'line'}|null)
+  activeTargetFor(boat) {
+    const e = this.entries.get(boat);
+    if (!e || e.finished) return null;
+    if (this.state === 'prestart' || e.leg === 0) return { type: 'line' };
+    const leg = this.course.legs[e.leg];
+    if (leg.type === 'mark') return { type: 'mark', mark: leg.mark };
+    return { type: 'line' };
   }
 
   // 给 AI/小地图：某船当前目标点
@@ -323,7 +389,11 @@ export class RaceManager {
     const leg = c.legs[e.leg];
     const pos = this.standings().indexOf(boat) + 1;
     const posTxt = this.boats.length > 1 ? ` · ${t('race.st.pos', { n: pos })}` : '';
-    return { phase: 'racing', text: `${c.legLabel(leg)} · ${formatTime(this.t)}${posTxt}` };
+    const tgt = this.targetFor(boat);
+    const distTxt = tgt
+      ? ` · ${t('race.st.dist', { d: Math.hypot(boat.phys.x - tgt.x, boat.phys.z - tgt.z).toFixed(0) })}`
+      : '';
+    return { phase: 'racing', text: `${c.legLabel(leg)}${distTxt} · ${formatTime(this.t)}${posTxt}` };
   }
 
   // 简易名次：按航段进度 + 距目标距离

@@ -13,6 +13,7 @@ const DEFAULTS = {
   aiCount: 3,
   autoHike: true,
   autoTrim: false,
+  coach: true,          // 新手教练提示(最佳帆/板参考 + 操作提示)
   ghost: true,
   volume: 0.7,
   lang: null,           // null = 首次启动按浏览器语言
@@ -153,6 +154,7 @@ export class Menu {
           <select id="s-ai">${[1, 2, 3].map((v) => opt(v, s.aiCount, v)).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-hike" ${s.autoHike ? 'checked' : ''}> ${t('set.autoHike')}</label>
         <label class="check"><input type="checkbox" id="s-trim" ${s.autoTrim ? 'checked' : ''}> ${t('set.autoTrim')}</label>
+        <label class="check"><input type="checkbox" id="s-coach" ${s.coach ? 'checked' : ''}> ${t('set.coach')}</label>
         <label class="check"><input type="checkbox" id="s-ghost" ${s.ghost ? 'checked' : ''}> ${t('set.ghost')}</label>
         <label><span>${t('set.volume')} <output id="o-vol">${Math.round(s.volume * 100)}</output>%</span>
           <input type="range" id="s-vol" min="0" max="100" step="5" value="${s.volume * 100}"></label>
@@ -227,6 +229,7 @@ export class Menu {
     st.aiCount = Number(el.querySelector('#s-ai').value);
     st.autoHike = el.querySelector('#s-hike').checked;
     st.autoTrim = el.querySelector('#s-trim').checked;
+    st.coach = el.querySelector('#s-coach').checked;
     st.ghost = el.querySelector('#s-ghost').checked;
     st.volume = Number(el.querySelector('#s-vol').value) / 100;
     st.quality = el.querySelector('#s-quality').value;

@@ -16,6 +16,8 @@ import { HUD } from './game/hud.js';
 import { Boat } from './game/boat.js';
 import { AIHelm } from './game/ai.js';
 import { RaceCourse, RaceManager, saveBest, loadBest } from './game/race.js';
+import { resolveBoatCollisions } from './sim/collision.js';
+import { RulesEngine, PENALTY_SECONDS } from './game/rules.js';
 import { GhostRecorder, GhostBoat, saveGhost, loadGhost } from './game/ghost.js';
 import { Tutorial } from './game/tutorial.js';
 import { Menu, loadSettings } from './game/menu.js';
@@ -165,6 +167,8 @@ export class App {
     this._clearBoats();
     this.race?.course?.dispose();
     this.race = null;
+    this.rules = null;
+    this._contacts = [];
     this.ghost?.dispose();
     this.ghost = null;
     this.ghostRec = null;
@@ -382,6 +386,7 @@ export class App {
       racers.push(ai);
     }
     this.race = new RaceManager(course, racers, this.settings.countdown);
+    this.rules = new RulesEngine(this.wind);
     // 幽灵船：回放该风速/该模式下的个人最佳轨迹
     this.ghostRec = new GhostRecorder(course);
     const ghostData = this.settings.ghost ? loadGhost(this.settings.windKn, aiCount) : null;
@@ -596,9 +601,23 @@ export class App {
     this.shadowWind.exclude = null;
     this._boatCollisions();
 
+    // 航行规则:碰撞判责 -> 让行方减速处罚
+    if (this.rules) {
+      this.rules.update(this.boats, this._contacts, dt);
+      for (const ev of this.rules.takeEvents()) {
+        if (ev.boat.isPlayer) {
+          this.hud.toast(t('rules.penalty.you', { s: PENALTY_SECONDS }), 3.5);
+          this.audio.beep(392, 0.35, 0.25);
+        } else if (ev.other?.isPlayer) {
+          this.hud.toast(t('rules.penalty.other', { name: ev.boat.displayName ?? t(ev.boat.nameKey) }));
+        }
+      }
+    }
+
     // 比赛
     if (this.race) {
       this.race.update(dt);
+      this.race.course.setActiveTarget(this.race.activeTargetFor(this.player));
       this.race.course.update(this.time);
       // 幽灵船：录制本场 + 回放历史最佳
       if (this.race.state !== 'prestart') {
@@ -718,6 +737,9 @@ export class App {
 
   _renderMultiplayer(dt) {
     for (const boat of this.boats) boat.render(this.time, dt);
+    if (this.race && this.player) {
+      this.race.course.setActiveTarget(this.race.activeTargetFor(this.player));
+    }
     this.race?.course?.update(this.time);
     this._updateMultiplayerRacePresentation();
     if (!this.player) return;
@@ -795,20 +817,8 @@ export class App {
   }
 
   _boatCollisions() {
-    for (let i = 0; i < this.boats.length; i++) {
-      for (let j = i + 1; j < this.boats.length; j++) {
-        const a = this.boats[i].phys, b = this.boats[j].phys;
-        const dx = b.x - a.x, dz = b.z - a.z;
-        const d = Math.hypot(dx, dz);
-        if (d < 4.4 && d > 1e-4) {
-          const push = (4.4 - d) / 2;
-          const nx = dx / d, nz = dz / d;
-          a.x -= nx * push; a.z -= nz * push;
-          b.x += nx * push; b.z += nz * push;
-          a.u *= 0.995; b.u *= 0.995;
-        }
-      }
-    }
+    // 胶囊体碰撞(sim/collision.js);接触列表交给航行规则引擎判责
+    this._contacts = resolveBoatCollisions(this.boats);
   }
 }
 

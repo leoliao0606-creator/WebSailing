@@ -84,6 +84,7 @@ export class BoatPhysics {
     this.crewY = 0;                // 船员横向位置（+右舷）
     this.capsized = false;
     this.rightProgress = 0;
+    this.powerScale = 1;           // 帆效率外部缩放(航行规则处罚等),1 = 正常
     // —— 控制输入 ——
     this.ctl = { rudder: 0, sheet: 1, board: 1, hike: 0, autoHike: true, righting: false, autoTrim: false };
     // —— 诊断输出（HUD/AI/教学读取）——
@@ -182,7 +183,7 @@ export class BoatPhysics {
     if (!this.capsized && aws > 0.05) {
       const heelEff = Math.pow(Math.cos(this.phi), 1.4); // 横倾使有效帆面积/攻角下降
       const chordAngle = -this.boom; // 弦“鼻”方向 = 帆杠反向
-      const f = foilForce2D(awX, awY, chordAngle, p.sailArea * heelEff, RHO_AIR, sailCoeffs);
+      const f = foilForce2D(awX, awY, chordAngle, p.sailArea * heelEff * this.powerScale, RHO_AIR, sailCoeffs);
       alphaSail = f.alpha;
       luff = sailLuff(f.alpha);
       // 压力中心位置（帆杠摆出时外移，顺风时驱动力偏舷 → 拱头力矩）

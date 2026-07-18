@@ -1,6 +1,8 @@
-// HUD：全屏 2D Canvas 绘制（风表罗盘 / 航行仪表 / 小地图）+ DOM 横幅与提示。
+// HUD：全屏 2D Canvas 绘制（风表罗盘 / 航行仪表 / 小地图 / 目标指示）+ DOM 横幅与提示。
 
+import * as THREE from 'three';
 import { DEG, RAD, clamp, clamp01, formatTime, wrapPi } from '../util/math.js';
+import { coachAdvice } from './coach.js';
 import { t } from '../i18n.js';
 
 export class HUD {
@@ -76,10 +78,23 @@ export class HUD {
     const w = W / this.dpr, h = H / this.dpr;
 
     const boat = game.player;
-    const o = boat.phys.out;
 
+    // 新手教练:最佳缭绳/稳向板 + 单条提示(带 1.6s 防抖)
+    let advice = null;
+    if (game.settings?.coach && game.mode !== 'menu') {
+      advice = coachAdvice(boat.phys, game.race?.targetFor(boat) ?? null);
+      this._hintAge = (this._hintAge ?? 0) + dt;
+      if (advice.hint !== this._hintKey && (this._hintAge > 1.6 || !this._hintKey)) {
+        this._hintKey = advice.hint;
+        this._hintAge = 0;
+      }
+    } else {
+      this._hintKey = null;
+    }
+
+    this._targetMarker(ctx, w, h, game);
     this._windDial(ctx, w - 118, 128, 86, boat, game);
-    this._instruments(ctx, 18, h - 20, boat);
+    this._instruments(ctx, 18, h - 20, boat, game, advice);
     this._rudderBar(ctx, w / 2, h - 26, boat);
     this._minimap(ctx, w - 118, h - 132, 100, game);
 
@@ -159,6 +174,21 @@ export class HUD {
       ctx.fill();
     };
 
+    // 基准风向刻度(空心三角):与真风箭头的夹角即当前风摆
+    {
+      const baseRel = wrapPi(game.wind.baseFromPsi - p.psi);
+      const s = Math.sin(baseRel), c = -Math.cos(baseRel);
+      const px = -c, py = s;
+      ctx.strokeStyle = 'rgba(57,198,192,0.55)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(s * (R + 11), c * (R + 11));
+      ctx.lineTo(s * (R + 3) + px * 4.5, c * (R + 3) + py * 4.5);
+      ctx.lineTo(s * (R + 3) - px * 4.5, c * (R + 3) - py * 4.5);
+      ctx.closePath();
+      ctx.stroke();
+    }
+
     // 真风（青）与视风（白）箭头：从外指向圆心
     arrow(twaRad, R + 12, R - 22, '#39c6c0', 3, 8);
     arrow(o.awaDeg * DEG, R + 2, R - 30, 'rgba(255,255,255,0.92)', 2, 7);
@@ -179,10 +209,35 @@ export class HUD {
     ctx.font = '11px system-ui';
     const twd = ((w.currentFromPsi() * RAD) % 360 + 360) % 360;
     ctx.fillText(t('hud.trueWind', { v: o.twsKn.toFixed(1), d: twd.toFixed(0) }) + (gustF > 1.13 ? t('hud.gust') : ''), 0, -R - 20);
+
+    // 风摆读数:相对基准风的偏角;迎风时标注抬升(绿)/受压(红)
+    const shift = wrapPi(w.currentFromPsi() - w.baseFromPsi) / DEG;
+    if (Math.abs(shift) >= 3) {
+      const upwind = Math.abs(o.twaDeg) < 100 && Math.abs(o.twaDeg) > 25;
+      const lifted = upwind && Math.sign(o.twaDeg) * shift > 0;
+      ctx.fillStyle = upwind ? (lifted ? '#8fe39a' : '#ff9d7a') : 'rgba(255,255,255,0.7)';
+      ctx.font = '11px system-ui';
+      const txt = t('hud.shift', { d: Math.abs(shift).toFixed(0) }) + (shift > 0 ? ' →' : ' ←')
+        + (upwind ? ` · ${t(lifted ? 'hud.lift' : 'hud.header')}` : '');
+      ctx.fillText(txt, 0, R + 30);
+    }
+
+    // 阵风预警:采样正上风 35/70m 处的阵风系数,提前提示"看水面暗纹"
+    {
+      const ux = Math.sin(w.currentFromPsi()), uz = -Math.cos(w.currentFromPsi());
+      const g1 = w.gustFactor(p.x + ux * 35, p.z + uz * 35);
+      const g2 = w.gustFactor(p.x + ux * 70, p.z + uz * 70);
+      const ahead = Math.max(g1, g2);
+      if (ahead > 1.14 && ahead > gustF + 0.05) {
+        ctx.fillStyle = '#ffd35c';
+        ctx.font = '600 12px system-ui';
+        ctx.fillText(t('hud.gustSoon'), 0, R + 46);
+      }
+    }
     ctx.restore();
   }
 
-  _instruments(ctx, x, bottom, boat) {
+  _instruments(ctx, x, bottom, boat, game, advice) {
     const o = boat.phys.out;
     const p = boat.phys;
     ctx.save();
@@ -221,16 +276,25 @@ export class HUD {
     ctx.font = '10px system-ui';
     ctx.fillText(t('hud.heel', { v: Math.abs(o.heelDeg).toFixed(0) }), hx, hy + 22);
 
-    // 缭绳 / 稳向板
+    // 缭绳 / 稳向板(教练开启时:接近最佳变绿,并画最佳位置刻度)
+    const sheetOk = advice && Math.abs(p.sheet - advice.sheetOpt) < 0.12;
+    const boardOk = advice && Math.abs(p.board - advice.boardOpt) < 0.15;
     ctx.fillText(t('hud.sheet', { v: (p.sheet * 100).toFixed(0) }), hx, 98);
-    bar(ctx, hx + 62, 91, 80, 6, p.sheet, '#7fc5e8');
+    bar(ctx, hx + 62, 91, 80, 6, p.sheet, advice ? (sheetOk ? '#79d97f' : '#e8b25c') : '#7fc5e8');
     ctx.fillText(t('hud.board', { v: (p.board * 100).toFixed(0) }), hx, 116);
-    bar(ctx, hx + 62, 109, 80, 6, p.board, '#a3d977');
+    bar(ctx, hx + 62, 109, 80, 6, p.board, advice ? (boardOk ? '#79d97f' : '#e8b25c') : '#a3d977');
+    if (advice) {
+      tick(ctx, hx + 62 + 80 * advice.sheetOpt, 91, 6);
+      tick(ctx, hx + 62 + 80 * advice.boardOpt, 109, 6);
+    }
 
-    // 状态徽章
+    // 状态徽章(处罚/让行预警优先级最高,仅次于翻船)
     const RED = 'rgba(200,50,40,0.85)', BLUE = 'rgba(60,160,220,0.85)', AMBER = 'rgba(230,160,40,0.85)';
+    const rowWarn = game?.rules?.warningFor(boat, game.boats);
     let badge = '', badgeColor = AMBER;
     if (p.capsized) { badge = p.rightProgress > 0 ? t('badge.righting', { p: (p.rightProgress * 100).toFixed(0) }) : t('badge.capsized'); badgeColor = RED; }
+    else if ((boat.penaltyT ?? 0) > 0) { badge = t('badge.penalty', { s: Math.ceil(boat.penaltyT) }); badgeColor = RED; }
+    else if (rowWarn) { badge = `⚠ ${t(rowWarn.rule)}`; badgeColor = AMBER; }
     else if (o.inIrons) badge = t('badge.irons');
     else if (o.sternway) badge = t('badge.sternway');
     else if ((boat.shadowF ?? 1) < 0.86) badge = t('badge.dirty');
@@ -245,6 +309,85 @@ export class HUD {
       ctx.fill();
       ctx.fillStyle = '#fff';
       ctx.fillText(badge, 8, -14);
+    }
+
+    // 教练提示(徽章上方一行)
+    if (advice && this._hintKey) {
+      const txt = t(this._hintKey);
+      ctx.font = '600 12px system-ui';
+      const bw = ctx.measureText(txt).width + 16;
+      const y0 = badge ? -58 : -30;
+      ctx.fillStyle = this._hintKey === 'coach.good' ? 'rgba(46,125,79,0.82)' : 'rgba(35,95,140,0.85)';
+      roundRect(ctx, 0, y0, bw, 22, 6);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.fillText(txt, 8, y0 + 16);
+    }
+    ctx.restore();
+  }
+
+  // 屏幕空间目标指示:目标可见时画倒三角+距离,在屏幕外/身后时沿边缘画指向箭头
+  _targetMarker(ctx, w, h, game) {
+    if (!game.race || !game.player || !game.camera) return;
+    const entry = game.race.entries.get(game.player);
+    if (!entry || entry.finished) return;
+    const tgt = game.race.targetFor(game.player);
+    if (!tgt) return;
+
+    this._v3 ??= new THREE.Vector3();
+    this._vRel ??= new THREE.Vector3();
+    this._camDir ??= new THREE.Vector3();
+    const v = this._v3.set(tgt.x, 2, tgt.z);
+    this._vRel.copy(v).sub(game.camera.position);
+    const behind = this._vRel.dot(game.camera.getWorldDirection(this._camDir)) < 0;
+    v.project(game.camera);
+    let sx = (v.x * 0.5 + 0.5) * w;
+    let sy = (1 - (v.y * 0.5 + 0.5)) * h;
+    if (behind) { sx = w - sx; sy = h - sy; }
+
+    const dist = Math.hypot(tgt.x - game.player.phys.x, tgt.z - game.player.phys.z);
+    const distTxt = dist >= 1000 ? `${(dist / 1000).toFixed(1)}km` : `${dist.toFixed(0)}m`;
+    const margin = 52;
+    const onScreen = !behind && sx > margin && sx < w - margin && sy > margin && sy < h - margin - 60;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,211,92,0.95)';
+    ctx.strokeStyle = 'rgba(10,20,30,0.6)';
+    ctx.lineWidth = 3;
+    ctx.font = '600 12px system-ui';
+    ctx.textAlign = 'center';
+    if (onScreen) {
+      ctx.translate(sx, sy);
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-8, -13);
+      ctx.lineTo(8, -13);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeText(distTxt, 0, -20);
+      ctx.fillText(distTxt, 0, -20);
+    } else {
+      // 从屏幕中心沿目标方向找边缘交点
+      const cx0 = w / 2, cy0 = h / 2;
+      const dx = sx - cx0, dy = sy - cy0;
+      const len = Math.hypot(dx, dy) || 1;
+      const kx = (w / 2 - margin) / Math.abs(dx / len || 1e-6);
+      const ky = (h / 2 - margin) / Math.abs(dy / len || 1e-6);
+      const k = Math.min(kx, ky);
+      const ex = cx0 + (dx / len) * k;
+      const ey = cy0 + (dy / len) * k;
+      const ang = Math.atan2(dy, dx);
+      ctx.translate(ex, ey);
+      ctx.rotate(ang + Math.PI / 2);
+      ctx.beginPath();
+      ctx.moveTo(0, -12);
+      ctx.lineTo(-8, 4);
+      ctx.lineTo(8, 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.rotate(-(ang + Math.PI / 2));
+      ctx.strokeText(distTxt, 0, 22);
+      ctx.fillText(distTxt, 0, 22);
     }
     ctx.restore();
   }
@@ -288,6 +431,26 @@ export class HUD {
     const X = (wx) => (wx - mx) * k;
     const Y = (wz) => (wz - mz) * k;
 
+    // 阵风叠加层(读风):暗斑 = 阵风,亮斑 = 风窝
+    {
+      const N = 13;
+      const rr = (R * 2 / N) * 0.9;
+      for (let gi = 0; gi < N; gi++) {
+        for (let gj = 0; gj < N; gj++) {
+          const wx = mx + (gi / (N - 1) - 0.5) * span;
+          const wz = mz + (gj / (N - 1) - 0.5) * span;
+          const dev = game.wind.gustFactor(wx, wz) - 1;
+          if (Math.abs(dev) < 0.07) continue;
+          ctx.fillStyle = dev > 0
+            ? `rgba(6,14,22,${Math.min(0.42, (dev - 0.07) * 1.9).toFixed(3)})`
+            : `rgba(185,215,235,${Math.min(0.28, (-dev - 0.07) * 1.3).toFixed(3)})`;
+          ctx.beginPath();
+          ctx.arc(X(wx), Y(wz), rr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+
     // 岛屿
     ctx.fillStyle = 'rgba(120,140,110,0.8)';
     for (const isl of game.islands) {
@@ -299,28 +462,72 @@ export class HUD {
     // 赛道
     if (game.race) {
       const c = game.race.course;
+      // 完整航线(淡):起航线中点 -> 各标 -> 终点线
+      const route = [c.lineMid];
+      for (const leg of c.legs) if (leg.type === 'mark') route.push(c.marks[leg.mark]);
+      route.push(c.lineMid);
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(X(route[0].x), Y(route[0].z));
+      for (let i = 1; i < route.length; i++) ctx.lineTo(X(route[i].x), Y(route[i].z));
+      ctx.stroke();
+
+      // 当前航段(亮)
+      const entry = game.race.entries.get(game.player);
+      const tgt = game.race.targetFor(game.player);
+      if (entry && tgt && !entry.finished) {
+        const prevLeg = c.legs[entry.leg - 1];
+        const from = prevLeg?.type === 'mark' ? c.marks[prevLeg.mark] : c.lineMid;
+        ctx.strokeStyle = 'rgba(255,211,92,0.85)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(X(from.x), Y(from.z));
+        ctx.lineTo(X(tgt.x), Y(tgt.z));
+        ctx.stroke();
+      }
+
+      // 起航线:委员会船(白方块)- 起航标(橙点)
       ctx.strokeStyle = 'rgba(255,255,255,0.75)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(X(c.pin.x), Y(c.pin.z));
       ctx.lineTo(X(c.committee.x), Y(c.committee.z));
       ctx.stroke();
+      ctx.fillStyle = '#ff8c42';
+      ctx.beginPath();
+      ctx.arc(X(c.pin.x), Y(c.pin.z), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fillRect(X(c.committee.x) - 2.5, Y(c.committee.z) - 2.5, 5, 5);
+
+      // 标记 + 编号
+      ctx.font = '600 9px system-ui';
+      ctx.textAlign = 'left';
       for (let i = 0; i < c.marks.length; i++) {
         ctx.fillStyle = '#ff8c42';
         ctx.beginPath();
         ctx.arc(X(c.marks[i].x), Y(c.marks[i].z), 4, 0, Math.PI * 2);
         ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.fillText(String(i + 1), X(c.marks[i].x) + 6, Y(c.marks[i].z) + 3);
       }
-      // 玩家目标
-      const t = game.race.targetFor(game.player);
-      if (t) {
+
+      // 玩家目标:虚线 + 呼吸圈
+      if (tgt) {
         ctx.strokeStyle = 'rgba(255,211,92,0.6)';
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.moveTo(X(boat.x), Y(boat.z));
-        ctx.lineTo(X(t.x), Y(t.z));
+        ctx.lineTo(X(tgt.x), Y(tgt.z));
         ctx.stroke();
         ctx.setLineDash([]);
+        const pulse = 5.5 + Math.sin((game.time ?? 0) * 3) * 1.5;
+        ctx.strokeStyle = 'rgba(255,211,92,0.9)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(X(tgt.x), Y(tgt.z), pulse, 0, Math.PI * 2);
+        ctx.stroke();
       }
     }
 
@@ -381,5 +588,17 @@ function bar(ctx, x, y, w, h, t, color) {
   ctx.fill();
   ctx.fillStyle = color;
   roundRect(ctx, x, y, Math.max(h, w * clamp01(t)), h, h / 2);
+  ctx.fill();
+}
+
+// 进度条上的"最佳值"参考刻度(白色竖线 + 小三角)
+function tick(ctx, x, y, h) {
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  ctx.fillRect(x - 1, y - 2, 2, h + 4);
+  ctx.beginPath();
+  ctx.moveTo(x, y - 3);
+  ctx.lineTo(x - 3.5, y - 8);
+  ctx.lineTo(x + 3.5, y - 8);
+  ctx.closePath();
   ctx.fill();
 }

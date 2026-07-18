@@ -109,14 +109,18 @@ void main() {
   float detailFade = exp(-vDist / 260.0);
 
   float gust = gustMask(vWorld.xz);
+  float gustPos = max(gust, 0.0) * uGustAmp * 2.5;   // 阵风强度 ~0..0.8
+  float lull = max(-gust, 0.0) * uGustAmp * 2.5;     // 风窝强度
 
-  // 表面细波纹扰动法线（近处强，阵风区更碎）
+  // 表面细波纹扰动法线（近处强,阵风区更碎,风窝处趋于镜面）
   vec3 N = normalize(vNormal);
+  float s3;
   {
     float s1 = vnoise(vWorld.xz * 0.55 - uWindFlow * uTime * 0.55);
     float s2 = vnoise(vWorld.xz * 2.3 - uWindFlow * uTime * 1.4 + 13.7);
-    float s3 = vnoise(vWorld.xz * 7.1 + vec2(uTime * 0.4, -uTime * 0.33));
-    float str = (0.16 + 0.1 * max(gust, 0.0) * uGustAmp * 3.0) * (0.25 + 0.75 * detailFade);
+    s3 = vnoise(vWorld.xz * 7.1 + vec2(uTime * 0.4, -uTime * 0.33));
+    float str = (0.16 + 0.15 * gustPos) * (0.25 + 0.75 * detailFade);
+    str *= 1.0 - 0.5 * min(lull, 1.0);
     N = normalize(N + vec3(s1 - 0.5, 0.0, s2 - 0.5) * str + vec3(s3 - 0.5, 0.0, 0.5 - s3) * str * 0.5);
   }
 
@@ -127,23 +131,27 @@ void main() {
   vec3 R = reflect(-V, N);
   R.y = abs(R.y);
   vec3 skyCol = mix(uHorizon, uZenith, pow(max(R.y, 0.0), 0.6));
-  // 阵风区更"毛糙" -> 反射变暗变灰
-  skyCol *= 1.0 - 0.16 * smoothstep(0.05, 0.5, gust) * uGustAmp * 2.5;
-  // 太阳眩光路径
+  // 阵风区更"毛糙" -> 反射明显变暗(读风的主要线索);风窝处反射更亮更平
+  skyCol *= 1.0 - 0.30 * smoothstep(0.02, 0.55, gust) * uGustAmp * 2.5;
+  skyCol *= 1.0 + 0.10 * min(lull, 1.0);
+  // 太阳眩光路径 + 噪声调制的碎闪
   float sunR = max(dot(R, uSunDir), 0.0);
   vec3 sunGlint = uSunColor * (pow(sunR, 1100.0) * 90.0 + pow(sunR, 90.0) * 0.9);
+  sunGlint += uSunColor * pow(sunR, 260.0) * 2.4 * (0.3 + 0.7 * s3) * detailFade;
 
-  // 水体色：深水 + 浪尖次表面散射
+  // 水体色：深水 + 浪尖次表面散射;阵风区水体也略深
   float sunN = max(dot(N, normalize(uSunDir + vec3(0.0, 0.35, 0.0))), 0.0);
   float sss = vCrest * (0.35 + 0.65 * sunN);
   vec3 bodyCol = mix(uDeep, uScatter, clamp(sss, 0.0, 1.0));
+  bodyCol *= 1.0 - 0.14 * min(gustPos, 1.0);
 
   vec3 col = mix(bodyCol, skyCol, fresnel) + sunGlint * (0.35 + 0.65 * fresnel);
 
-  // 浪尖白沫（风大才出现），叠噪声破碎感
+  // 浪尖白沫（风大才出现），叠噪声破碎感;阵风扫过处白沫更密
   float foamN = vnoise(vWorld.xz * 0.9 + uWindFlow * uTime * 0.25) * 0.6 +
                 vnoise(vWorld.xz * 3.1 - uWindFlow * uTime * 0.5) * 0.4;
-  float cap = smoothstep(1.18 - uWhitecap * 0.55, 1.38 - uWhitecap * 0.5, vCrest + foamN * 0.62);
+  float cap = smoothstep(1.18 - uWhitecap * 0.55, 1.38 - uWhitecap * 0.5,
+                         vCrest + foamN * 0.62 + 0.09 * max(gust, 0.0));
   cap *= 0.55 + 0.45 * detailFade;
   col = mix(col, vec3(0.92, 0.95, 0.96), cap * 0.85);
 
@@ -178,8 +186,8 @@ export class Water {
       uSunColor: { value: new THREE.Color(1.0, 0.92, 0.78) },
       uZenith: { value: new THREE.Color(0.11, 0.29, 0.5) },
       uHorizon: { value: new THREE.Color(0.68, 0.79, 0.86) },
-      uDeep: { value: new THREE.Color(0.012, 0.052, 0.085) },
-      uScatter: { value: new THREE.Color(0.05, 0.2, 0.21) },
+      uDeep: { value: new THREE.Color(0.010, 0.056, 0.098) },
+      uScatter: { value: new THREE.Color(0.055, 0.23, 0.225) },
       uFogColor: { value: FOG_COLOR.clone() },
       uFogDensity: { value: 0.00095 },
       uGustDir: { value: new THREE.Vector2(0, -1) },

@@ -45,6 +45,10 @@ export class Boat {
     this.hikeLevel = 0;
     this.manualSheetAt = -99;
 
+    // 航行规则处罚状态(rules.js 读写)
+    this.penaltyT = 0;
+    this.ruleCooldown = 0;
+
     // 事件计数（教学/音效用）
     this.events = { tacks: 0, gybes: 0, capsizes: 0 };
     this._prevTwaSign = 0;
@@ -61,6 +65,9 @@ export class Boat {
     p.capsized = false;
     p.sheet = p.ctl.sheet = 1;
     p.board = p.ctl.board = 1;
+    p.powerScale = 1;
+    this.penaltyT = 0;
+    this.ruleCooldown = 0;
     this._prevPos = { x, z };
   }
 

@@ -21,9 +21,13 @@ function profileAt(arr, t) {
   return a + (b - a) * s;
 }
 
-function buildHull() {
+function buildHull(topColor = 0xf4f1e8, bottomColor = 0x35566b) {
   const NS = 26, M = 15;
-  const positions = [], indices = [];
+  const positions = [], colors = [], indices = [];
+  const cTop = new THREE.Color(topColor);
+  const cBot = new THREE.Color(bottomColor);
+  const cTmp = new THREE.Color();
+  const WL = -0.045; // 水线高度:以下为防污漆色,形成双色船体
   for (let i = 0; i <= NS; i++) {
     const t = i / NS;
     const xb = lerp(-HALF, HALF, t);       // 体轴 x
@@ -35,6 +39,8 @@ function buildHull() {
       const y = sh - (sh + d) * Math.pow(tt, 1.18);
       const x = Math.sign(u) * b * Math.pow(1 - Math.pow(tt, 2.1), 0.72);
       positions.push(x, y, zl);
+      cTmp.copy(cBot).lerp(cTop, smooth01((y - WL) / 0.05));
+      colors.push(cTmp.r, cTmp.g, cTmp.b);
     }
   }
   for (let i = 0; i < NS; i++) {
@@ -47,9 +53,11 @@ function buildHull() {
   const sternBase = 0;
   const cIdx = positions.length / 3;
   positions.push(0, 0.05, HALF);
+  colors.push(cTop.r, cTop.g, cTop.b);
   for (let k = 0; k < M; k++) indices.push(sternBase + k + 1, sternBase + k, cIdx);
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geo.setIndex(indices);
   geo.computeVertexNormals();
   return geo;
@@ -94,25 +102,49 @@ function smooth01(x) {
   return x * x * (3 - 2 * x);
 }
 
-// 帆布纹理：底色 + 拼幅缝线 + 红色星芒 + 帆号
+// 帆布纹理：底色 + 扇形拼幅缝线 + 帆骨袋 + 观察窗 + 红色星芒 + 帆号
 function makeSailTexture(sailNumber, accent = '#c03a2b') {
   const c = document.createElement('canvas');
   c.width = c.height = 512;
   const g = c.getContext('2d');
-  g.fillStyle = '#f6f3ea';
+  // 底色带轻微纵向渐变(帆顶略亮,更有透光感)
+  const bg = g.createLinearGradient(0, 0, 0, 512);
+  bg.addColorStop(0, '#faf8f1');
+  bg.addColorStop(1, '#f2eee1');
+  g.fillStyle = bg;
   g.fillRect(0, 0, 512, 512);
   // 布纹微噪声
   for (let i = 0; i < 2600; i++) {
     g.fillStyle = `rgba(${180 + Math.random() * 40 | 0},${178 + Math.random() * 40 | 0},${168 + Math.random() * 40 | 0},0.05)`;
     g.fillRect(Math.random() * 512, Math.random() * 512, 2, 2);
   }
-  // 拼幅缝线（横向）
-  g.strokeStyle = 'rgba(120,115,100,0.35)';
+  // 扇形拼幅缝线:从帆尾角(纹理右下)放射,微弯更像切割帆
+  // 纹理坐标:u=弦向(0 桅杆 -> 1 后缘),v=高度(0 帆脚 -> 1 帆顶),v 朝上画布 y 反向
+  g.strokeStyle = 'rgba(120,115,100,0.38)';
   g.lineWidth = 1.5;
   for (let i = 1; i <= 6; i++) {
-    const y = 512 - i * 72;
-    g.beginPath(); g.moveTo(0, y); g.lineTo(512, y); g.stroke();
+    const y = 512 - i * 68;
+    g.beginPath();
+    g.moveTo(0, y);
+    g.quadraticCurveTo(280, y - 14, 512, y - 40 - i * 4);
+    g.stroke();
   }
+  // 帆骨袋(后缘 4 条短双线)
+  g.strokeStyle = 'rgba(110,105,92,0.5)';
+  g.lineWidth = 3;
+  for (let i = 1; i <= 4; i++) {
+    const y = 512 - i * 96;
+    g.beginPath(); g.moveTo(512, y); g.lineTo(400, y + 8); g.stroke();
+  }
+  // 观察窗(帆脚上方的半透明视窗,画成浅灰蓝)
+  g.fillStyle = 'rgba(168,190,205,0.6)';
+  g.strokeStyle = 'rgba(110,115,120,0.6)';
+  g.lineWidth = 2;
+  g.beginPath();
+  if (g.roundRect) g.roundRect(96, 400, 150, 54, 10);
+  else g.rect(96, 400, 150, 54);
+  g.fill();
+  g.stroke();
   // 星芒标志
   const cx = 320, cy = 160;
   g.fillStyle = accent;
@@ -146,11 +178,11 @@ export function createBoatVisual(opts = {}) {
 
   const group = new THREE.Group();
 
-  // —— 船体 / 甲板 ——
+  // —— 船体 / 甲板(水线以下防污漆双色) ——
   const hullMat = new THREE.MeshPhysicalMaterial({
-    color: hullColor, roughness: 0.22, clearcoat: 0.7, clearcoatRoughness: 0.25,
+    color: 0xffffff, vertexColors: true, roughness: 0.22, clearcoat: 0.7, clearcoatRoughness: 0.25,
   });
-  const hull = new THREE.Mesh(buildHull(), hullMat);
+  const hull = new THREE.Mesh(buildHull(hullColor, 0x35566b), hullMat);
   hull.castShadow = true;
   const deckMat = new THREE.MeshStandardMaterial({ color: 0xe6dfcd, roughness: 0.6 });
   const deck = new THREE.Mesh(buildDeck(), deckMat);
@@ -158,20 +190,25 @@ export function createBoatVisual(opts = {}) {
   deck.receiveShadow = true;
   group.add(hull, deck);
 
-  // 舷缘护舷条
+  // 舷缘护舷条 + 舷侧彩色饰条(队色)
   {
-    const pts = [];
-    for (let i = 0; i <= 40; i++) {
-      const t = i / 40;
-      const xb = lerp(-HALF, HALF, t);
-      pts.push(new THREE.Vector3(profileAt(P_BEAM, t), profileAt(P_SHEER, t) + 0.015, -xb));
-    }
-    const curve = new THREE.CatmullRomCurve3(pts);
+    const mkRail = (yOff, inset, radius, mat) => {
+      const pts = [];
+      for (let i = 0; i <= 40; i++) {
+        const t = i / 40;
+        const xb = lerp(-HALF, HALF, t);
+        pts.push(new THREE.Vector3(profileAt(P_BEAM, t) * inset, profileAt(P_SHEER, t) + yOff, -xb));
+      }
+      const curve = new THREE.CatmullRomCurve3(pts);
+      const railR = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, radius, 6), mat);
+      const railL = railR.clone();
+      railL.scale.x = -1;
+      return [railR, railL];
+    };
     const railMat = new THREE.MeshStandardMaterial({ color: 0x4b4b4b, roughness: 0.7 });
-    const railR = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, 0.022, 6), railMat);
-    const railL = railR.clone();
-    railL.scale.x = -1;
-    group.add(railR, railL);
+    group.add(...mkRail(0.015, 1, 0.022, railMat));
+    const stripeMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(accent), roughness: 0.35 });
+    group.add(...mkRail(-0.05, 1.002, 0.012, stripeMat));
   }
 
   // —— 桅杆（含风向标）——
@@ -235,6 +272,23 @@ export function createBoatVisual(opts = {}) {
   const sail = new THREE.Mesh(sailGeo, sailMat);
   sail.castShadow = true;
   boomGroup.add(sail);
+
+  // —— 帆面纤维带(telltales):贴流时向后飘直,空帆/失速时乱抖,弱风下垂 ——
+  const TT_SEGS = 5;
+  const TT_SPECS = [
+    { rr: 0.3, ss: 0.18, side: 1, color: 0x2e9e5b },
+    { rr: 0.3, ss: 0.18, side: -1, color: 0xd04030 },
+    { rr: 0.58, ss: 0.18, side: 1, color: 0x2e9e5b },
+    { rr: 0.58, ss: 0.18, side: -1, color: 0xd04030 },
+  ];
+  const telltales = TT_SPECS.map((spec, i) => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array((TT_SEGS + 1) * 3), 3));
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: spec.color }));
+    line.frustumCulled = false;
+    boomGroup.add(line);
+    return { ...spec, line, phase: i * 2.3 };
+  });
 
   // —— 稳向板（可升降）——
   const boardMat = new THREE.MeshStandardMaterial({ color: 0xd9c98f, roughness: 0.45 });
@@ -340,6 +394,33 @@ export function createBoatVisual(opts = {}) {
     }
     sailPos.needsUpdate = true;
     sailGeo.computeVertexNormals();
+
+    // 纤维带:与帆面同一套成形公式取根部位置,再向后缘拖出摆动的短飘带
+    const stalled = Math.abs(phys.out.alphaDeg) > 26;
+    const disturb = Math.max(luff, stalled ? 0.75 : 0);
+    const airFlow = clamp(phys.out.awsKn / 8, 0.1, 1);
+    for (const tt of telltales) {
+      const rr = tt.rr, ss = tt.ss;
+      const luffY = 0.95 + 4.35 * rr;
+      const luffZ = 0.09 + rr * 0.04;
+      const chord = 2.34 * Math.pow(1 - rr, 0.92) + 0.1 * Math.sin(Math.PI * rr);
+      const tw = twistAmt * rr * -Math.sign(camberSm || 1) * 0.7;
+      const bulge = Math.sin(Math.PI * Math.pow(ss, 0.85));
+      const pos = tt.line.geometry.attributes.position;
+      const segLen = 0.085;
+      let x = camberSm * bulge * chord * 0.105 + Math.sin(tw) * chord * ss * 0.5 + tt.side * 0.02;
+      let y = luffY;
+      let z = luffZ + Math.cos(tw * ss) * chord * ss;
+      pos.setXYZ(0, x, y, z);
+      for (let i = 1; i <= TT_SEGS; i++) {
+        const wob = Math.sin(time * 21 + tt.phase + i * 1.7) * disturb;
+        x += tt.side * 0.004 + wob * segLen * 0.85;
+        z += segLen * (0.2 + 0.8 * airFlow) * Math.cos(wob);
+        y -= segLen * (1 - airFlow) * 0.85 + 0.005;
+        pos.setXYZ(i, x, y, z);
+      }
+      pos.needsUpdate = true;
+    }
 
     // 船员：横向压舷 + 身体外倾
     const hikeK = clamp(phys.crewY / phys.p.hikeMax, -1, 1);
