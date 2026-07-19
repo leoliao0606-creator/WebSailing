@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "description": "逐风 WindChaser — 3D 小型稳向板帆船拟真游戏",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "npm run test:unit",
     "test:unit": "node --test tests/*.test.js",
