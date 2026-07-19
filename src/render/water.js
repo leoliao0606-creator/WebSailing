@@ -207,6 +207,9 @@ export class Water {
 
     this.mesh = new THREE.Mesh(geo, this.material);
     this.mesh.frustumCulled = false;
+    // 在船体的舱内深度遮罩塞块(renderOrder 1,见 boatModel.js)之后绘制,
+    // 使舱内水面片元被深度测试剔除
+    this.mesh.renderOrder = 2;
     this.snap = this.size / this.segments;
   }
 

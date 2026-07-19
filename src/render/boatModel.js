@@ -49,12 +49,24 @@ function buildHull(topColor = 0xf4f1e8, bottomColor = 0x35566b) {
       indices.push(a, b2, a + 1, a + 1, b2, b2 + 1);
     }
   }
-  // 艉封板
-  const sternBase = 0;
+  // 艉封板:复制一圈独立轮缘顶点(不与侧壳共享,保证平面硬边法线),
+  // 绕序取从船艉(+z)看逆时针,面片朝外。
+  const sternBase = positions.length / 3;
+  const b0 = profileAt(P_BEAM, 0), d0 = profileAt(P_KEEL, 0), sh0 = profileAt(P_SHEER, 0);
+  for (let k = 0; k <= M; k++) {
+    const u = (k / M) * 2 - 1;
+    const tt = 1 - Math.abs(u);
+    const y = sh0 - (sh0 + d0) * Math.pow(tt, 1.18);
+    const x = Math.sign(u) * b0 * Math.pow(1 - Math.pow(tt, 2.1), 0.72);
+    positions.push(x, y, HALF);
+    cTmp.copy(cBot).lerp(cTop, smooth01((y - WL) / 0.05));
+    colors.push(cTmp.r, cTmp.g, cTmp.b);
+  }
   const cIdx = positions.length / 3;
-  positions.push(0, 0.05, HALF);
-  colors.push(cTop.r, cTop.g, cTop.b);
-  for (let k = 0; k < M; k++) indices.push(sternBase + k + 1, sternBase + k, cIdx);
+  positions.push(0, (sh0 - d0) / 2, HALF);
+  cTmp.copy(cBot).lerp(cTop, smooth01(((sh0 - d0) / 2 - WL) / 0.05));
+  colors.push(cTmp.r, cTmp.g, cTmp.b);
+  for (let k = 0; k < M; k++) indices.push(sternBase + k, sternBase + k + 1, cIdx);
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
@@ -190,6 +202,19 @@ export function createBoatVisual(opts = {}) {
   deck.receiveShadow = true;
   group.add(hull, deck);
 
+  // 舱内深度遮罩塞块:只写深度不写颜色,在船体(order 0)之后、水面(order 2)之前
+  // 绘制,把画进驾驶舱凹槽的水面片元按深度剔除;顶面压在舷缘之下,
+  // 不遮舷外水花,浪峰高过舷缘时仍会漫进来(可接受的进水观感)。
+  {
+    const plug = new THREE.Mesh(
+      new THREE.BoxGeometry(0.92, 0.31, 2.1),
+      new THREE.MeshBasicMaterial({ colorWrite: false }),
+    );
+    plug.position.set(0, 0.1, 0.6); // 覆盖凹槽 z∈[-0.45,1.65],顶面 y≈0.255
+    plug.renderOrder = 1;
+    group.add(plug);
+  }
+
   // 舷缘护舷条 + 舷侧彩色饰条(队色)
   {
     const mkRail = (yOff, inset, radius, mat) => {
@@ -314,26 +339,51 @@ export function createBoatVisual(opts = {}) {
   rudderGroup.add(rblade, rhead, tiller);
   group.add(rudderGroup);
 
-  // —— 船员 ——
+  // —— 船员:分段人偶(髋/大腿/小腿/躯干/颈/头/双臂),每帧按压舷姿态摆位 ——
   const crew = new THREE.Group();
   const wetsuit = new THREE.MeshStandardMaterial({ color: 0x2b3038, roughness: 0.8 });
   const vestM = new THREE.MeshStandardMaterial({ color: 0xc23f2e, roughness: 0.7 });
   const skinM = new THREE.MeshStandardMaterial({ color: 0xd9a37e, roughness: 0.7 });
-  const hip = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.2, 4, 8), wetsuit);
-  hip.rotation.z = Math.PI / 2;
-  hip.position.y = 0.1;
-  const legL = new THREE.Mesh(new THREE.CapsuleGeometry(0.07, 0.42, 4, 8), wetsuit);
-  const legR = legL.clone();
+  const hip = new THREE.Mesh(new THREE.CapsuleGeometry(0.115, 0.18, 4, 8), wetsuit);
+  hip.rotation.x = Math.PI / 2; // 骨盆沿前后向,连接两侧髋关节
+  hip.position.y = 0.06;
+
+  // 四肢:单位胶囊按两端点摆位拉伸(近似 IK,姿态由 update 每帧解出)
+  const limbUp = new THREE.Vector3(0, 1, 0);
+  const _limbDir = new THREE.Vector3();
+  function makeLimb(mat, radius, span) {
+    const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, span, 4, 8), mat);
+    crew.add(mesh);
+    return { mesh, total: span + radius * 2 };
+  }
+  function placeLimb(limb, ax, ay, az, bx, by, bz) {
+    _limbDir.set(bx - ax, by - ay, bz - az);
+    const len = Math.max(_limbDir.length(), 1e-4);
+    limb.mesh.position.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+    limb.mesh.quaternion.setFromUnitVectors(limbUp, _limbDir.divideScalar(len));
+    limb.mesh.scale.set(1, len / limb.total, 1);
+  }
+  const thighL = makeLimb(wetsuit, 0.072, 0.2);
+  const thighR = makeLimb(wetsuit, 0.072, 0.2);
+  const shinL = makeLimb(wetsuit, 0.052, 0.22);
+  const shinR = makeLimb(wetsuit, 0.052, 0.22);
+  const armAftU = makeLimb(vestM, 0.045, 0.16); // 后臂(舵手臂)上段
+  const armAftF = makeLimb(skinM, 0.036, 0.16); // 后臂前段
+  const armFwdU = makeLimb(vestM, 0.045, 0.16); // 前臂(缭绳臂)上段
+  const armFwdF = makeLimb(skinM, 0.036, 0.16); // 前臂前段
+
   const torso = new THREE.Group();
-  const torsoMesh = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.34, 4, 10), vestM);
-  torsoMesh.position.y = 0.26;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.105, 10, 10), skinM);
-  head.position.y = 0.58;
-  const cap = new THREE.Mesh(new THREE.SphereGeometry(0.11, 10, 6, 0, Math.PI * 2, 0, 1.2), new THREE.MeshStandardMaterial({ color: 0xf0ede4, roughness: 0.8 }));
-  cap.position.y = 0.61;
-  torso.add(torsoMesh, head, cap);
-  torso.position.y = 0.12;
-  crew.add(hip, legL, legR, torso);
+  const torsoMesh = new THREE.Mesh(new THREE.CapsuleGeometry(0.145, 0.3, 4, 10), vestM);
+  torsoMesh.position.y = 0.24;
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.09, 8), skinM);
+  neck.position.y = 0.44;
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 10), skinM);
+  head.position.y = 0.56;
+  const cap = new THREE.Mesh(new THREE.SphereGeometry(0.105, 12, 6, 0, Math.PI * 2, 0, 1.25), new THREE.MeshStandardMaterial({ color: 0xf0ede4, roughness: 0.8 }));
+  cap.position.y = 0.585;
+  torso.add(torsoMesh, neck, head, cap);
+  torso.position.y = 0.08;
+  crew.add(hip, torso);
   crew.traverse((o) => { if (o.isMesh) o.castShadow = true; });
   group.add(crew);
 
@@ -346,7 +396,7 @@ export function createBoatVisual(opts = {}) {
   // —— 每帧姿态更新 ——
   const sailPos = sailGeo.attributes.position;
   const _boomEnd = new THREE.Vector3();
-  let smPitch = 0, smRoll = 0, smHeave = 0, camberSm = 0;
+  let smPitch = 0, smRoll = 0, smHeave = 0, camberSm = 0, crewXSm = 0;
 
   function update(phys, waveField, time, dt) {
     // 波面姿态
@@ -422,14 +472,38 @@ export function createBoatVisual(opts = {}) {
       pos.needsUpdate = true;
     }
 
-    // 船员：横向压舷 + 身体外倾
+    // 船员:坐在上风侧舱边,脚横伸钩住舱底压舷带;压舷越满臀部越出舷、膝盖越直
     const hikeK = clamp(phys.crewY / phys.p.hikeMax, -1, 1);
-    crew.position.set(phys.crewY * 0.72, 0.34, 0.42);
-    torso.rotation.z = -hikeK * 1.05;
-    legL.position.set(-hikeK * 0.2 - 0.08, 0.12, 0.18);
-    legL.rotation.z = Math.PI / 2 + hikeK * 0.7;
-    legR.position.set(-hikeK * 0.2 + 0.06, 0.12, 0.3);
-    legR.rotation.z = Math.PI / 2 + hikeK * 0.75;
+    // 坐侧:压舷取压舷侧;坐正时坐在帆杠对侧(上风舷)
+    const side = Math.abs(hikeK) > 0.04 ? Math.sign(hikeK) : -(Math.sign(phys.boom) || 1);
+    const seatX = phys.crewY * 0.72 + side * 0.16;
+    crewXSm = damp(crewXSm, seatX, 6, dt);
+    crew.position.set(crewXSm, 0.3, 0.42);
+    const lean = hikeK * 1.05;
+    torso.rotation.z = -lean;
+    torso.rotation.y = -side * 0.7;
+    // 双脚锚在船中线附近的压舷带(crew 组内坐标须抵消 crewXSm)
+    const footX = -side * 0.08 - crewXSm;
+    const bendUp = (1 - Math.abs(hikeK)) * 0.14;
+    for (const [thigh, shin, fz] of [[thighL, shinL, -0.12], [thighR, shinR, 0.06]]) {
+      const hipX = 0, hipY = 0.06;
+      const fx = footX, fy = -0.2;
+      const kx = (hipX + fx) * 0.5, ky = (hipY + fy) * 0.5 + bendUp, kz = fz + 0.02;
+      placeLimb(thigh, hipX, hipY, fz, kx, ky, kz);
+      placeLimb(shin, kx, ky, kz, fx, fy, fz + 0.04);
+    }
+    // 肩点随躯干外倾旋转;后手持舵柄延伸杆收在体侧,前手拉住缭绳方向
+    const shX = -Math.sin(lean) * 0.42;
+    const shY = 0.08 + Math.cos(lean) * 0.42;
+    const aftHandX = shX - side * 0.06, aftHandY = shY - 0.34;
+    const fwdHandX = clamp(-crewXSm * 0.7, -0.5, 0.5), fwdHandY = shY - 0.3;
+    let ex = (shX + aftHandX) * 0.5 + side * 0.08, ey = (shY + aftHandY) * 0.5;
+    placeLimb(armAftU, shX, shY, 0.1, ex, ey, 0.2);
+    placeLimb(armAftF, ex, ey, 0.2, aftHandX, aftHandY, 0.3);
+    ex = (shX + fwdHandX) * 0.5 + side * 0.06;
+    ey = (shY + fwdHandY) * 0.5 - 0.04;
+    placeLimb(armFwdU, shX, shY, -0.1, ex, ey, -0.16);
+    placeLimb(armFwdF, ex, ey, -0.16, fwdHandX, fwdHandY, -0.2);
     crew.visible = !phys.capsized;
 
     // 缭绳：帆杠末端 -> 舱底
