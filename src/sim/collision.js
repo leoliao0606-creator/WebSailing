@@ -113,6 +113,73 @@ export function collidePair(A, B) {
   };
 }
 
+// 船体胶囊与静态障碍(浮标圆桩 / 委员会船线段)的碰撞。
+// 障碍不动:穿透时把船整体推出,去除指向障碍的速度分量并带少量回弹,
+// 接触点不在重心时给艏摇反馈。返回接触信息或 null。
+export function collideCapsuleStatic(P, ox1, oz1, ox2, oz2, radius) {
+  const fx = Math.sin(P.psi), fz = -Math.cos(P.psi);
+  const seg = segSegClosest(
+    P.x - fx * HULL_HALF_LEN, P.z - fz * HULL_HALF_LEN,
+    P.x + fx * HULL_HALF_LEN, P.z + fz * HULL_HALF_LEN,
+    ox1, oz1, ox2, oz2,
+  );
+  const minD = HULL_RADIUS + radius;
+  if (seg.d >= minD) return null;
+
+  // 法线:障碍 -> 船;重叠退化时从障碍中点指向船心
+  let nx, nz;
+  if (seg.d > 1e-4) {
+    nx = (seg.px - seg.qx) / seg.d;
+    nz = (seg.pz - seg.qz) / seg.d;
+  } else {
+    const mx = (ox1 + ox2) * 0.5, mz = (oz1 + oz2) * 0.5;
+    const cd = Math.hypot(P.x - mx, P.z - mz);
+    if (cd > 1e-4) { nx = (P.x - mx) / cd; nz = (P.z - mz) / cd; }
+    else { nx = Math.cos(P.psi); nz = Math.sin(P.psi); }
+  }
+
+  const overlap = minD - seg.d;
+  P.x += nx * overlap;
+  P.z += nz * overlap;
+
+  const v = worldVel(P);
+  const into = -(v.x * nx + v.z * nz);
+  let closing = 0;
+  if (into > 0) {
+    closing = into;
+    const imp = into * (1 + RESTITUTION);
+    setWorldVel(P, v.x + nx * imp, v.z + nz * imp);
+    const s = Math.sin(P.psi), c = Math.cos(P.psi);
+    const rbx = (seg.px - P.x) * s - (seg.pz - P.z) * c;
+    const rby = (seg.px - P.x) * c + (seg.pz - P.z) * s;
+    const Fbx = nx * s - nz * c;
+    const Fby = nx * c + nz * s;
+    P.yawRate += clamp((rbx * Fby - rby * Fbx) * closing * YAW_KICK, -0.9, 0.9);
+    P.u *= 0.985;
+  }
+
+  return { nx, nz, overlap, closing, px: seg.px, pz: seg.pz };
+}
+
+// 全船队 × 赛道障碍碰撞。obstacles 元素:
+//   { kind, type: 'circle', x, z, r } 或 { kind, type: 'segment', ax, az, bx, bz, r }
+// 返回接触列表 [{ boat, obstacle, nx, nz, overlap, closing, px, pz }] 供触标判罚。
+export function resolveObstacleCollisions(boats, obstacles) {
+  const contacts = [];
+  if (!obstacles?.length) return contacts;
+  for (const boat of boats) {
+    const P = boat.phys;
+    if (!P) continue;
+    for (const ob of obstacles) {
+      const c = ob.type === 'segment'
+        ? collideCapsuleStatic(P, ob.ax, ob.az, ob.bx, ob.bz, ob.r)
+        : collideCapsuleStatic(P, ob.x, ob.z, ob.x, ob.z, ob.r);
+      if (c) contacts.push({ boat, obstacle: ob, ...c });
+    }
+  }
+  return contacts;
+}
+
 // 全船队碰撞解算,返回接触列表 [{a, b, nx, nz, overlap, closing, px, pz}]
 export function resolveBoatCollisions(boats) {
   const contacts = [];

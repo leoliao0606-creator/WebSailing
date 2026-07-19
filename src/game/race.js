@@ -38,6 +38,20 @@ export class RaceCourse {
       { type: 'mark', mark: 1, key: 'race.leg.dn', lap: 2 },
       { type: 'finish', key: 'race.leg.finish' },
     ];
+    // —— 碰撞障碍(供 sim/collision.js resolveObstacleCollisions)——
+    // 触碰任何一个都算触标(RRS 31);委员会船沿其朝向(艏指上风)为线段
+    this.obstacles = [
+      { kind: 'pin', type: 'circle', x: this.pin.x, z: this.pin.z, r: 0.6 },
+      {
+        kind: 'committee',
+        type: 'segment',
+        ax: this.committee.x - up.x * 2.6, az: this.committee.z - up.z * 2.6,
+        bx: this.committee.x + up.x * 2.6, bz: this.committee.z + up.z * 2.6,
+        r: 1.0,
+      },
+      ...this.marks.map((m, i) => ({ kind: 'mark', mark: i, type: 'circle', x: m.x, z: m.z, r: 0.75 })),
+    ];
+
     // —— 视觉 ——
     this.objects = [];
     const pinBuoy = createBuoy(0xe8642c, true);

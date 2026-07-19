@@ -16,7 +16,7 @@ import { HUD } from './game/hud.js';
 import { Boat } from './game/boat.js';
 import { AIHelm } from './game/ai.js';
 import { RaceCourse, RaceManager, saveBest, loadBest } from './game/race.js';
-import { resolveBoatCollisions } from './sim/collision.js';
+import { resolveBoatCollisions, resolveObstacleCollisions } from './sim/collision.js';
 import { RulesEngine, PENALTY_SECONDS } from './game/rules.js';
 import { GhostRecorder, GhostBoat, saveGhost, loadGhost } from './game/ghost.js';
 import { Tutorial } from './game/tutorial.js';
@@ -819,6 +819,10 @@ export class App {
   _boatCollisions() {
     // 胶囊体碰撞(sim/collision.js);接触列表交给航行规则引擎判责
     this._contacts = resolveBoatCollisions(this.boats);
+    // 赛道障碍(标/起航线端点船)实体碰撞;接触列表供触标判罚
+    this._markContacts = this.race
+      ? resolveObstacleCollisions(this.boats, this.race.course.obstacles)
+      : [];
   }
 }
 
