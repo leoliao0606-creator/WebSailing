@@ -62,6 +62,7 @@ export const BOAT = {
   cOrbital: 0.7,        // 波浪轨道流速对水动力的耦合系数（船体吃水处略衰减）
   cSurf: 1.0,           // 浪面坡度推力增益（冲浪/顶浪的来源）
   cSurfRelief: 0.5,     // 冲浪时船体卸载：自身波系叠加浪面，兴波阻力下降比例
+  cRollWave: 0.45,       // 浪面横向坡度 -> 横摇力矩增益（浮力回复趋向浪面法线；大浪摇船与横浪翻船风险的来源）
 };
 
 // 平水环境（不传波浪场时使用）
@@ -209,10 +210,12 @@ export class BoatPhysics {
     const ru = this.u - owX; // 相对水体的体轴速度（一切水动力的参照系）
     const rv = this.v - owY;
     let surfAcc = 0;
+    let waveRollAcc = 0; // 浪面横向坡度加速度(未乘 cSurf),供横摇力矩
     {
       const sax = toBodyX(wv.ax, wv.az) * p.cSurf;
       const say = toBodyY(wv.ax, wv.az) * p.cSurf;
       surfAcc = sax;
+      waveRollAcc = toBodyY(wv.ax, wv.az);
       Fx += this.mass * sax;
       Fy += this.mass * say * 0.5; // 横向坡度推力打折：横摇-横漂耦合未建模
     }
@@ -283,6 +286,10 @@ export class BoatPhysics {
     const aPhi = Math.abs(this.phi);
     const fade = 1 - 1.18 * smoothstep(p.stabFadeA * DEG, p.stabFadeB * DEG, aPhi);
     tauRoll += -this.mass * G * p.gmEff * Math.sin(this.phi) * fade;
+    // 浪致横摇：浮力回复力矩趋向浪面法线（等效把浪面横向坡度当作侧向重力分量）。
+    // 放在船员压舷之后累加,自动压舷不会瞬时抵消它 —— 大浪真实摇船,
+    // 横浪 + 阵风横倾叠加时逼近稳性崩溃区,构成大浪翻船风险。
+    if (!this.capsized) tauRoll += this.mass * p.gmEff * waveRollAcc * p.cRollWave;
     // 横摇阻尼
     tauRoll -= p.cRollDampL * this.phiRate + p.cRollDampQ * this.phiRate * Math.abs(this.phiRate);
 

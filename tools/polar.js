@@ -155,7 +155,7 @@ console.log('\n=== 场景：波浪中的航行（对照平水）===');
     waves.setConditions(0, TWS_KN);
     const b = makeBoat(-twa);
     const dt = 1 / 60;
-    let sum = 0, n = 0, maxV = 0, minV = 99;
+    let sum = 0, n = 0, maxV = 0, minV = 99, maxHeel = 0;
     for (let t = 0; t < 100; t += dt) {
       steerTowards(b, -twa * DEG);
       trimAssist(b, twa < 60 ? 18 : twa < 100 ? 17 : 15);
@@ -165,13 +165,15 @@ console.log('\n=== 场景：波浪中的航行（对照平水）===');
         sum += b.out.speedKn; n++;
         maxV = Math.max(maxV, b.out.speedKn);
         minV = Math.min(minV, b.out.speedKn);
+        if (!b.capsized) maxHeel = Math.max(maxHeel, Math.abs(b.phi) / DEG);
       }
     }
     const finite = Number.isFinite(b.x + b.z + b.u + b.v + b.phi + b.psi);
-    return { avg: sum / n, max: maxV, min: minV, finite };
+    return { avg: sum / n, max: maxV, min: minV, maxHeel, finite };
   };
   const upF = runCase(45, false), upW = runCase(45, true);
   const dnF = runCase(150, false), dnW = runCase(150, true);
+  const bmW = runCase(90, true);
   console.log(`  迎风45°:  平水 ${upF.avg.toFixed(2)}kn -> 带浪 ${upW.avg.toFixed(2)}kn (波动 ${upW.min.toFixed(2)}~${upW.max.toFixed(2)})`);
   console.log(`  顺风150°: 平水 ${dnF.avg.toFixed(2)}kn -> 带浪 ${dnW.avg.toFixed(2)}kn (波动 ${dnW.min.toFixed(2)}~${dnW.max.toFixed(2)})`);
   check('顺风可追浪冲浪（峰值明显高于平水）', dnW.max > dnF.max * 1.06, `峰值 ${dnW.max.toFixed(2)} vs 平水 ${dnF.max.toFixed(2)}kn`);
@@ -180,6 +182,9 @@ console.log('\n=== 场景：波浪中的航行（对照平水）===');
     check('迎风顶浪近似中性', upW.avg > upF.avg * 0.85 && upW.avg < upF.avg * 1.08, `${upW.avg.toFixed(2)} vs ${upF.avg.toFixed(2)}kn`);
   }
   check('波浪中数值稳定无发散', upW.finite && dnW.finite && dnW.max < 25);
+  // 浪致横摇(cRollWave):横风带浪应有可感横倾且有界(压舷辅助下不至失控)
+  console.log(`  横风90°带浪最大横倾 ${bmW.maxHeel.toFixed(1)}°`);
+  check('横风带浪横摇有界', bmW.finite && bmW.maxHeel > 3 && bmW.maxHeel < 60, `${bmW.maxHeel.toFixed(1)}°`);
 }
 
 console.log('\n=== 风影几何自检 ===');
