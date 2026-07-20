@@ -2,16 +2,24 @@
 //  规则10 不同舷受风:左舷受风船让右舷受风船
 //  规则11 同舷并列:上风船让下风船
 //  规则12 同舷前后:后船让前船
-// 发生碰撞时判责让行方并给予"减速处罚"(帆效率降低数秒);
+//  规则31 触标:碰赛道标志(含起航线两端)受罚
+// 处罚两种模式(设置可切):
+//  'turns' 回转处罚(默认):碰撞判责 2 回转(RRS 44.2)、触标 1 回转(RRS 44.1),
+//          未完成回转不得完赛(race.js 拦截);回转按连续净转向角累计满 360° 清一个。
+//  'slow'  街机减速处罚:判责后帆效率降低数秒。
 // 另提供玩家让行预警(接近中的会遇且玩家为让行方时提示)。
 // 返回/发出的 rule 均为 i18n key,由调用方翻译。
 
 import { wrapPi } from '../util/math.js';
 
-export const PENALTY_SECONDS = 8;   // 处罚时长
-export const PENALTY_POWER = 0.45;  // 处罚期帆效率
-const OVERLAP_LEN = 4.6;            // 前后错开超过一船长即为"前后关系"
-const WARN_DIST = 30;               // 预警扫描半径 m
+export const PENALTY_SECONDS = 8;        // slow 模式处罚时长
+export const PENALTY_POWER = 0.45;       // slow 模式处罚期帆效率
+export const PENALTY_TURNS_CONTACT = 2;  // turns 模式:船间碰撞责任船回转数
+export const PENALTY_TURNS_MARK = 1;     // turns 模式:触标回转数
+const TURN_COMPLETE = Math.PI * 2 * 0.97; // 一个回转的净转角(留 3% 判定余量)
+const TURN_RATE_GATE = 0.25;             // rad/s;低于此转率不计入回转(过滤正常航行)
+const OVERLAP_LEN = 4.6;                 // 前后错开超过一船长即为"前后关系"
+const WARN_DIST = 30;                    // 预警扫描半径 m
 
 // 受风舷:twa > 0 = 风来自右舷(starboard tack)
 export function tackOf(phys) {
@@ -48,9 +56,10 @@ function worldVel(p) {
 }
 
 export class RulesEngine {
-  constructor(wind) {
+  constructor(wind, { mode = 'slow' } = {}) {
     this.wind = wind;
-    this.events = []; // { boat, other, rule }
+    this.mode = mode === 'turns' ? 'turns' : 'slow';
+    this.events = []; // { boat, other, rule, kind: 'contact'|'mark'|'turnDone', turns }
   }
 
   takeEvents() {
@@ -59,23 +68,67 @@ export class RulesEngine {
     return e;
   }
 
-  // 每帧:衰减处罚、应用帆效率、对本帧接触判责
-  update(boats, contacts, dt) {
+  // 每帧:衰减处罚 / 累计回转、应用帆效率、对本帧接触与触标判责
+  update(boats, contacts, dt, markContacts = []) {
     for (const b of boats) {
       if ((b.penaltyT ?? 0) > 0) b.penaltyT = Math.max(0, b.penaltyT - dt);
       if ((b.ruleCooldown ?? 0) > 0) b.ruleCooldown -= dt;
       b.phys.powerScale = (b.penaltyT ?? 0) > 0 ? PENALTY_POWER : 1;
+      if (this.mode === 'turns') this.#trackTurns(b, dt);
     }
-    if (!contacts?.length) return;
-    const windPsi = this.wind.currentFromPsi();
-    for (const c of contacts) {
-      const { give, rule } = giveWay(c.a.phys, c.b.phys, windPsi);
-      const culprit = give === 'a' ? c.a : c.b;
-      const other = give === 'a' ? c.b : c.a;
-      if ((culprit.penaltyT ?? 0) > 0 || (culprit.ruleCooldown ?? 0) > 0) continue;
-      culprit.penaltyT = PENALTY_SECONDS;
-      culprit.ruleCooldown = PENALTY_SECONDS + 4;
-      this.events.push({ boat: culprit, other, rule });
+    if (contacts?.length) {
+      const windPsi = this.wind.currentFromPsi();
+      for (const c of contacts) {
+        const { give, rule } = giveWay(c.a.phys, c.b.phys, windPsi);
+        const culprit = give === 'a' ? c.a : c.b;
+        const other = give === 'a' ? c.b : c.a;
+        if (!this.#charge(culprit, PENALTY_TURNS_CONTACT)) continue;
+        this.events.push({
+          boat: culprit, other, rule, kind: 'contact', turns: culprit.penaltyTurns ?? 0,
+        });
+      }
+    }
+    if (markContacts?.length) {
+      for (const c of markContacts) {
+        if (!this.#charge(c.boat, PENALTY_TURNS_MARK)) continue;
+        this.events.push({
+          boat: c.boat, other: null, rule: 'rules.markTouch', kind: 'mark',
+          turns: c.boat.penaltyTurns ?? 0,
+        });
+      }
+    }
+  }
+
+  // 判责入账;冷却期或处罚未消化时不重复入账。返回是否入账。
+  #charge(boat, turns) {
+    if ((boat.ruleCooldown ?? 0) > 0) return false;
+    if (this.mode === 'turns') {
+      boat.penaltyTurns = (boat.penaltyTurns ?? 0) + turns;
+      boat.ruleCooldown = 6;
+    } else {
+      if ((boat.penaltyT ?? 0) > 0) return false;
+      boat.penaltyT = PENALTY_SECONDS;
+      boat.ruleCooldown = PENALTY_SECONDS + 4;
+    }
+    return true;
+  }
+
+  // 回转累计:带符号净转角,反向转抵消;转率过低(正常航行)不计入。
+  #trackTurns(b, dt) {
+    const psi = b.phys.psi;
+    const prev = b._rulesPrevPsi ?? psi;
+    b._rulesPrevPsi = psi;
+    if ((b.penaltyTurns ?? 0) <= 0) { b.turnAcc = 0; return; }
+    if (b.phys.capsized || dt <= 0) return;
+    const d = wrapPi(psi - prev);
+    if (Math.abs(d / dt) < TURN_RATE_GATE) return;
+    b.turnAcc = (b.turnAcc ?? 0) + d;
+    if (Math.abs(b.turnAcc) >= TURN_COMPLETE) {
+      b.penaltyTurns -= 1;
+      b.turnAcc = 0;
+      this.events.push({
+        boat: b, other: null, rule: 'rules.turnDone', kind: 'turnDone', turns: b.penaltyTurns,
+      });
     }
   }
 

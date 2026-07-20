@@ -386,7 +386,7 @@ export class App {
       racers.push(ai);
     }
     this.race = new RaceManager(course, racers, this.settings.countdown);
-    this.rules = new RulesEngine(this.wind);
+    this.rules = new RulesEngine(this.wind, { mode: this.settings.penaltyMode });
     // 幽灵船：回放该风速/该模式下的个人最佳轨迹
     this.ghostRec = new GhostRecorder(course);
     const ghostData = this.settings.ghost ? loadGhost(this.settings.windKn, aiCount) : null;
@@ -601,17 +601,10 @@ export class App {
     this.shadowWind.exclude = null;
     this._boatCollisions();
 
-    // 航行规则:碰撞判责 -> 让行方减速处罚
+    // 航行规则:碰撞/触标判责 -> 回转或减速处罚
     if (this.rules) {
-      this.rules.update(this.boats, this._contacts, dt);
-      for (const ev of this.rules.takeEvents()) {
-        if (ev.boat.isPlayer) {
-          this.hud.toast(t('rules.penalty.you', { s: PENALTY_SECONDS }), 3.5);
-          this.audio.beep(392, 0.35, 0.25);
-        } else if (ev.other?.isPlayer) {
-          this.hud.toast(t('rules.penalty.other', { name: ev.boat.displayName ?? t(ev.boat.nameKey) }));
-        }
-      }
+      this.rules.update(this.boats, this._contacts, dt, this._markContacts);
+      this._consumeRuleEvents();
     }
 
     // 比赛
@@ -814,6 +807,29 @@ export class App {
     p.v = 0;
     p.yawRate = 0;
     p.sheet = p.ctl.sheet = 1;
+  }
+
+  // 规则事件 -> 玩家提示音与 toast(单机与联机权威路径共用)
+  _consumeRuleEvents() {
+    for (const ev of this.rules.takeEvents()) {
+      if (ev.kind === 'turnDone') {
+        if (ev.boat.isPlayer) {
+          this.hud.toast(
+            ev.turns > 0 ? t('rules.turnDone.more', { n: ev.turns }) : t('rules.turnDone.clear'), 3);
+          this.audio.beep(1040, 0.25, 0.22);
+        }
+        continue;
+      }
+      if (ev.boat.isPlayer) {
+        const msg = this.rules.mode === 'turns'
+          ? t(ev.kind === 'mark' ? 'rules.markTouchTurns.you' : 'rules.penaltyTurns.you', { n: ev.turns })
+          : t(ev.kind === 'mark' ? 'rules.markTouch.you' : 'rules.penalty.you', { s: PENALTY_SECONDS });
+        this.hud.toast(msg, 3.5);
+        this.audio.beep(392, 0.35, 0.25);
+      } else if (ev.other?.isPlayer) {
+        this.hud.toast(t('rules.penalty.other', { name: ev.boat.displayName ?? t(ev.boat.nameKey) }));
+      }
+    }
   }
 
   _boatCollisions() {

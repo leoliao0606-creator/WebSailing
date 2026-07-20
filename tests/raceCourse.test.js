@@ -46,3 +46,24 @@ test('终点仅接受自下风向上风的穿越;反向穿线不算完赛', () =
   assert.equal(race.entries.get(boat).finished, true, '正向穿线应完赛');
   assert.equal(race.results.length, 1);
 });
+
+test('未完成的回转处罚拦截完赛,清罚后可完赛', () => {
+  const course = makeCourse();
+  const boat = makeBoat(0, 1);
+  boat.penaltyTurns = 1;
+  const race = new RaceManager(course, [boat], 0);
+  race.state = 'racing';
+  race.t = 100;
+  race.entries.get(boat).leg = course.legs.length - 1;
+
+  boat.phys.z = -1;
+  race.update(0.1);
+  assert.equal(race.entries.get(boat).finished, false, '带罚转不应完赛');
+
+  boat.phys.z = 1;
+  race.update(0.1); // 回到线下
+  boat.penaltyTurns = 0;
+  boat.phys.z = -1;
+  race.update(0.1);
+  assert.equal(race.entries.get(boat).finished, true, '清罚后应完赛');
+});

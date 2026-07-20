@@ -11,6 +11,7 @@ const DEFAULTS = {
   gustiness: 0.32,
   countdown: 45,
   aiCount: 3,
+  penaltyMode: 'turns', // 判罚模式:'turns' 回转处罚 / 'slow' 减速处罚
   autoHike: true,
   autoTrim: false,
   coach: true,          // 新手教练提示(最佳帆/板参考 + 操作提示)
@@ -152,6 +153,8 @@ export class Menu {
           <select id="s-count">${[30, 45, 60].map((v) => opt(v, s.countdown, t('set.seconds', { s: v }))).join('')}</select></label>
         <label>${t('set.ai')}
           <select id="s-ai">${[1, 2, 3].map((v) => opt(v, s.aiCount, v)).join('')}</select></label>
+        <label>${t('set.penaltyMode')}
+          <select id="s-penalty">${['turns', 'slow'].map((v) => opt(v, s.penaltyMode, t('pen.' + v))).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-hike" ${s.autoHike ? 'checked' : ''}> ${t('set.autoHike')}</label>
         <label class="check"><input type="checkbox" id="s-trim" ${s.autoTrim ? 'checked' : ''}> ${t('set.autoTrim')}</label>
         <label class="check"><input type="checkbox" id="s-coach" ${s.coach ? 'checked' : ''}> ${t('set.coach')}</label>
@@ -227,6 +230,7 @@ export class Menu {
     st.gustiness = Number(el.querySelector('#s-gust').value) / 100;
     st.countdown = Number(el.querySelector('#s-count').value);
     st.aiCount = Number(el.querySelector('#s-ai').value);
+    st.penaltyMode = el.querySelector('#s-penalty').value;
     st.autoHike = el.querySelector('#s-hike').checked;
     st.autoTrim = el.querySelector('#s-trim').checked;
     st.coach = el.querySelector('#s-coach').checked;

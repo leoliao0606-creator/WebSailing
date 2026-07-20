@@ -143,6 +143,7 @@ test('race finish messages use the temporary multiplayer nickname', () => {
   boat.displayName = 'Skipper 七';
   const course = makeCourse();
   course.crossesLine = () => true;
+  course.isUpwindOfLine = () => true; // 终点要求正向(向上风)穿越
   const race = new RaceManager(course, [boat], 0);
   race.state = 'racing';
   race.t = 4;

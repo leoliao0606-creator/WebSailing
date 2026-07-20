@@ -293,6 +293,14 @@ export class HUD {
     const rowWarn = game?.rules?.warningFor(boat, game.boats);
     let badge = '', badgeColor = AMBER;
     if (p.capsized) { badge = p.rightProgress > 0 ? t('badge.righting', { p: (p.rightProgress * 100).toFixed(0) }) : t('badge.capsized'); badgeColor = RED; }
+    else if ((boat.penaltyTurns ?? 0) > 0) {
+      // 回转处罚:剩余回转数 + 当前回转进度
+      badge = t('badge.turns', {
+        n: boat.penaltyTurns,
+        p: Math.min(99, Math.abs(boat.turnAcc ?? 0) / (Math.PI * 2) * 100).toFixed(0),
+      });
+      badgeColor = RED;
+    }
     else if ((boat.penaltyT ?? 0) > 0) { badge = t('badge.penalty', { s: Math.ceil(boat.penaltyT) }); badgeColor = RED; }
     else if (rowWarn) { badge = `⚠ ${t(rowWarn.rule)}`; badgeColor = AMBER; }
     else if (o.inIrons) badge = t('badge.irons');

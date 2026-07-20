@@ -48,6 +48,9 @@ export class Boat {
     // 航行规则处罚状态(rules.js 读写)
     this.penaltyT = 0;
     this.ruleCooldown = 0;
+    this.penaltyTurns = 0;   // turns 模式:待完成回转数
+    this.turnAcc = 0;        // 当前回转累计净转角 rad
+    this._rulesPrevPsi = 0;
 
     // 事件计数（教学/音效用）
     this.events = { tacks: 0, gybes: 0, capsizes: 0 };
@@ -68,6 +71,9 @@ export class Boat {
     p.powerScale = 1;
     this.penaltyT = 0;
     this.ruleCooldown = 0;
+    this.penaltyTurns = 0;
+    this.turnAcc = 0;
+    this._rulesPrevPsi = psi;
     this._prevPos = { x, z };
   }
 
