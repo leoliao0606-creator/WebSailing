@@ -298,10 +298,9 @@ export class App {
       boat.slot.lineTarget = mkSlot(lateral, -30);
       this.boats.push(boat);
       racers.push(boat);
-      this._multiplayerHelms.set(
-        boat.boatId,
-        new AIHelm(boat, 0.86 + (index % 5) * 0.035, `${start.seed}:helm:${boat.boatId}`),
-      );
+      const helm = new AIHelm(boat, 0.86 + (index % 5) * 0.035, `${start.seed}:helm:${boat.boatId}`);
+      helm.course = course;
+      this._multiplayerHelms.set(boat.boatId, helm);
       if (member.isLocal) this.player = boat;
     }
     if (!this.player) throw new Error('local player is missing from the multiplayer roster');
@@ -381,6 +380,7 @@ export class App {
       ai.slot = mkSlot(-12 - i * 20, 12);
       ai.slot.lineTarget = mkSlot(-10 - i * 18, -30);
       const helm = new AIHelm(ai, 0.86 + i * 0.07);
+      helm.course = course; // 起航偏向有利端需要起航线两端位置
       this.aiHelms.push(helm);
       this.boats.push(ai);
       racers.push(ai);
@@ -580,16 +580,19 @@ export class App {
     // 玩家输入
     this.player.applyInput(this.input, s, dt, this.time);
 
-    // AI
+    // AI(采样带风影的风场:能感知脏风并做逃逸战术)
+    this.shadowWind.boats = this.boats;
     for (const helm of this.aiHelms) {
       const b = helm.boat;
+      this.shadowWind.exclude = b;
       if (this.race && this.race.state === 'prestart') {
-        helm.holdNear(this.wind, b.slot, this.time, -this.race.t);
+        helm.holdNear(this.shadowWind, b.slot, this.time, -this.race.t);
       } else {
         const target = this.race ? this.race.targetFor(b) : null;
-        helm.update(this.wind, target, this.time, dt);
+        helm.update(this.shadowWind, target, this.time, dt);
       }
     }
+    this.shadowWind.exclude = null;
 
     // 物理与视觉（每条船感受到被其他船遮挡后的风）
     this.shadowWind.boats = this.boats;
@@ -676,11 +679,14 @@ export class App {
       const aiControlled = !boat.playerId || takeoverPlayerIds.has(boat.playerId);
       if (aiControlled) {
         const helm = this._multiplayerHelms.get(boat.boatId);
+        this.shadowWind.boats = this.boats;
+        this.shadowWind.exclude = boat;
         if (this.race.state === 'prestart') {
-          helm.holdNear(this.wind, boat.slot, worldTime, -this.race.t);
+          helm.holdNear(this.shadowWind, boat.slot, worldTime, -this.race.t);
         } else {
-          helm.update(this.wind, this.race.targetFor(boat), worldTime, dt);
+          helm.update(this.shadowWind, this.race.targetFor(boat), worldTime, dt);
         }
+        this.shadowWind.exclude = null;
       } else {
         boat.applyControlIntent(controlFor(boat.playerId), this.settings, dt, worldTime);
       }
