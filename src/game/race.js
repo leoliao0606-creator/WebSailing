@@ -348,7 +348,8 @@ export class RaceManager {
             if (b.isPlayer) this.emit(t('race.msg.rounded', { mark: t(m.nameKey), next: c.legLabel(c.legs[e.leg]) }));
           }
         } else if (leg.type === 'finish') {
-          if (crossed) {
+          // 终点须自下风侧向上风穿越(与起航同向);反向穿线不算完赛
+          if (crossed && nowUp) {
             e.finished = true;
             e.finishT = this.t;
             this.results.push({ boat: b, time: this.t });
