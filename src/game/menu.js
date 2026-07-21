@@ -25,16 +25,17 @@ const DEFAULTS = {
   shadowQ: 'high',      // off/medium/high/ultra
   waterDetail: 'high',  // low/medium/high
   effects: true,        // 浪花/尾流粒子
+  clouds: true,         // 程序化云层
   dynamicRes: true,     // 掉帧时自动降分辨率
   showFps: false,
 };
 
 // 画质预设 -> 细项。改任何细项后预设显示为 custom。
 export const QUALITY_PRESETS = {
-  low:    { resScale: 0.7,  shadowQ: 'off',    waterDetail: 'low',    effects: false },
-  medium: { resScale: 0.85, shadowQ: 'medium', waterDetail: 'medium', effects: true },
-  high:   { resScale: 1.0,  shadowQ: 'high',   waterDetail: 'high',   effects: true },
-  ultra:  { resScale: 1.3,  shadowQ: 'ultra',  waterDetail: 'high',   effects: true },
+  low:    { resScale: 0.7,  shadowQ: 'off',    waterDetail: 'low',    effects: false, clouds: false },
+  medium: { resScale: 0.85, shadowQ: 'medium', waterDetail: 'medium', effects: true,  clouds: true },
+  high:   { resScale: 1.0,  shadowQ: 'high',   waterDetail: 'high',   effects: true,  clouds: true },
+  ultra:  { resScale: 1.3,  shadowQ: 'ultra',  waterDetail: 'high',   effects: true,  clouds: true },
 };
 
 export function loadSettings() {
@@ -184,6 +185,7 @@ export class Menu {
         <label>${t('set.water')}
           <select id="s-water">${['low', 'medium', 'high'].map((v) => opt(v, s.waterDetail, t('w.' + v))).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-fx" ${s.effects ? 'checked' : ''}> ${t('set.effects')}</label>
+        <label class="check"><input type="checkbox" id="s-clouds" ${s.clouds ? 'checked' : ''}> ${t('set.clouds')}</label>
         <label class="check"><input type="checkbox" id="s-dynres" ${s.dynamicRes ? 'checked' : ''}> ${t('set.dynRes')}</label>
         <label class="check"><input type="checkbox" id="s-fps" ${s.showFps ? 'checked' : ''}> ${t('set.showFps')}</label>
       </div>
@@ -208,9 +210,10 @@ export class Menu {
       el.querySelector('#s-shadow').value = p.shadowQ;
       el.querySelector('#s-water').value = p.waterDetail;
       el.querySelector('#s-fx').checked = p.effects;
+      el.querySelector('#s-clouds').checked = p.clouds;
     });
     // 改细项 -> 预设变自定义
-    for (const id of ['#s-res', '#s-shadow', '#s-water', '#s-fx']) {
+    for (const id of ['#s-res', '#s-shadow', '#s-water', '#s-fx', '#s-clouds']) {
       el.querySelector(id).addEventListener('change', () => {
         el.querySelector('#s-quality').value = 'custom';
       });
@@ -255,6 +258,7 @@ export class Menu {
     st.shadowQ = el.querySelector('#s-shadow').value;
     st.waterDetail = el.querySelector('#s-water').value;
     st.effects = el.querySelector('#s-fx').checked;
+    st.clouds = el.querySelector('#s-clouds').checked;
     st.dynamicRes = el.querySelector('#s-dynres').checked;
     st.showFps = el.querySelector('#s-fps').checked;
     saveSettings(st);

@@ -7,6 +7,7 @@ import { WaveField } from './sim/waves.js';
 import { WindField } from './sim/wind.js';
 import { ShadowedWind, shadowFactorAt } from './sim/windShadow.js';
 import { createScene } from './render/sceneSetup.js';
+import { createClouds } from './render/clouds.js';
 import { Water } from './render/water.js';
 import { createTerrain, createBuoy } from './render/terrain.js';
 import { Input } from './game/input.js';
@@ -137,6 +138,10 @@ export class App {
     }
     this.water.setDetail(s.waterDetail);
     for (const b of this.boats) b.effects.setEnabled(s.effects);
+
+    // —— 云层(可开关;低画质预设默认关)——
+    if (s.clouds && !this.clouds) this.clouds = createClouds(this.scene);
+    else if (!s.clouds && this.clouds) { this.clouds.dispose(); this.clouds = null; }
   }
 
   _applyPixelRatio() {
@@ -558,6 +563,7 @@ export class App {
       this.followShadow(camTarget.phys.x, camTarget.phys.z);
     }
     this.water.update(this.wind, this.camera.position.x, this.camera.position.z);
+    this.clouds?.update(rawDt, this.wind, this.camera);
     if (this.tutorialMark) {
       const w = this.waveField.sample(this.tutorialMark.position.x, this.tutorialMark.position.z);
       this.tutorialMark.position.y = w.y;
