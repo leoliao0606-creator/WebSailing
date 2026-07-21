@@ -219,6 +219,7 @@ const zh = {
   'toast.trialReady': '计时赛 · {s}秒后起航',
   'toast.raceReady': '对手就位 · {s}秒后起航',
   'toast.ghost': ' · 幽灵船已就位',
+  'ghost.sail': '影',
   'toast.reset': '已复位',
   'toast.grounded': '搁浅! 离岸边远一点',
 
@@ -468,6 +469,7 @@ const en = {
   'toast.trialReady': 'Time trial · start in {s}s',
   'toast.raceReady': 'Opponents ready · start in {s}s',
   'toast.ghost': ' · ghost boat ready',
+  'ghost.sail': 'G',
   'toast.reset': 'Reset',
   'toast.grounded': 'Aground! Steer away from shore',
 
@@ -715,6 +717,7 @@ const ja = {
   'toast.trialReady': 'タイムトライアル · {s}秒後スタート',
   'toast.raceReady': '対戦相手準備完了 · {s}秒後スタート',
   'toast.ghost': ' · ゴースト出走',
+  'ghost.sail': '影',
   'toast.reset': 'リセット完了',
   'toast.grounded': '座礁! 岸から離れて',
 

@@ -4,6 +4,7 @@
 
 import { clamp, lerp, wrapPi } from '../util/math.js';
 import { createBoatVisual } from '../render/boatModel.js';
+import { t } from '../i18n.js';
 
 const REC_HZ = 5; // 采样率；10 分钟赛程 ≈ 3000 帧 ≈ 150KB localStorage
 
@@ -69,7 +70,7 @@ export class GhostBoat {
     this.frame = courseFrame(course);
     this.samples = data.s;
     this.finishT = data.t;
-    this.visual = createBoatVisual({ hullColor: 0x9fc3d8, sailNumber: '影', accent: '#5f7f96' });
+    this.visual = createBoatVisual({ hullColor: 0x9fc3d8, sailNumber: t('ghost.sail'), accent: '#5f7f96' });
     this.visual.group.traverse((o) => {
       if (o.isMesh || o.isLine) {
         o.castShadow = false;
