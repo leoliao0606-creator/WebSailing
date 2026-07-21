@@ -26,6 +26,7 @@ const DEFAULTS = {
   waterDetail: 'high',  // low/medium/high
   effects: true,        // 浪花/尾流粒子
   clouds: true,         // 程序化云层
+  skyPreset: 'golden',  // 时段/天气:golden/noon/dusk/overcast
   dynamicRes: true,     // 掉帧时自动降分辨率
   showFps: false,
 };
@@ -184,6 +185,8 @@ export class Menu {
           <select id="s-shadow">${['off', 'medium', 'high', 'ultra'].map((v) => opt(v, s.shadowQ, t('sh.' + v))).join('')}</select></label>
         <label>${t('set.water')}
           <select id="s-water">${['low', 'medium', 'high'].map((v) => opt(v, s.waterDetail, t('w.' + v))).join('')}</select></label>
+        <label>${t('set.sky')}
+          <select id="s-sky">${['golden', 'noon', 'dusk', 'overcast'].map((v) => opt(v, s.skyPreset, t('sky.' + v))).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-fx" ${s.effects ? 'checked' : ''}> ${t('set.effects')}</label>
         <label class="check"><input type="checkbox" id="s-clouds" ${s.clouds ? 'checked' : ''}> ${t('set.clouds')}</label>
         <label class="check"><input type="checkbox" id="s-dynres" ${s.dynamicRes ? 'checked' : ''}> ${t('set.dynRes')}</label>
@@ -257,6 +260,7 @@ export class Menu {
     st.resScale = Number(el.querySelector('#s-res').value) / 100;
     st.shadowQ = el.querySelector('#s-shadow').value;
     st.waterDetail = el.querySelector('#s-water').value;
+    st.skyPreset = el.querySelector('#s-sky').value;
     st.effects = el.querySelector('#s-fx').checked;
     st.clouds = el.querySelector('#s-clouds').checked;
     st.dynamicRes = el.querySelector('#s-dynres').checked;

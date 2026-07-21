@@ -213,6 +213,16 @@ export class Water {
     this.snap = this.size / this.segments;
   }
 
+  // 时段/天气预设:同步太阳方向、日照颜色与雾(与 sceneSetup.applySkyPreset 一致)
+  setSky(sunDir, preset) {
+    this.uniforms.uSunDir.value.copy(sunDir);
+    if (preset) {
+      this.uniforms.uSunColor.value.set(preset.waterSun);
+      this.uniforms.uFogColor.value.set(preset.fog);
+      this.uniforms.uFogDensity.value = preset.fogD;
+    }
+  }
+
   // 画质设置：重建不同分段数的网格（着色器/uniform 不变）
   setDetail(level) {
     const seg = WATER_SEGMENTS[level] ?? WATER_SEGMENTS.high;

@@ -53,8 +53,9 @@ const MULTIPLAYER_STYLES = [
 export class App {
   constructor() {
     const canvas = document.getElementById('app');
-    const { renderer, scene, camera, sunDir, sunLight, followShadow } = createScene(canvas);
-    Object.assign(this, { renderer, scene, camera, sunLight, followShadow });
+    const { renderer, scene, camera, sunDir, sunLight, followShadow, applySkyPreset } = createScene(canvas);
+    Object.assign(this, { renderer, scene, camera, sunLight, followShadow, applySkyPreset });
+    this.sunDir = sunDir;
 
     this.settings = loadSettings();
     this.waveField = new WaveField();
@@ -142,6 +143,13 @@ export class App {
     // —— 云层(可开关;低画质预设默认关)——
     if (s.clouds && !this.clouds) this.clouds = createClouds(this.scene);
     else if (!s.clouds && this.clouds) { this.clouds.dispose(); this.clouds = null; }
+
+    // —— 时段/天气预设(纯本地视觉,联机不同步)——
+    if (this._skyApplied !== s.skyPreset) {
+      this._skyApplied = s.skyPreset;
+      const preset = this.applySkyPreset(s.skyPreset);
+      this.water.setSky(this.sunDir, preset);
+    }
   }
 
   _applyPixelRatio() {
