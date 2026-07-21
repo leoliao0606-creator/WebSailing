@@ -305,6 +305,69 @@ test('IntegrityMonitor rejects boat roster replacement and seed changes within a
   assert.ok(seedResult.reasons.some((reason) => reason.includes('seed')));
 });
 
+test('IntegrityMonitor checks the first authority state against the authorized race identity', () => {
+  const snapshot = makeSnapshot();
+
+  const foreignRoster = new IntegrityMonitor().inspect(snapshot, {
+    expectedEpoch: 1,
+    expectedBoatIds: ['boat-a', 'boat-b'],
+    expectedSeed: 'integrity-seed',
+  });
+  const foreignSeed = new IntegrityMonitor().inspect(snapshot, {
+    expectedEpoch: 1,
+    expectedBoatIds: ['boat-a'],
+    expectedSeed: 'different-seed',
+  });
+  const authorized = new IntegrityMonitor().inspect(snapshot, {
+    expectedEpoch: 1,
+    expectedBoatIds: ['boat-a'],
+    expectedSeed: 'integrity-seed',
+  });
+
+  assert.equal(foreignRoster.status, 'invalidated');
+  assert.ok(foreignRoster.reasons.some((reason) => reason.includes('authorized roster')));
+  assert.equal(foreignSeed.status, 'invalidated');
+  assert.ok(foreignSeed.reasons.some((reason) => reason.includes('authorized seed')));
+  assert.equal(authorized.status, 'accepted');
+});
+
+test('IntegrityMonitor rejects a first authority state that lies about the 60 Hz start timeline', () => {
+  const result = new IntegrityMonitor().inspect(
+    makeSnapshot({ tick: 600, worldTime: 0.1, raceTime: 0.1 }),
+    {
+      expectedEpoch: 1,
+      expectedBoatIds: ['boat-a'],
+      expectedSeed: 'integrity-seed',
+      expectedStartTick: 0,
+    },
+  );
+
+  assert.equal(result.status, 'invalidated');
+  assert.match(result.reasons.join(' '), /tick|worldTime|60 Hz|timeline/i);
+});
+
+test('IntegrityMonitor accepts legal first states on the original and migrated epochs', () => {
+  const monitor = new IntegrityMonitor();
+  const authorization = {
+    expectedBoatIds: ['boat-a'],
+    expectedSeed: 'integrity-seed',
+    expectedStartTick: 540,
+  };
+
+  const original = monitor.inspect(makeSnapshot({ tick: 600, worldTime: 1 }), {
+    ...authorization,
+    expectedEpoch: 1,
+  });
+  monitor.reset();
+  const migrated = monitor.inspect(makeSnapshot({ tick: 606, worldTime: 1.1, hostEpoch: 2 }), {
+    ...authorization,
+    expectedEpoch: 2,
+  });
+
+  assert.equal(original.status, 'accepted');
+  assert.equal(migrated.status, 'accepted');
+});
+
 test('IntegrityMonitor allows only adjacent race-state transitions without rollback', () => {
   const skipMonitor = new IntegrityMonitor();
   const prestart = makeSnapshot({ raceTime: 0 });

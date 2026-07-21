@@ -263,6 +263,8 @@ export class MultiplayerRaceController {
 
   #role = 'disconnected';
 
+  #initialWorldState;
+
   constructor({
     session = null,
     boats = [],
@@ -320,6 +322,7 @@ export class MultiplayerRaceController {
     this.#onRescueRequest = onRescueRequest;
     this.#onStartRace = onStartRace;
     if (session) this.attach(session);
+    this.#initialWorldState = this.captureWorldState(session?.state?.hostEpoch ?? 0);
   }
 
   get tick() {
@@ -379,7 +382,15 @@ export class MultiplayerRaceController {
     this.#listen('checkpoint', ({ detail }) => this.receiveAuthorityCheckpoint(detail.checkpoint));
     this.#listen('promote', ({ detail }) => {
       this.#migrating = true;
-      if (detail.checkpoint) this.applyWorldState(detail.checkpoint);
+      if (detail.checkpoint) {
+        this.applyWorldState(detail.checkpoint);
+      } else {
+        const initialState = cloneWorldState(this.#initialWorldState);
+        initialState.hostEpoch = this.#session?.state?.hostEpoch
+          ?? this.#hostEpoch
+          ?? initialState.hostEpoch;
+        this.applyWorldState(initialState);
+      }
     });
     this.#listen('rolechange', ({ detail }) => {
       const previousRole = this.#role;
@@ -603,7 +614,12 @@ export class MultiplayerRaceController {
       const elapsed = Math.max(0, receivedAt - this.#authorityClock.receivedAt) / 1_000;
       const estimatedTick = this.#authorityClock.tick + elapsed * MULTIPLAYER_TICK_HZ;
       const estimatedWorldTime = this.#authorityClock.worldTime + elapsed;
-      if (estimatedWorldTime > worldTime) {
+      const extrapolatedLeadSeconds = Math.max(
+        estimatedWorldTime - state.worldTime,
+        (estimatedTick - state.tick) / MULTIPLAYER_TICK_HZ,
+      );
+      if (extrapolatedLeadSeconds <= HARD_CLOCK_DRIFT_SECONDS
+        && estimatedWorldTime > worldTime) {
         tick = Math.max(tick, estimatedTick);
         worldTime = estimatedWorldTime;
       }

@@ -31,6 +31,31 @@ const DEFAULTS = {
   showFps: false,
 };
 
+const MULTIPLAYER_CONTROL_SETTINGS = Object.freeze({
+  autoHike: true,
+  autoTrim: false,
+});
+
+export const AI_COUNT_OPTIONS = Object.freeze([0, 1, 2, 3]);
+
+export function resolveSimulationEnvironment({
+  mode,
+  settings,
+  multiplayerStart,
+  currentWindPsi,
+}) {
+  const authoritative = mode === 'multiplayer-race' ? multiplayerStart?.config : null;
+  return {
+    windPsi: authoritative?.windPsi ?? currentWindPsi,
+    windKn: authoritative?.windKn ?? settings.windKn,
+    gustiness: authoritative?.gustiness ?? settings.gustiness,
+  };
+}
+
+export function simulationControlSettings(mode, settings) {
+  return mode === 'multiplayer-race' ? MULTIPLAYER_CONTROL_SETTINGS : settings;
+}
+
 // 画质预设 -> 细项。改任何细项后预设显示为 custom。
 export const QUALITY_PRESETS = {
   low:    { resScale: 0.7,  shadowQ: 'off',    waterDetail: 'low',    effects: false, clouds: false },
@@ -160,7 +185,7 @@ export class Menu {
         <label>${t('set.countdown')}
           <select id="s-count">${[30, 45, 60].map((v) => opt(v, s.countdown, t('set.seconds', { s: v }))).join('')}</select></label>
         <label>${t('set.ai')}
-          <select id="s-ai">${[1, 2, 3].map((v) => opt(v, s.aiCount, v)).join('')}</select></label>
+          <select id="s-ai">${AI_COUNT_OPTIONS.map((v) => opt(v, s.aiCount, v)).join('')}</select></label>
         <label>${t('set.penaltyMode')}
           <select id="s-penalty">${['turns', 'slow'].map((v) => opt(v, s.penaltyMode, t('pen.' + v))).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-hike" ${s.autoHike ? 'checked' : ''}> ${t('set.autoHike')}</label>
@@ -297,7 +322,7 @@ export class Menu {
     el.className = 'screen';
     el.innerHTML = `<h2>${t('results.title')}</h2><div id="results-body"></div>
       <div class="btn-col">
-        <button data-act="again">${t('results.again')}</button>
+        <button id="results-again" data-act="again">${t('results.again')}</button>
         <button data-act="main">${t('pause.main')}</button>
       </div>`;
     el.addEventListener('click', (e) => {
@@ -309,8 +334,10 @@ export class Menu {
     this.root.appendChild(el);
   }
 
-  showResults(rows, newBest) {
+  showResults(rows, newBest, { allowRestart = true } = {}) {
     const body = document.getElementById('results-body');
+    const restart = document.getElementById('results-again');
+    if (restart) restart.hidden = !allowRestart;
     const table = document.createElement('table');
     table.classList.add('results');
     for (let index = 0; index < rows.length; index += 1) {

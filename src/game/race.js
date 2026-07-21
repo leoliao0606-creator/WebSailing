@@ -269,6 +269,9 @@ export class RaceManager {
       if (!Number.isSafeInteger(entry.leg) || entry.leg < 0) {
         throw new TypeError('race entry leg must be a non-negative integer');
       }
+      if (entry.leg >= this.course.legs.length) {
+        throw new TypeError('race entry leg must reference an existing course leg');
+      }
       if (typeof entry.ocs !== 'boolean' || typeof entry.finished !== 'boolean'
         || typeof entry.nearMark !== 'boolean') {
         throw new TypeError('race entry flags must be Boolean');

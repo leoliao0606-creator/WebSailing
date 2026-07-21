@@ -1,8 +1,11 @@
-// 房主迁移专项回归(docs/plans/2026-07-10 Task 12 的欠账):
-// 覆盖 2/8 人房主丢失、按加入序选举、hostEpoch 恰好 +1、
-// 旧 host 过期权威拒收、0.5s 回滚边界、旧 host 以 guest 回归后输入水位重置。
-// 注册表计时/心跳类场景见 signalingServer.test.js 与 roomRegistry.test.js;
-// 比赛控制器的 AI 接管见 multiplayerRaceController.test.js。
+// 房主迁移专项回归 —— 聚焦「真实 RoomRegistry 选举」驱动客户端 session 晋升的集成路径
+// (docs/plans/2026-07-10 Task 12 的欠账)。覆盖:按加入序选举、注册表锁定+断线触发
+// 的两人迁移、旧 host 以 guest 回归后输入水位重置。
+//
+// 纯 session 侧的晋升机制(预检 checkpoint+host-ready 批次、0.5s 回滚边界、脏权威拒收、
+// 迁移回退计时)由 multiplayerSession.test.js 用假件详尽覆盖;注册表计时/心跳见
+// roomRegistry.test.js 与 signalingServer.test.js;比赛控制器的 AI 接管见
+// multiplayerRaceController.test.js。
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -10,10 +13,8 @@ import test from 'node:test';
 import { RoomRegistry } from '../server/roomRegistry.js';
 import { IntegrityMonitor } from '../src/net/integrityMonitor.js';
 import {
-  makeRoom,
-  makeWorldState,
+  makeAuthorizedWorldState,
   CONTROL,
-  startConfigForTick,
   makeHarness,
   collect,
 } from './helpers/netFakes.js';
@@ -51,10 +52,30 @@ function fillRoom(registry, humanCount) {
   return { roomCode, players };
 }
 
+// 供 registry.lockRoom 使用的初始开赛描述符:tick 必须为 0,roster 须与房间保留名单一致。
+function initialStart(players, { seed = 'migration-seed' } = {}) {
+  const countdown = 30;
+  return {
+    tick: 0,
+    seed,
+    config: {
+      windPsi: 0.25,
+      windKn: 12,
+      gustiness: 0.25,
+      countdown,
+      startTick: countdown * 60,
+      roster: players.map(({ playerId, nickname }) => ({ playerId, nickname })),
+      aiFill: 1,
+      penaltyMode: 'turns',
+    },
+  };
+}
+
 test('two-player racing migration: registry election drives session promotion within rollback budget', () => {
   const registry = createRegistry();
   const { roomCode, players: [host, guest] } = fillRoom(registry, 2);
-  const locked = registry.lockRoom(host.playerId);
+  const start = initialStart([host, guest]);
+  const locked = registry.lockRoom(host.playerId, start);
   assert.equal(locked.room.phase, 'racing');
 
   const { signaling, transport, session } = makeHarness({
@@ -63,31 +84,25 @@ test('two-player racing migration: registry election drives session promotion wi
     checkpointIntegrityMonitor: new IntegrityMonitor(),
   });
   const promotions = collect(session, 'promote');
+  // 房间视图携带 start 描述符即建立赛事身份,guest 无需额外的 start-race 消息。
   signaling.room(locked.room);
   assert.equal(session.role, 'guest');
 
+  const boatIds = [host.playerId, guest.playerId, 'ai:0'];
   transport.receive(host.playerId, {
     type: 'checkpoint',
     roomCode,
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10, seed: start.seed, boatIds }),
   }, { reliable: true });
   transport.receive(host.playerId, {
     type: 'snapshot',
     roomCode,
     hostEpoch: 1,
     tick: 624,
-    state: makeWorldState({ tick: 624, worldTime: 10.4 }),
+    state: makeAuthorizedWorldState({ tick: 624, worldTime: 10.4, seed: start.seed, boatIds }),
   });
-  transport.receive(host.playerId, {
-    type: 'start-race',
-    roomCode,
-    hostEpoch: 1,
-    tick: 630,
-    seed: 'race-seed',
-    config: startConfigForTick(630, [host.playerId, guest.playerId]),
-  }, { reliable: true });
 
   const migrated = registry.disconnect(host.playerId);
   assert.equal(migrated.room.hostId, guest.playerId);
@@ -132,171 +147,22 @@ test('eight-player room elects strictly by join order across consecutive host lo
   assert.equal(second.room.members.filter((member) => member.isHost).length, 1);
 });
 
-test('eight-player promotion preflights checkpoint and host-ready to every remaining peer', () => {
-  const others = ['g2', 'g3', 'g4', 'g5', 'g6', 'g7'];
-  const { signaling, transport, session } = makeHarness();
-  signaling.room(makeRoom({ extraIds: others }));
-  transport.receive('host', {
-    type: 'checkpoint',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'start-race',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 606,
-    seed: 'race-seed',
-    config: { ...startConfigForTick(606, ['host', 'guest', ...others]), aiFill: 0 },
-  }, { reliable: true });
-  signaling.hostChanged({
-    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
-  });
-
-  const peerIds = ['host', ...others];
-  transport.reliableAvailable = false;
-  transport.topology({
-    roomCode: 'AB2CD9',
-    hostId: 'guest',
-    hostEpoch: 2,
-    selfId: 'guest',
-    isHost: true,
-    peerIds,
-  });
-  for (const playerId of peerIds) {
-    transport.peerOpen({ playerId, channel: 'control', reliable: true, hostEpoch: 2 });
-  }
-
-  assert.equal(session.state.migrating, true);
-  assert.equal(transport.broadcasts.length, 0);
-  const preflight = transport.reliablePreflights.at(-1);
-  assert.deepEqual(preflight.messageOrMessages.map(({ type }) => type), ['checkpoint', 'host-ready']);
-  assert.deepEqual([...preflight.options.playerIds].sort(), [...peerIds].sort());
-
-  // 预检失败会清空整份 ready 集合,恢复可靠通道后须重新宣告每个 peer。
-  transport.reliableAvailable = true;
-  for (const playerId of peerIds) {
-    transport.peerOpen({ playerId, channel: 'control', reliable: true, hostEpoch: 2 });
-  }
-
-  assert.equal(session.state.migrating, false);
-  assert.deepEqual(
-    transport.broadcasts.map(({ message }) => message.type),
-    ['checkpoint', 'host-ready'],
-  );
-});
-
-test('after migration the stale host authority is rejected without consulting integrity', () => {
-  const { signaling, transport, integrityMonitor, session } = makeHarness();
-  signaling.room(makeRoom({ extraIds: ['new-host'] }));
-  transport.receive('host', {
-    type: 'checkpoint',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'start-race',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 606,
-    seed: 'race-seed',
-    config: startConfigForTick(606, ['host', 'guest', 'new-host']),
-  }, { reliable: true });
-
-  signaling.room(makeRoom({ hostId: 'new-host', extraIds: ['new-host'], hostEpoch: 2, phase: 'racing' }));
-  signaling.hostChanged({
-    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'new-host', hostEpoch: 2,
-  });
-  assert.equal(session.role, 'guest');
-
-  const rejected = collect(session, 'message-rejected');
-  const snapshots = collect(session, 'snapshot');
-  const callsBefore = integrityMonitor.calls.length;
-
-  transport.receive('host', {
-    type: 'snapshot',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 660,
-    state: makeWorldState({ tick: 660, worldTime: 11, hostEpoch: 1 }),
-  });
-  assert.equal(rejected.length, 1);
-  assert.equal(integrityMonitor.calls.length, callsBefore);
-  assert.equal(snapshots.length, 0);
-
-  transport.receive('new-host', {
-    type: 'snapshot',
-    roomCode: 'AB2CD9',
-    hostEpoch: 2,
-    tick: 666,
-    state: makeWorldState({ tick: 666, worldTime: 11.1, hostEpoch: 2 }),
-  });
-  assert.equal(snapshots.length, 1);
-  assert.equal(session.state.invalidated, false);
-});
-
-test('promotion accepts a checkpoint at exactly the 0.5s rollback boundary', () => {
-  const { signaling, transport, session } = makeHarness();
-  signaling.room(makeRoom());
-  const promotions = collect(session, 'promote');
-  transport.receive('host', {
-    type: 'checkpoint',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive('host', {
-    type: 'snapshot',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 630,
-    state: makeWorldState({ tick: 630, worldTime: 10.5 }),
-  });
-  transport.receive('host', {
-    type: 'start-race',
-    roomCode: 'AB2CD9',
-    hostEpoch: 1,
-    tick: 632,
-    seed: 'race-seed',
-    config: startConfigForTick(632),
-  }, { reliable: true });
-
-  signaling.hostChanged({
-    roomCode: 'AB2CD9', previousHostId: 'host', hostId: 'guest', hostEpoch: 2,
-  });
-
-  assert.equal(session.state.invalidated, false);
-  assert.equal(promotions.length, 1);
-  assert.equal(promotions[0].checkpoint.worldTime, 10);
-});
-
 test('an old host resuming as guest gets a fresh input watermark under the new epoch', () => {
   const registry = createRegistry();
   const { roomCode, players: [oldHost, guest] } = fillRoom(registry, 2);
-  registry.lockRoom(oldHost.playerId);
+  const start = initialStart([oldHost, guest]);
+  registry.lockRoom(oldHost.playerId, start);
 
   const { signaling, transport, session } = makeHarness({ playerId: guest.playerId });
   const locked = registry.roomView(roomCode);
   signaling.room(locked);
+  const boatIds = [oldHost.playerId, guest.playerId, 'ai:0'];
   transport.receive(oldHost.playerId, {
     type: 'checkpoint',
     roomCode,
     hostEpoch: 1,
     tick: 600,
-    state: makeWorldState({ tick: 600, worldTime: 10 }),
-  }, { reliable: true });
-  transport.receive(oldHost.playerId, {
-    type: 'start-race',
-    roomCode,
-    hostEpoch: 1,
-    tick: 606,
-    seed: 'race-seed',
-    config: startConfigForTick(606, [oldHost.playerId, guest.playerId]),
+    state: makeAuthorizedWorldState({ tick: 600, worldTime: 10, seed: start.seed, boatIds }),
   }, { reliable: true });
 
   const migrated = registry.disconnect(oldHost.playerId);

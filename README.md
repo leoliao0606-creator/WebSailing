@@ -25,7 +25,7 @@ npm install
 | `npm run signal` | 启动信令及静态文件服务，默认 `http://localhost:8787` |
 | `npm run serve` | `npm run signal` 的部署别名 |
 | `npm test` / `npm run test:unit` | 运行 Node 单元及集成测试 |
-| `npm run test:multiplayer` | 运行 Playwright 双浏览器联机回归 |
+| `npm run test:multiplayer` | 运行 Playwright 三浏览器联机与迁移回归 |
 | `npm run polar` | 输出极曲线并做物理自检；可传风速，如 `npm run polar -- 18` |
 
 首次运行浏览器回归前还需安装 Playwright Chromium：
@@ -34,7 +34,9 @@ npm install
 npx playwright install chromium
 ```
 
-`npm run test:multiplayer` 会自行启动临时 Vite/信令服务和两个隔离的浏览器上下文，无需先手动启动服务。CI 若使用系统 Chromium，可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定其可执行文件。
+`npm run test:multiplayer` 会自行启动临时 Vite/信令服务和三个隔离的浏览器上下文，无需先手动启动服务。测试会关闭原房主，并验证新房主与另一名幸存访客在 5 秒内继续同步。CI 若使用系统 Chromium，可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定其可执行文件。
+
+详细覆盖范围、实测结果和仍未验证的边界见 [私人多人绕标赛验证记录](docs/multiplayer-verification.md)。
 
 ## 本地 2–8 人私人联机
 
@@ -76,16 +78,24 @@ npm run dev
 | `RECONNECT_GRACE_MS` | `30000` | 普通玩家断线后保留座位和恢复令牌的时间 |
 | `HOST_LOSS_MS` | `2500` | 房主连接丢失后、正式迁移权威前的短暂恢复窗口 |
 | `HEARTBEAT_MS` | `1000` | 服务端 WebSocket ping 周期，必须大于 0 |
+| `MAX_CONNECTIONS` | `1024` | 同一信令进程允许的 WebSocket 连接总数 |
+| `MAX_CONNECTIONS_PER_IP` | `64` | 同一客户端地址允许的 WebSocket 连接数；仍应在边缘再做一层限流 |
+| `MAX_ROOMS` | `512` | 单进程内存房间数上限 |
+| `TRUST_PROXY` | `false` | 是否使用 `X-Forwarded-For` 最左侧地址；仅在 Node 只接受可信代理流量且代理覆盖该头时启用 |
+| `SIGNAL_RATE_MAX_MESSAGES` | `120` | 每个信令来源在窗口内允许的消息数 |
+| `SIGNAL_RATE_MAX_BYTES` | `262144` | 每个信令来源在窗口内允许的入站字节数；已认证玩家跨重连共享额度 |
+| `SIGNAL_RATE_WINDOW_MS` | `1000` | 信令消息数/字节限流窗口 |
+| `SIGNAL_ADDRESS_RATE_MULTIPLIER` | `8` | 同一来源地址的粗粒度总额度倍数；身份轮换仍受总额度约束，同时允许一场最多 8 人共享 NAT。中国 CGNAT 误限流时可谨慎调高，但会同步放大单地址攻击预算 |
 | `ICE_SERVERS_JSON` | `[]` | 发送给浏览器的 `RTCIceServer[]` JSON；生产必须配置可达 STUN/TURN |
 | `ALLOWED_ORIGINS` | 空（不限制） | 逗号分隔的精确 Web Origin，例如 `https://game.example.cn` |
 
 迁移检测预算会在启动时强制检查：
 
 ```text
-2 * HEARTBEAT_MS + HOST_LOSS_MS <= 5000
+2 * HEARTBEAT_MS + HOST_LOSS_MS <= 4500
 ```
 
-默认值的最坏检测预算为 4500 ms。`RECONNECT_GRACE_MS` 决定座位能否稍后恢复，不延迟新房主的选举。房主若在 `HOST_LOSS_MS` 内恢复会取消迁移；否则信令服务提升下一位在线玩家、递增权威 epoch，并由幸存客户端最近的可靠检查点恢复比赛。检查点频率把正常回滚限制在约 0.5 秒内。
+默认值的最坏检测预算为 4500 ms，客户端再保留最多 500 ms 等待可靠通道；在正常事件循环和信令可达时，迁移暂停的设计预算不超过 5 秒。`RECONNECT_GRACE_MS` 决定座位能否稍后恢复，不延迟新房主的选举。房主若在 `HOST_LOSS_MS` 内恢复会取消迁移；否则信令服务提升下一位在线玩家、递增权威 epoch，并由幸存客户端最近的可靠检查点恢复比赛。检查点频率把正常回滚限制在约 0.5 秒内；刚开赛尚未产生检查点的前 0.5 秒，可用信令服务保存的不可变开赛描述恢复。
 
 ### ICE、TURN 与中国区域
 
@@ -108,6 +118,8 @@ ICE_SERVERS_JSON='[{"urls":"stun:stun.game.example.cn:3478"},{"urls":["turn:turn
 反向代理需要：
 
 - 将 `/signal` 转发至 Node，并保留 HTTP/1.1 `Upgrade`、`Connection`、`Host` 和客户端地址头；不要对 WebSocket 做响应缓冲。
+- Node 只允许被可信代理访问、且代理会覆盖而不是追加外部传入的 `X-Forwarded-For` 时，设置 `TRUST_PROXY=true`；否则保持 `false` 以免客户端伪造来源地址。Node 直连单层 Nginx 时可用 `proxy_set_header X-Forwarded-For $remote_addr;` 覆盖该头；不要直接使用会保留客户端自带链条的 append 配置。保持 `false` 时，代理后的所有客户端会共享代理的 TCP 来源地址额度。
+- 多层 CDN/负载均衡链必须先在最外层清除不可信的客户端地址头，再由最后一层可信代理向 Node 输出经过验证的最左侧客户端 IP。无法保证这一点时不要开启 `TRUST_PROXY`，应在边缘按真实客户端地址执行容量限制。
 - 将其余路径转发至 Node 的静态服务，或由代理直接提供同一份 `dist/`。
 - 用 `GET /health`（返回 `{"status":"ok"}`）做存活检查，并让 WebSocket 空闲超时明显大于恢复宽限期。
 - 在生产显式设置 `ALLOWED_ORIGINS`；匹配的是浏览器发送的精确 Origin，不含路径，也不要添加尾斜杠。
@@ -121,10 +133,10 @@ ICE_SERVERS_JSON='[{"urls":"stun:stun.game.example.cn:3478"},{"urls":["turn:turn
 
 ### 安全、隐私和当前限制
 
-- 这是房主权威 P2P 星型拓扑：访客只提交控制意图，不能直接提交位置、速度、进度或结果；epoch、快照和检查点会做一致性/异常检查。发现异常会作废比赛，但恶意房主仍可能伪造或拒绝权威状态，当前不能绝对防止。
-- 自动迁移依赖至少一位幸存访客缓存了上一 epoch 的有效检查点。所有浏览器同时离线、唯一玩家离线或进程重启时，无法凭空继续世界状态；迁移期间会短暂停赛。
+- 这是房主权威 P2P 星型拓扑：访客只提交控制意图，不能直接提交位置、速度、进度或结果；开赛阵容/种子、epoch、快照和检查点会做一致性与异常检查。检测到异常的客户端会把比赛标记作废，但当前没有服务端或全房作废共识；恶意房主仍可能伪造、压制或分叉权威状态，不能绝对防止。
+- 自动迁移通常依赖至少一位幸存访客缓存了上一 epoch 的有效检查点；刚开赛的前 0.5 秒可由服务端开赛描述恢复。所有浏览器同时离线、唯一玩家离线或进程重启时，仍无法凭空继续世界状态；迁移期间会短暂停赛。当前房主在比赛中整页刷新会丢失仅存于内存的权威检查点，若它在迁移前恢复为原房主，比赛可能因状态倒退而作废；关闭标签页、进程崩溃或超过恢复窗口的断线会走正常房主迁移。
 - WebRTC 直连会向通信对端暴露网络候选信息。TURN 能帮助穿透和中继，但当前客户端未强制 `relay` 模式，不能承诺隐藏玩家 IP；有更强隐私要求时需增加 relay-only 选项。
-- 临时昵称不是身份认证。聊天不做内容过滤，支持任意 Unicode，最多 500 个 Unicode 字符，并以每位玩家每 5 秒最多 5 条限流；玩家可在本地静音。没有举报、审核或持久化聊天记录，其他玩家仍可自行保存内容。
+- 临时昵称不是身份认证。聊天不做内容过滤，支持任意 Unicode，最多 500 个 Unicode 字符，并以每位玩家每 5 秒最多 5 条限流；玩家可在本地静音。没有举报、审核或持久化聊天记录，其他玩家仍可自行保存内容。信令连接默认每秒 120 条/256 KiB，且 SDP/ICE 分别限制为 48 KiB/4 KiB；每个 WebRTC 对端默认每秒 120 条/512 KiB。超限只断开违规端，连接、来源地址和房间另有硬容量上限。
 - 恢复令牌存入当前标签页的 `sessionStorage`。只在 HTTPS/WSS 下部署、限制脚本来源并避免把令牌写入日志。
 - 当前只实现 2–8 人私人绕标赛。公开匹配、联机自由巡航、排位和可验证的专用权威服务器不在这一版中。
 
@@ -193,7 +205,7 @@ server/
   roomRegistry.js       进程内房间、座位租约与 host epoch
 tools/
   polar.js    极曲线与物理自检（node）
-  test-multiplayer.mjs   Playwright 双浏览器联机与房主迁移回归
+  test-multiplayer.mjs   Playwright 三浏览器联机与房主迁移回归
 ```
 
 ## 画质与性能

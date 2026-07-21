@@ -177,6 +177,20 @@ class ControlledTimers {
   }
 }
 
+class FakeClock {
+  constructor(time = 0) {
+    this.time = time;
+  }
+
+  now() {
+    return this.time;
+  }
+
+  advance(milliseconds) {
+    this.time += milliseconds;
+  }
+}
+
 function member(playerId, connected = true) {
   return { playerId, nickname: playerId, connected, ready: false, isHost: false };
 }
@@ -630,6 +644,34 @@ test('constructor and outgoing serialization reject invalid inputs without throw
     }),
     /timers/i,
   );
+  for (const inboundRateLimit of [
+    null,
+    { windowMs: 0 },
+    { windowMs: Infinity },
+    { maxMessages: 0 },
+    { maxMessages: 1.5 },
+    { maxBytes: 0 },
+    { maxBytes: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    assert.throws(
+      () => new PeerTransport({
+        signaling: new FakeSignaling({ selfId: 'guest' }),
+        RTCPeerConnectionImpl: FakePeerConnection,
+        inboundRateLimit,
+      }),
+      /inboundRateLimit/i,
+    );
+  }
+  for (const clock of [null, {}, { now: 1 }, { now: () => NaN }, { now: () => { throw new Error('bad clock'); } }]) {
+    assert.throws(
+      () => new PeerTransport({
+        signaling: new FakeSignaling({ selfId: 'guest' }),
+        RTCPeerConnectionImpl: FakePeerConnection,
+        clock,
+      }),
+      /clock/i,
+    );
+  }
 
   const signaling = new FakeSignaling({ selfId: 'guest' });
   const transport = new PeerTransport({ signaling, RTCPeerConnectionImpl: FakePeerConnection });
@@ -682,6 +724,262 @@ test('inbound peer JSON over 64 KiB in UTF-8 is dropped before parsing or dispat
 
   assert.deepEqual(messages, []);
   transport.close();
+});
+
+test('malformed and binary inbound frames consume quota before JSON parsing', () => {
+  const timers = new ControlledTimers();
+  const clock = new FakeClock(10);
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    retryDelaysMs: [0],
+    timers,
+    clock,
+    inboundRateLimit: { windowMs: 1000, maxMessages: 3, maxBytes: 10_000 },
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+  const control = new FakeDataChannel('control');
+  peer.emitDataChannel(control);
+  control.open();
+  const accepted = JSON.stringify({ accepted: true });
+  const rejected = JSON.stringify({ rejected: true });
+
+  control.receive('{bad');
+  control.receive(new Uint8Array([1]));
+  control.receive(accepted);
+  control.receive(rejected);
+
+  assert.deepEqual(messages.map(({ message }) => message), [{ accepted: true }]);
+  assert.deepEqual(violations, [{
+    playerId: 'host',
+    channel: 'control',
+    reliable: true,
+    hostEpoch: 1,
+    reason: 'messages',
+    observedMessages: 4,
+    observedBytes: new TextEncoder().encode(`{bad${accepted}${rejected}`).byteLength + 1,
+    windowMs: 1000,
+    maxMessages: 3,
+    maxBytes: 10_000,
+  }]);
+  assert.equal(peer.closeCalls, 1);
+  assert.equal(timers.pendingCount, 1);
+  transport.close();
+});
+
+test('inbound quotas use a rolling window so boundary bursts cannot double the allowance', () => {
+  const clock = new FakeClock(0);
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    retryDelaysMs: [],
+    clock,
+    inboundRateLimit: { windowMs: 1000, maxMessages: 3, maxBytes: 10_000 },
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+  const control = new FakeDataChannel('control');
+  peer.emitDataChannel(control);
+  control.open();
+
+  control.receive(JSON.stringify({ at: 0 }));
+  clock.advance(900);
+  control.receive(JSON.stringify({ at: 900, order: 1 }));
+  control.receive(JSON.stringify({ at: 900, order: 2 }));
+  clock.advance(100);
+  control.receive(JSON.stringify({ at: 1000, order: 1 }));
+  control.receive(JSON.stringify({ at: 1000, order: 2 }));
+
+  assert.deepEqual(messages.map(({ message }) => message), [
+    { at: 0 },
+    { at: 900, order: 1 },
+    { at: 900, order: 2 },
+    { at: 1000, order: 1 },
+  ]);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].reason, 'messages');
+  assert.equal(violations[0].observedMessages, 4);
+  assert.equal(peer.closeCalls, 1);
+  transport.close();
+});
+
+test('default inbound budget accepts expected controls snapshots and chat traffic', () => {
+  const clock = new FakeClock(100);
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    clock,
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+  const control = new FakeDataChannel('control');
+  const state = new FakeDataChannel('state', { ordered: false, maxRetransmits: 0 });
+  peer.emitDataChannel(control);
+  peer.emitDataChannel(state);
+  control.open();
+  state.open();
+
+  for (let index = 0; index < 30; index += 1) {
+    control.receive(JSON.stringify({ type: 'input', sequence: index }));
+  }
+  for (let index = 0; index < 20; index += 1) {
+    state.receive(JSON.stringify({ type: 'snapshot', sequence: index }));
+  }
+  for (let index = 0; index < 10; index += 1) {
+    control.receive(JSON.stringify({ type: 'chat', text: `message-${index}` }));
+  }
+
+  assert.equal(messages.length, 60);
+  assert.deepEqual(violations, []);
+  assert.equal(peer.closeCalls, 0);
+  transport.close();
+});
+
+test('inbound byte quota drops the crossing frame and reports byte pressure', () => {
+  const clock = new FakeClock(0);
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const first = JSON.stringify({ chunk: '界'.repeat(8) });
+  const second = JSON.stringify({ chunk: 'x'.repeat(12) });
+  const firstBytes = new TextEncoder().encode(first).byteLength;
+  const secondBytes = new TextEncoder().encode(second).byteLength;
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    retryDelaysMs: [],
+    clock,
+    inboundRateLimit: {
+      windowMs: 1000,
+      maxMessages: 100,
+      maxBytes: firstBytes + secondBytes - 1,
+    },
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+  const state = new FakeDataChannel('state', { ordered: false, maxRetransmits: 0 });
+  peer.emitDataChannel(state);
+  state.open();
+
+  state.receive(first);
+  state.receive(second);
+
+  assert.equal(messages.length, 1);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].reason, 'bytes');
+  assert.equal(violations[0].observedMessages, 2);
+  assert.equal(violations[0].observedBytes, firstBytes + secondBytes);
+  assert.equal(peer.closeCalls, 1);
+  transport.close();
+});
+
+test('a flooding peer is isolated while healthy peers continue and retries stay bounded', async () => {
+  const timers = new ControlledTimers();
+  const clock = new FakeClock(0);
+  const signaling = new FakeSignaling({ selfId: 'host' });
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    retryDelaysMs: [0],
+    timers,
+    clock,
+    inboundRateLimit: { windowMs: 1000, maxMessages: 2, maxBytes: 10_000 },
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room({
+    members: [member('host'), member('guest-a'), member('guest-b')],
+  }));
+  const offender = FakePeerConnection.instances[0];
+  const healthy = FakePeerConnection.instances[1];
+  channel(offender, 'control').open();
+  channel(offender, 'state').open();
+  channel(healthy, 'control').open();
+  channel(healthy, 'state').open();
+
+  channel(healthy, 'control').receive(JSON.stringify({ healthy: 1 }));
+  channel(offender, 'state').receive(JSON.stringify({ flood: 1 }));
+  channel(offender, 'state').receive(JSON.stringify({ flood: 2 }));
+  channel(offender, 'state').receive(JSON.stringify({ flood: 3 }));
+  channel(healthy, 'state').receive(JSON.stringify({ healthy: 2 }));
+
+  assert.equal(offender.closeCalls, 1);
+  assert.equal(healthy.closeCalls, 0);
+  assert.deepEqual(messages.filter(({ playerId }) => playerId === 'guest-b')
+    .map(({ message }) => message), [{ healthy: 1 }, { healthy: 2 }]);
+  assert.deepEqual(violations.map(({ playerId }) => playerId), ['guest-a']);
+  assert.equal(timers.pendingCount, 1);
+
+  assert.equal(timers.runNext(), true);
+  await flushTasks();
+  const replacement = FakePeerConnection.instances[2];
+  channel(replacement, 'control').open();
+  channel(replacement, 'state').open();
+  channel(replacement, 'state').receive(JSON.stringify({ flood: 4 }));
+  channel(replacement, 'state').receive(JSON.stringify({ flood: 5 }));
+  channel(replacement, 'state').receive(JSON.stringify({ flood: 6 }));
+  clock.advance(1000);
+  channel(healthy, 'control').receive(JSON.stringify({ healthy: 3 }));
+
+  assert.equal(replacement.closeCalls, 1);
+  assert.equal(healthy.closeCalls, 0);
+  assert.equal(timers.pendingCount, 0);
+  assert.deepEqual(violations.map(({ playerId }) => playerId), ['guest-a', 'guest-a']);
+  assert.deepEqual(messages.filter(({ playerId }) => playerId === 'guest-b')
+    .map(({ message }) => message), [{ healthy: 1 }, { healthy: 2 }, { healthy: 3 }]);
+  transport.close();
+});
+
+test('topology teardown clears inbound counters and stale channels cannot spend new quota', () => {
+  const clock = new FakeClock(0);
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({
+    signaling,
+    RTCPeerConnectionImpl: FakePeerConnection,
+    retryDelaysMs: [],
+    clock,
+    inboundRateLimit: { windowMs: 1000, maxMessages: 2, maxBytes: 10_000 },
+  });
+  const messages = eventDetails(transport, 'peer-message');
+  const violations = eventDetails(transport, 'peer-rate-limit');
+  transport.reconcileTopology(room({ hostEpoch: 1 }));
+  const oldPeer = FakePeerConnection.instances[0];
+  const oldControl = new FakeDataChannel('control');
+  oldPeer.emitDataChannel(oldControl);
+  oldControl.open();
+  oldControl.receive(JSON.stringify({ old: 1 }));
+  oldControl.receive(JSON.stringify({ old: 2 }));
+
+  transport.reconcileTopology(room({ hostEpoch: 2 }));
+  const newPeer = FakePeerConnection.instances[1];
+  const newControl = new FakeDataChannel('control');
+  newPeer.emitDataChannel(newControl);
+  newControl.open();
+  oldControl.receive(JSON.stringify({ stale: true }));
+  newControl.receive(JSON.stringify({ fresh: 1 }));
+  newControl.receive(JSON.stringify({ fresh: 2 }));
+
+  assert.deepEqual(messages.map(({ message }) => message), [
+    { old: 1 }, { old: 2 }, { fresh: 1 }, { fresh: 2 },
+  ]);
+  assert.deepEqual(violations, []);
+  assert.equal(oldPeer.closeCalls, 1);
+  assert.equal(newPeer.closeCalls, 0);
+
+  transport.close();
+  newControl.receive(JSON.stringify({ afterClose: true }));
+  assert.equal(messages.length, 4);
+  assert.deepEqual(violations, []);
 });
 
 test('buffer pressure queues reliable messages but drops transient state until capacity returns', () => {
@@ -805,6 +1103,32 @@ test('remote ICE candidates over 4 KiB in UTF-8 are dropped before buffering', a
   transport.close();
 });
 
+test('remote ICE metadata over 256 UTF-8 bytes is dropped before buffering', async () => {
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({ signaling, RTCPeerConnectionImpl: FakePeerConnection });
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+
+  signaling.emitSignal('host', {
+    type: 'ice', candidate: 'candidate:bad-mid', sdpMid: '界'.repeat(86), negotiationId: 'negotiation-1',
+  });
+  signaling.emitSignal('host', {
+    type: 'ice', candidate: 'candidate:bad-ufrag', usernameFragment: '界'.repeat(86), negotiationId: 'negotiation-1',
+  });
+  signaling.emitSignal('host', {
+    type: 'ice', candidate: 'candidate:valid', sdpMid: `${'界'.repeat(85)}a`, negotiationId: 'negotiation-1',
+  });
+  signaling.emitSignal('host', {
+    type: 'offer', sdp: 'host-offer', negotiationId: 'negotiation-1',
+  });
+  await flushTasks();
+
+  assert.deepEqual(peer.addedIce, [{
+    candidate: 'candidate:valid', sdpMid: `${'界'.repeat(85)}a`,
+  }]);
+  transport.close();
+});
+
 test('local ICE candidates over 4 KiB in UTF-8 are not relayed through signaling', async () => {
   const signaling = new FakeSignaling({ selfId: 'guest' });
   const transport = new PeerTransport({ signaling, RTCPeerConnectionImpl: FakePeerConnection });
@@ -823,6 +1147,34 @@ test('local ICE candidates over 4 KiB in UTF-8 are not relayed through signaling
   assert.deepEqual(signaling.sent, [{
     targetId: 'host',
     data: { type: 'ice', candidate: 'candidate:valid', negotiationId: 'negotiation-1' },
+  }]);
+  transport.close();
+});
+
+test('local ICE metadata over 256 UTF-8 bytes is not relayed through signaling', async () => {
+  const signaling = new FakeSignaling({ selfId: 'guest' });
+  const transport = new PeerTransport({ signaling, RTCPeerConnectionImpl: FakePeerConnection });
+  transport.reconcileTopology(room());
+  const peer = FakePeerConnection.instances[0];
+  signaling.emitSignal('host', {
+    type: 'offer', sdp: 'host-offer', negotiationId: 'negotiation-1',
+  });
+  await flushTasks();
+  signaling.sent.length = 0;
+
+  peer.emitIce({ candidate: 'candidate:bad-mid', sdpMid: '界'.repeat(86) });
+  peer.emitIce({ candidate: 'candidate:bad-ufrag', usernameFragment: '界'.repeat(86) });
+  peer.emitIce({ candidate: 'candidate:valid', usernameFragment: `${'界'.repeat(85)}a` });
+  await flushTasks();
+
+  assert.deepEqual(signaling.sent, [{
+    targetId: 'host',
+    data: {
+      type: 'ice',
+      candidate: 'candidate:valid',
+      usernameFragment: `${'界'.repeat(85)}a`,
+      negotiationId: 'negotiation-1',
+    },
   }]);
   transport.close();
 });

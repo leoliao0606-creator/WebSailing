@@ -83,32 +83,61 @@ function testId(page, id) {
   return page.locator(`[data-testid="${id}"]`);
 }
 
+async function gameDiagnostics(page) {
+  try {
+    return await page.evaluate(() => {
+      const game = window.__game;
+      const lobby = game?.menu?.multiplayerLobby;
+      return {
+        mode: game?.mode ?? null,
+        boatCount: game?.boats?.length ?? null,
+        tick: game?.multiplayerController?.tick ?? null,
+        controllerRole: game?.multiplayerController?.role ?? null,
+        controllerMigrating: game?.multiplayerController?.migrating ?? null,
+        snapshotBufferSize: game?.multiplayerController?.snapshotBuffer?.size ?? null,
+        latestCheckpointTick: game?.multiplayerSession?.latestCheckpoint?.tick ?? null,
+        latestCheckpointBytes: game?.multiplayerSession?.latestCheckpoint
+          ? new TextEncoder().encode(JSON.stringify(game.multiplayerSession.latestCheckpoint)).byteLength
+          : null,
+        paused: game?.paused ?? null,
+        netEvents: window.__multiplayerE2eNet ?? null,
+        session: game?.multiplayerSession?.state ?? null,
+        signaling: lobby?.stack?.signaling?.state ?? null,
+        lobby: lobby ? {
+          statusKey: lobby.statusKey,
+          roomCommandPending: lobby.roomCommandPending,
+          roomCode: lobby.state?.roomCode ?? null,
+        } : null,
+        visibleScreen: [...document.querySelectorAll('#menus > .screen.show')]
+          .map((element) => element.id),
+        onlineStatus: document.querySelector('[data-testid="multiplayer-status"]')?.textContent ?? null,
+        lobbyStatus: document.querySelector('[data-testid="lobby-status"]')?.textContent ?? null,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function waitForVisible(page, id, description) {
+  try {
+    await testId(page, id).waitFor({ state: 'visible', timeout: STEP_TIMEOUT_MS });
+  } catch (error) {
+    throw new Error(
+      `${description} did not become visible within ${STEP_TIMEOUT_MS}ms. `
+        + `Diagnostics: ${JSON.stringify(await gameDiagnostics(page))}`,
+      { cause: error },
+    );
+  }
+}
+
 async function waitForGame(page, description, predicate, argument, timeout = STEP_TIMEOUT_MS) {
   try {
     await page.waitForFunction(predicate, argument, { timeout });
   } catch (error) {
-    let diagnostics = null;
-    try {
-      diagnostics = await page.evaluate(() => {
-        const game = window.__game;
-        return {
-          mode: game?.mode ?? null,
-          boatCount: game?.boats?.length ?? null,
-          tick: game?.multiplayerController?.tick ?? null,
-          controllerRole: game?.multiplayerController?.role ?? null,
-          session: game?.multiplayerSession?.state ?? null,
-          latestCheckpointTick: game?.multiplayerSession?.latestCheckpoint?.tick ?? null,
-          probe: window.__probe ?? null,
-          visibleScreen: [...document.querySelectorAll('#menus > .screen.show')]
-            .map((element) => element.id),
-          lobbyStatus: document.querySelector('[data-testid="lobby-status"]')?.textContent ?? null,
-        };
-      });
-    } catch {
-      // The page may already have closed; the original wait error remains authoritative.
-    }
     throw new Error(
-      `${description} did not complete within ${timeout}ms. Diagnostics: ${JSON.stringify(diagnostics)}`,
+      `${description} did not complete within ${timeout}ms. `
+        + `Diagnostics: ${JSON.stringify(await gameDiagnostics(page))}`,
       { cause: error },
     );
   }
@@ -125,20 +154,14 @@ async function openGame(page, appUrl) {
 
 async function openOnlineScreen(page) {
   await testId(page, 'multiplayer-button').click();
-  await testId(page, 'multiplayer-online-screen').waitFor({
-    state: 'visible',
-    timeout: STEP_TIMEOUT_MS,
-  });
+  await waitForVisible(page, 'multiplayer-online-screen', 'online multiplayer screen');
 }
 
 async function createRoom(page, nickname) {
   await openOnlineScreen(page);
   await testId(page, 'multiplayer-nickname').fill(nickname);
   await testId(page, 'multiplayer-create').click();
-  await testId(page, 'multiplayer-lobby-screen').waitFor({
-    state: 'visible',
-    timeout: STEP_TIMEOUT_MS,
-  });
+  await waitForVisible(page, 'multiplayer-lobby-screen', 'created-room lobby');
   await waitForGame(
     page,
     'room creation',
@@ -157,16 +180,13 @@ async function joinRoom(page, roomCode, nickname) {
   await testId(page, 'multiplayer-nickname').fill(nickname);
   await testId(page, 'multiplayer-room-code').fill(roomCode);
   await testId(page, 'multiplayer-join').click();
-  await testId(page, 'multiplayer-lobby-screen').waitFor({
-    state: 'visible',
-    timeout: STEP_TIMEOUT_MS,
-  });
+  await waitForVisible(page, 'multiplayer-lobby-screen', 'joined-room lobby');
   await waitForGame(
     page,
     'room join',
     (expectedCode) => {
       const state = window.__game?.multiplayerSession?.state;
-      return state?.roomCode === expectedCode && state.members?.length === 2;
+      return state?.roomCode === expectedCode;
     },
     roomCode,
   );
@@ -200,9 +220,75 @@ async function readWorld(page) {
   });
 }
 
-function assertWorldsClose(hostWorld, guestWorld) {
-  assert.equal(hostWorld.boats.length, 2, 'host should render exactly two human boats');
-  assert.equal(guestWorld.boats.length, 2, 'guest should render exactly two human boats');
+async function readWorldsWithinTickDrift(pages, maximumTicks, timeout = MIGRATION_TIMEOUT_MS) {
+  const deadline = Date.now() + timeout;
+  let worlds = [];
+  do {
+    worlds = await Promise.all(pages.map(readWorld));
+    const authorityTick = worlds[0]?.tick;
+    if (Number.isSafeInteger(authorityTick) && worlds.slice(1).every((world) => (
+      Number.isSafeInteger(world?.tick) && Math.abs(world.tick - authorityTick) <= maximumTicks
+    ))) {
+      return worlds;
+    }
+    await Promise.all(pages.map((page) => page.waitForTimeout(50)));
+  } while (Date.now() < deadline);
+
+  throw new Error(
+    `guest clocks did not converge within ${maximumTicks} ticks of authority: `
+      + JSON.stringify(worlds.map((world) => world?.tick ?? null)),
+  );
+}
+
+async function instrumentMultiplayer(page) {
+  await page.evaluate(() => {
+    const session = window.__game?.multiplayerSession;
+    const counters = {
+      snapshots: 0,
+      checkpoints: 0,
+      lastSnapshotTick: null,
+      lastCheckpointTick: null,
+      rejected: [],
+      providerErrors: [],
+      sessionErrors: [],
+      peerRateLimits: [],
+      peerCloses: [],
+      peerOpens: [],
+    };
+    window.__multiplayerE2eNet = counters;
+    session.addEventListener('snapshot', (event) => {
+      counters.snapshots += 1;
+      counters.lastSnapshotTick = event.detail?.snapshot?.tick ?? null;
+    });
+    session.addEventListener('checkpoint', (event) => {
+      counters.checkpoints += 1;
+      counters.lastCheckpointTick = event.detail?.checkpoint?.tick ?? null;
+    });
+    session.addEventListener('rejected-message', (event) => {
+      counters.rejected.push(event.detail ?? null);
+    });
+    session.addEventListener('provider-error', (event) => {
+      counters.providerErrors.push(event.detail ?? null);
+    });
+    session.addEventListener('session-error', (event) => {
+      counters.sessionErrors.push(event.detail ?? null);
+    });
+    const transport = window.__game?.menu?.multiplayerLobby?.stack?.transport;
+    transport.addEventListener('peer-rate-limit', (event) => {
+      counters.peerRateLimits.push(event.detail ?? null);
+    });
+    transport.addEventListener('peer-close', (event) => {
+      counters.peerCloses.push(event.detail ?? null);
+    });
+    transport.addEventListener('peer-open', (event) => {
+      counters.peerOpens.push(event.detail ?? null);
+    });
+  });
+}
+
+function assertWorldsClose(hostWorld, guestWorld, expectedBoats = 3) {
+  assert.equal(hostWorld.boats.length, expectedBoats, 'host should render every human boat');
+  assert.equal(guestWorld.boats.length, expectedBoats, 'guest should render every human boat');
   const guestById = new Map(guestWorld.boats.map((boat) => [boat.boatId, boat]));
   for (const hostBoat of hostWorld.boats) {
     const guestBoat = guestById.get(hostBoat.boatId);
@@ -278,6 +364,7 @@ async function main() {
   let browser = null;
   let hostContext = null;
   let guestContext = null;
+  let observerContext = null;
   const pageErrors = [];
   const consoleErrors = [];
 
@@ -289,7 +376,7 @@ async function main() {
     process.stdout.write(`[multiplayer-e2e] app: ${appUrl}\n`);
     process.stdout.write(`[multiplayer-e2e] signal: ${signaling.signalUrl}\n`);
 
-    step('launching Chromium and two isolated browser contexts');
+    step('launching Chromium and three isolated browser contexts');
     try {
       browser = await chromium.launch({
         headless: true,
@@ -299,6 +386,10 @@ async function main() {
           '--enable-webgl',
           '--enable-unsafe-swiftshader',
           '--use-angle=swiftshader',
+          // Isolated headless contexts cannot reliably resolve one another's
+          // privacy-preserving .local ICE candidates in containerized CI.
+          // This changes only the temporary test browser, never production.
+          '--disable-features=WebRtcHideLocalIpsWithMdns',
         ],
       });
     } catch (error) {
@@ -313,7 +404,8 @@ async function main() {
 
     hostContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 960, height: 600 } });
     guestContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 960, height: 600 } });
-    // 软渲染 CI/低配机器:预置最低画质,避免两个 WebGL 实例把内存/CPU 打爆
+    observerContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 960, height: 600 } });
+    // 软渲染 CI/低配机器:预置最低画质,避免三个 WebGL 实例把内存/CPU 打爆
     const lowQuality = () => {
       localStorage.setItem('windchaser.settings', JSON.stringify({
         quality: 'low', resScale: 0.5, shadowQ: 'off', waterDetail: 'low',
@@ -322,9 +414,15 @@ async function main() {
     };
     await hostContext.addInitScript(lowQuality);
     await guestContext.addInitScript(lowQuality);
+    await observerContext.addInitScript(lowQuality);
     const hostPage = await hostContext.newPage();
     const guestPage = await guestContext.newPage();
-    for (const [label, page] of [['host', hostPage], ['guest', guestPage]]) {
+    const observerPage = await observerContext.newPage();
+    for (const [label, page] of [
+      ['host', hostPage],
+      ['guest', guestPage],
+      ['observer', observerPage],
+    ]) {
       page.setDefaultTimeout(STEP_TIMEOUT_MS);
       page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
       page.on('pageerror', (error) => pageErrors.push(`${label}: ${error.stack ?? error.message}`));
@@ -337,48 +435,69 @@ async function main() {
       });
     }
 
-    await Promise.all([openGame(hostPage, appUrl), openGame(guestPage, appUrl)]);
+    await Promise.all([
+      openGame(hostPage, appUrl),
+      openGame(guestPage, appUrl),
+      openGame(observerPage, appUrl),
+    ]);
 
     step('creating and joining a private room');
     const roomCode = await createRoom(hostPage, '船长甲');
     await joinRoom(guestPage, roomCode, '水手乙');
-    await Promise.all([hostPage, guestPage].map((page) => waitForGame(
+    await joinRoom(observerPage, roomCode, '水手丙');
+    await Promise.all([hostPage, guestPage, observerPage].map((page) => waitForGame(
       page,
-      'two-member room view',
+      'three-member room view',
       (expectedCode) => {
         const state = window.__game?.multiplayerSession?.state;
         return state?.roomCode === expectedCode
-          && state.members?.filter((member) => member.connected).length === 2;
+          && state.members?.filter((member) => member.connected).length === 3;
       },
       roomCode,
     )));
+    await Promise.all([hostPage, guestPage, observerPage].map((page) => waitForGame(
+      page,
+      'clean initial host assignment',
+      () => {
+        const lobby = window.__game?.menu?.multiplayerLobby;
+        const banner = document.querySelector('[data-testid="multiplayer-status-banner"]');
+        return lobby?.statusKey !== 'lobby.status.migrating' && banner?.hidden === true;
+      },
+    )));
 
-    step('readying both players and waiting for the reliable WebRTC topology');
+    step('readying all players and waiting for the reliable WebRTC topology');
     await testId(hostPage, 'lobby-ready').click();
     await testId(guestPage, 'lobby-ready').click();
+    await testId(observerPage, 'lobby-ready').click();
     await waitForGame(
       hostPage,
       'host start eligibility',
       () => {
         const button = document.querySelector('[data-testid="lobby-start"]');
         const members = window.__game?.multiplayerSession?.state?.members ?? [];
-        return members.length === 2
+        return members.length === 3
           && members.every((member) => member.connected && member.ready)
           && button && !button.hidden && !button.disabled;
       },
     );
 
-    step('starting a deterministic two-human authoritative race');
+    await Promise.all([
+      instrumentMultiplayer(hostPage),
+      instrumentMultiplayer(guestPage),
+      instrumentMultiplayer(observerPage),
+    ]);
+
+    step('starting a deterministic three-human authoritative race');
     await hostPage.evaluate(() => {
       window.__game.settings.aiCount = 0;
       window.__game.settings.countdown = 0;
     });
     await testId(hostPage, 'lobby-start').click();
-    await Promise.all([hostPage, guestPage].map((page) => waitForGame(
+    await Promise.all([hostPage, guestPage, observerPage].map((page) => waitForGame(
       page,
       'multiplayer race start',
       () => window.__game?.mode === 'multiplayer-race'
-        && window.__game?.boats?.length === 2
+        && window.__game?.boats?.length === 3
         && Number.isSafeInteger(window.__game?.multiplayerController?.tick),
     )));
 
@@ -429,7 +548,7 @@ async function main() {
     assert.equal(guestWorld.role, 'guest');
     assert.equal(hostWorld.session.phase, 'racing');
     assert.equal(guestWorld.session.phase, 'racing');
-    assertWorldsClose(hostWorld, guestWorld);
+    assertWorldsClose(hostWorld, guestWorld, 3);
     const hostPlayerId = hostWorld.session.playerId;
 
     step('exchanging unrestricted Unicode chat in both directions');
@@ -437,10 +556,10 @@ async function main() {
     const guestMessage = '乙→甲：收到，继续！⛵ & 自由聊天';
     await testId(hostPage, 'chat-input').fill(hostMessage);
     await testId(hostPage, 'chat-send').click();
-    await assertChatDelivered([hostPage, guestPage], hostMessage);
+    await assertChatDelivered([hostPage, guestPage, observerPage], hostMessage);
     await testId(guestPage, 'chat-input').fill(guestMessage);
     await testId(guestPage, 'chat-send').click();
-    await assertChatDelivered([hostPage, guestPage], guestMessage);
+    await assertChatDelivered([hostPage, guestPage, observerPage], guestMessage);
     assert.equal(
       await testId(hostPage, 'chat-log').locator('script').count(),
       0,
@@ -448,40 +567,112 @@ async function main() {
     );
 
     step('closing the host and waiting for automatic guest promotion');
-    const tickBeforeHostLoss = (await readWorld(guestPage)).tick;
+    const [authorityBeforeLoss] = await readWorldsWithinTickDrift(
+      [hostPage, guestPage, observerPage],
+      30,
+    );
+    const authorityTickBeforeHostLoss = authorityBeforeLoss.tick;
+    const beforeLossDiagnostics = await Promise.all([
+      gameDiagnostics(hostPage),
+      gameDiagnostics(guestPage),
+      gameDiagnostics(observerPage),
+    ]);
+    assert.ok(
+      beforeLossDiagnostics[1]?.latestCheckpointTick >= authorityTickBeforeHostLoss - 30,
+      `guest checkpoint is too old before host loss: ${JSON.stringify(beforeLossDiagnostics)}`,
+    );
+    const migrationStartedAt = Date.now();
     await hostContext.close();
     hostContext = null;
-    await waitForGame(
-      guestPage,
-      'guest host promotion',
-      (previousTick) => {
-        const game = window.__game;
-        const state = game?.multiplayerSession?.state;
-        const controller = game?.multiplayerController;
-        return state?.role === 'host'
-          && state.hostId === state.playerId
-          && state.hostEpoch >= 2
-          && state.migrating === false
-          && state.invalidated === false
-          && controller?.role === 'host'
-          && controller.tick >= previousTick - 30;
-      },
-      tickBeforeHostLoss,
-      MIGRATION_TIMEOUT_MS,
+    await Promise.all([
+      waitForGame(
+        guestPage,
+        `guest host promotion from authority tick ${authorityTickBeforeHostLoss}`,
+        (previousTick) => {
+          const game = window.__game;
+          const state = game?.multiplayerSession?.state;
+          const controller = game?.multiplayerController;
+          return state?.role === 'host'
+            && state.hostId === state.playerId
+            && state.hostEpoch >= 2
+            && state.migrating === false
+            && state.invalidated === false
+            && controller?.role === 'host'
+            && controller.tick >= previousTick - 30;
+        },
+        authorityTickBeforeHostLoss,
+        MIGRATION_TIMEOUT_MS,
+      ),
+      waitForGame(
+        observerPage,
+        `surviving guest migration recovery from authority tick ${authorityTickBeforeHostLoss}`,
+        (previousTick) => {
+          const game = window.__game;
+          const state = game?.multiplayerSession?.state;
+          const controller = game?.multiplayerController;
+          return state?.role === 'guest'
+            && state.hostId !== state.playerId
+            && state.hostEpoch >= 2
+            && state.migrating === false
+            && state.invalidated === false
+            && controller?.role === 'guest'
+            && controller.tick >= previousTick - 30;
+        },
+        authorityTickBeforeHostLoss,
+        MIGRATION_TIMEOUT_MS,
+      ),
+    ]);
+    await Promise.all([guestPage, observerPage].map(async (page) => {
+      await waitForGame(
+        page,
+        'migration keeps the racing UI unobstructed',
+        () => window.__game?.mode === 'multiplayer-race'
+          && !document.querySelector('[data-testid="multiplayer-lobby-screen"]')
+            ?.classList.contains('show'),
+        undefined,
+        MIGRATION_TIMEOUT_MS,
+      );
+      assert.equal(
+        await testId(page, 'multiplayer-lobby-screen').isVisible(),
+        false,
+        'host migration must not reopen the multiplayer lobby over the race',
+      );
+    }));
+    const migrationElapsedMs = Date.now() - migrationStartedAt;
+    assert.ok(
+      migrationElapsedMs <= MIGRATION_TIMEOUT_MS,
+      `migration took ${migrationElapsedMs}ms (budget ${MIGRATION_TIMEOUT_MS}ms)`,
     );
     const promoted = await readWorld(guestPage);
-    await waitForGame(
-      guestPage,
-      'post-migration authoritative tick progression',
-      (promotedTick) => window.__game?.multiplayerController?.role === 'host'
-        && window.__game.multiplayerController.tick >= promotedTick + 30,
-      promoted.tick,
-      STEP_TIMEOUT_MS,
+    assert.ok(
+      promoted.tick >= authorityTickBeforeHostLoss - 30,
+      `migration rolled back ${authorityTickBeforeHostLoss - promoted.tick} ticks (maximum 30)`,
     );
+    await Promise.all([
+      waitForGame(
+        guestPage,
+        'post-migration authoritative tick progression',
+        (promotedTick) => window.__game?.multiplayerController?.role === 'host'
+          && window.__game.multiplayerController.tick >= promotedTick + 30,
+        promoted.tick,
+        STEP_TIMEOUT_MS,
+      ),
+      waitForGame(
+        observerPage,
+        'post-migration guest snapshot progression',
+        (promotedTick) => window.__game?.multiplayerController?.role === 'guest'
+          && window.__game.multiplayerController.tick >= promotedTick + 20,
+        promoted.tick,
+        STEP_TIMEOUT_MS,
+      ),
+    ]);
     const continued = await readWorld(guestPage);
-    assert.equal(continued.boats.length, 2, 'AI takeover should preserve the disconnected host boat');
+    const survivingGuest = await readWorld(observerPage);
+    assert.equal(continued.boats.length, 3, 'AI takeover should preserve the disconnected host boat');
     assert.ok(continued.tick > promoted.tick, 'new host must continue the authoritative clock');
     assert.equal(continued.session.invalidated, false, 'migration must not invalidate the race');
+    assert.equal(survivingGuest.session.invalidated, false, 'surviving guest must remain valid');
+    assertWorldsClose(continued, survivingGuest, 3);
     assert.ok(
       continued.takeoverPlayerIds.includes(hostPlayerId),
       'the disconnected former host must be assigned to AI takeover',
@@ -495,12 +686,14 @@ async function main() {
     assert.deepEqual(consoleErrors, [], `unexpected browser console errors:\n${consoleErrors.join('\n')}`);
 
     step(
-      `PASS — room ${roomCode}, synchronized 2 boats, bidirectional chat, `
-        + `epoch ${continued.session.hostEpoch}, tick ${promoted.tick}→${continued.tick}`,
+      `PASS — room ${roomCode}, synchronized 3 boats across 2 survivors, bidirectional chat, `
+        + `epoch ${continued.session.hostEpoch}, migration ${migrationElapsedMs}ms, `
+        + `tick ${promoted.tick}→${continued.tick}`,
     );
   } finally {
     await hostContext?.close().catch(() => {});
     await guestContext?.close().catch(() => {});
+    await observerContext?.close().catch(() => {});
     await browser?.close().catch(() => {});
     await vite?.close().catch(() => {});
     await signaling?.close().catch(() => {});

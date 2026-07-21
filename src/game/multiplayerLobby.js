@@ -12,6 +12,12 @@ import { ChatPanel } from './chatPanel.js';
 export const NICKNAME_STORAGE_KEY = 'windchaser.multiplayer.nickname.v1';
 const MAX_PLAYERS = 8;
 const MAX_LOCKED_START_ATTEMPTS = 3;
+const DEFINITIVE_LOCK_ERRORS = [
+  'NOT_HOST',
+  'NOT_ENOUGH_PLAYERS',
+  'PLAYERS_NOT_READY',
+  'START_ROSTER_MISMATCH',
+];
 
 function defaultStackFactory() {
   const signaling = new SignalingClient();
@@ -119,6 +125,7 @@ export function buildMultiplayerStartOptions({
   const countdown = Math.max(0, Math.min(120, integerSetting(settings.countdown, 45)));
   const desiredAi = Math.max(0, integerSetting(settings.aiCount, 0));
   const aiFill = Math.min(desiredAi, MAX_PLAYERS - roster.length);
+  const penaltyMode = settings.penaltyMode === 'slow' ? 'slow' : 'turns';
   const randomValue = Math.max(0, Math.min(1, Number(random()) || 0));
   const windPsi = -0.65 + (randomValue - 0.5) * 0.9;
   const timestamp = Number(now());
@@ -134,6 +141,7 @@ export function buildMultiplayerStartOptions({
       startTick: tick + countdown * 60,
       roster,
       aiFill,
+      penaltyMode,
     },
   };
 }
@@ -188,6 +196,7 @@ export class MultiplayerLobby {
     this.pendingLockedStart = null;
     this.roomCommandPromise = null;
     this.roomCommandPending = false;
+    this.raceStarted = false;
     this.statusKey = null;
     this.statusVars = null;
     this.root = null;
@@ -312,6 +321,27 @@ export class MultiplayerLobby {
   startRace() {
     if (this.startPromise) return this.startPromise;
     if (this.pendingLockedStart) {
+      const state = this._effectiveState();
+      if (this.pendingLockedStart.lockUncertain && state.phase === 'lobby') {
+        const eligibility = lobbyEligibility(state, { transportReady: this._transportReady(state) });
+        if (!eligibility.canStart) {
+          this.statusKey = `lobby.status.${eligibility.reason}`;
+          this._render();
+          return Promise.resolve(false);
+        }
+        const options = this.pendingLockedStart.options;
+        this.pendingLockedStart = null;
+        this.statusKey = 'lobby.status.locking';
+        const operation = this._lockAndStart(options);
+        this.startPromise = operation;
+        this._render();
+        void operation.finally(() => {
+          if (this.startPromise === operation) this.startPromise = null;
+          this._render();
+          this._retryUncertainLockedStart();
+        });
+        return operation;
+      }
       const operation = Promise.resolve(this._retryLockedStart({ manual: true }));
       this.startPromise = operation;
       this._render();
@@ -342,22 +372,44 @@ export class MultiplayerLobby {
     void operation.finally(() => {
       if (this.startPromise === operation) this.startPromise = null;
       this._render();
+      this._retryUncertainLockedStart();
     });
     return operation;
   }
 
   async _lockAndStart(options) {
+    let locked;
     try {
       if (typeof this.stack?.signaling?.lockRoom !== 'function') {
         throw new Error('signaling room lock is unavailable');
       }
-      await this.stack.signaling.lockRoom();
-    } catch {
+      locked = await this.stack.signaling.lockRoom(options);
+    } catch (error) {
+      const state = this._effectiveState();
+      if (state.phase === 'racing' && state.start) return this._startLockedRoom(state.start);
+      const errorIdentity = String(error?.code ?? error?.message ?? '').toUpperCase();
+      const definitive = DEFINITIVE_LOCK_ERRORS.some((code) => errorIdentity.includes(code));
+      if (!definitive) {
+        this.pendingLockedStart = {
+          options,
+          roomCode: state.roomCode,
+          hostEpoch: state.hostEpoch,
+          attempts: 0,
+          retrying: false,
+          lockUncertain: true,
+        };
+      }
       this.statusKey = 'lobby.status.lockFailed';
       this._render();
       return false;
     }
-    return this._startLockedRoom(options);
+    const authoritativeStart = locked?.start ?? this._effectiveState().start;
+    if (!authoritativeStart) {
+      this.statusKey = 'lobby.status.lockFailed';
+      this._render();
+      return false;
+    }
+    return this._startLockedRoom(authoritativeStart);
   }
 
   _startLockedRoom(options) {
@@ -368,6 +420,7 @@ export class MultiplayerLobby {
       accepted = false;
     }
     if (accepted) {
+      this.raceStarted = true;
       this.pendingLockedStart = null;
       this.statusKey = 'lobby.status.starting';
       this._render();
@@ -380,6 +433,7 @@ export class MultiplayerLobby {
       hostEpoch: state.hostEpoch,
       attempts: 1,
       retrying: false,
+      lockUncertain: false,
     };
     this.statusKey = 'lobby.status.lockedWaiting';
     this._render();
@@ -405,16 +459,23 @@ export class MultiplayerLobby {
 
     if (manual && pending.attempts >= MAX_LOCKED_START_ATTEMPTS) pending.attempts = 0;
     pending.retrying = true;
+    pending.lockUncertain = false;
     pending.attempts += 1;
+    const authoritativeStart = state.start;
+    if (!authoritativeStart) {
+      pending.retrying = false;
+      return false;
+    }
     let accepted = false;
     try {
-      accepted = this.app.startMultiplayerRace(pending.options) !== false;
+      accepted = this.app.startMultiplayerRace(authoritativeStart) !== false;
     } catch {
       accepted = false;
     } finally {
       pending.retrying = false;
     }
     if (accepted) {
+      this.raceStarted = true;
       this.pendingLockedStart = null;
       this.statusKey = 'lobby.status.starting';
     } else {
@@ -426,6 +487,13 @@ export class MultiplayerLobby {
     return accepted;
   }
 
+  _retryUncertainLockedStart() {
+    const pending = this.pendingLockedStart;
+    if (!pending?.lockUncertain || this.startPromise !== null) return false;
+    if (this._effectiveState().phase !== 'racing') return false;
+    return this._retryLockedStart();
+  }
+
   leave() {
     if (!this.stack) {
       this.showScreen('menu-online');
@@ -433,12 +501,25 @@ export class MultiplayerLobby {
     }
     let accepted = false;
     accepted = leaveOrCloseMultiplayer(this.stack.session);
+    if (!accepted) {
+      for (const [target, type, listener] of this.listeners) {
+        target.removeEventListener(type, listener);
+      }
+      this.listeners.length = 0;
+      this.chatPanel?.destroy?.();
+      this.chatPanel = null;
+      this.stack = null;
+      this.connectedOnce = false;
+      this.connectPromise = null;
+      this.roomCommandPromise = null;
+    }
     this.room = null;
     this.sessionState = null;
     this.reliablePeers.clear();
     this.topologyContext = null;
     this.pendingLockedStart = null;
     this.roomCommandPending = false;
+    this.raceStarted = false;
     this.statusKey = null;
     this._render();
     this.showScreen('menu-online');
@@ -447,7 +528,12 @@ export class MultiplayerLobby {
 
   async copyRoomCode() {
     const code = this._effectiveState().roomCode;
-    if (!code || typeof this.clipboard?.writeText !== 'function') return false;
+    if (!code) return false;
+    if (typeof this.clipboard?.writeText !== 'function') {
+      this.statusKey = 'lobby.status.copyFailed';
+      this._render();
+      return false;
+    }
     try {
       await this.clipboard.writeText(code);
       this.statusKey = 'lobby.status.copied';
@@ -506,8 +592,12 @@ export class MultiplayerLobby {
     this._listen(signaling, 'statechange', (event) => {
       const state = event?.detail ?? signaling.state;
       if (state?.room) this._applyRoom(state.room, false);
-      else if (state?.room === null && !this.sessionState?.roomCode) this.room = null;
+      else if (state?.room === null && !this.sessionState?.roomCode) {
+        this.room = null;
+        this.raceStarted = false;
+      }
       if (state?.connection === 'reconnecting' || state?.connected === false) {
+        this.roomCommandPending = false;
         this.statusKey = state?.connection === 'reconnecting'
           ? 'lobby.status.reconnecting'
           : 'lobby.status.disconnected';
@@ -521,6 +611,7 @@ export class MultiplayerLobby {
       this._render();
     });
     this._listen(signaling, 'reconnecting', () => {
+      this.roomCommandPending = false;
       this.statusKey = 'lobby.status.reconnecting';
       this._render();
     });
@@ -548,6 +639,9 @@ export class MultiplayerLobby {
     this._listen(session, 'rolechange', () => {
       this.sessionState = session.state;
       this._render();
+    });
+    this._listen(session, 'start-race', () => {
+      this.raceStarted = true;
     });
     this._listen(session, 'promote', () => {
       this.statusKey = 'lobby.status.migrating';
@@ -630,6 +724,8 @@ export class MultiplayerLobby {
       phase: value.phase === 'racing' ? 'racing' : 'lobby',
       members: normalizeMembers(value.members),
     };
+    if (this.room.phase === 'lobby') this.raceStarted = false;
+    if (this.room.phase === 'racing' && value.start) this.room.start = value.start;
     if (previousRoomCode !== undefined && (
       previousRoomCode !== this.room.roomCode
       || previousHostId !== this.room.hostId
@@ -651,11 +747,33 @@ export class MultiplayerLobby {
       this.statusKey = null;
     }
     this._render();
-    if (navigate) this.showScreen('menu-online-lobby');
+    this._retryUncertainLockedStart();
+    const activeRace = this.app.mode === 'multiplayer-race' || this.raceStarted;
+    if (navigate && !(this.room.phase === 'racing' && activeRace)) {
+      this.showScreen('menu-online-lobby');
+    }
   }
 
   _applyHostChange(detail) {
     if (!detail || detail.roomCode !== this.room?.roomCode) return;
+    if (Number.isSafeInteger(detail.hostEpoch)
+      && Number.isSafeInteger(this.room.hostEpoch)
+      && detail.hostEpoch < this.room.hostEpoch) {
+      return;
+    }
+    if (detail.previousHostId === null) {
+      this.room = {
+        ...this.room,
+        hostId: detail.hostId,
+        hostEpoch: detail.hostEpoch,
+      };
+      if (this.statusKey === 'lobby.status.migrating') this.statusKey = null;
+      this._render();
+      return;
+    }
+    // A genuine migration may have reached us through the session listener
+    // before this signaling alias. Preserve its banner/topology state.
+    if (detail.hostId === this.room.hostId && detail.hostEpoch === this.room.hostEpoch) return;
     this.room = {
       ...this.room,
       hostId: detail.hostId,
@@ -682,6 +800,7 @@ export class MultiplayerLobby {
       hostId,
       hostEpoch: session.hostEpoch ?? room.hostEpoch ?? null,
       phase: session.phase ?? room.phase ?? null,
+      start: session.start ?? room.start ?? null,
       role: session.role && session.role !== 'disconnected'
         ? session.role
         : (playerId && playerId === hostId ? 'host' : (playerId ? 'guest' : 'disconnected')),
@@ -805,9 +924,10 @@ export class MultiplayerLobby {
     this.copyButton.addEventListener('click', () => { void this.copyRoomCode(); });
     codeRow.append(codeLabel, this.lobbyCode, this.copyButton);
 
-    this.memberList = setTestId(documentRef.createElement('div'), 'lobby-members');
+    this.memberList = setTestId(documentRef.createElement('ul'), 'lobby-members');
     this.memberList.classList.add('lobby-members');
     this.memberList.setAttribute('aria-label', this.translate('lobby.members'));
+    this.memberList.setAttribute('role', 'list');
     this.lobbyStatus = setTestId(documentRef.createElement('div'), 'lobby-status');
     this.lobbyStatus.classList.add('lobby-status');
     this.lobbyStatus.setAttribute('role', 'status');
@@ -842,7 +962,8 @@ export class MultiplayerLobby {
       || state.invalidated
       || state.migrating
       || this.startPromise !== null
-      || this.pendingLockedStart !== null
+      || (this.pendingLockedStart !== null
+        && !(this.pendingLockedStart.lockUncertain && state.phase === 'lobby'))
       || this.stack?.signaling?.state?.connected !== true;
     const eligibility = lobbyEligibility(state, { transportReady: this._transportReady(state) });
     const canRetryLockedStart = this.pendingLockedStart !== null
@@ -851,8 +972,13 @@ export class MultiplayerLobby {
       && !state.invalidated
       && !state.migrating
       && this._transportReady(state);
+    const canRetryUncertainLock = this.pendingLockedStart?.lockUncertain === true
+      && state.phase === 'lobby'
+      && eligibility.canStart;
     this.startButton.disabled = this.startPromise !== null
-      || (this.pendingLockedStart !== null ? !canRetryLockedStart : !eligibility.canStart);
+      || (this.pendingLockedStart !== null
+        ? !(canRetryLockedStart || canRetryUncertainLock)
+        : !eligibility.canStart);
     this.startButton.hidden = state.role !== 'host';
     const statusKey = this._resolvedStatusKey(state, eligibility);
     const text = statusKey ? this.translate(statusKey, this.statusVars ?? undefined) : '';
@@ -865,8 +991,9 @@ export class MultiplayerLobby {
 
   _renderMembers(state) {
     const rows = state.members.map((member) => {
-      const row = this.document.createElement('div');
+      const row = this.document.createElement('li');
       row.classList.add('lobby-member');
+      row.setAttribute('role', 'listitem');
       row.setAttribute('data-testid', `lobby-member-${member.playerId}`);
       const name = this.document.createElement('span');
       name.classList.add('lobby-member-name');

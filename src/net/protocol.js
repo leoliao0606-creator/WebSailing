@@ -13,6 +13,9 @@ export const MAX_CHAT_LENGTH = 500;
 export const MAX_NEGOTIATION_ID_BYTES = 128;
 export const MAX_PLAYER_ID_BYTES = 128;
 export const MAX_RESUME_TOKEN_BYTES = 256;
+export const MAX_SDP_BYTES = 48 * 1024;
+export const MAX_ICE_CANDIDATE_BYTES = 4 * 1024;
+export const MAX_ICE_METADATA_BYTES = 256;
 export const MAX_START_WIND_KNOTS = 40;
 export const MAX_START_COUNTDOWN_SECONDS = 120;
 
@@ -220,6 +223,36 @@ function normalizeStartRaceConfig(value, envelopeTick) {
   }));
 }
 
+export function normalizeStartDescriptor(value) {
+  if (!isRecord(value)) return failure('start descriptor must be a plain object');
+  const fields = new Set(['tick', 'seed', 'config']);
+  const unknown = rejectUnknownFields(value, fields, 'start descriptor');
+  if (unknown) return unknown;
+  const missing = rejectMissingOwnFields(value, [...fields], 'start descriptor');
+  if (missing) return missing;
+
+  const tick = normalizeNonNegativeSafeInteger(value.tick, 'tick');
+  if (!tick.ok) return tick;
+  const seed = normalizeSeed(value.seed);
+  if (!seed.ok) return seed;
+  const config = normalizeStartRaceConfig(value.config, tick.value);
+  if (!config.ok) return config;
+
+  return success(deepFreeze({
+    tick: tick.value,
+    seed: seed.value,
+    config: config.value,
+  }));
+}
+
+export function startDescriptorsEqual(left, right) {
+  const normalizedLeft = normalizeStartDescriptor(left);
+  if (!normalizedLeft.ok) return false;
+  const normalizedRight = normalizeStartDescriptor(right);
+  if (!normalizedRight.ok) return false;
+  return JSON.stringify(normalizedLeft.value) === JSON.stringify(normalizedRight.value);
+}
+
 function normalizeNegotiationId(value) {
   if (typeof value !== 'string' || value.length === 0) {
     return failure('negotiationId must be a non-empty string');
@@ -312,6 +345,9 @@ function normalizeRtcSignal(value) {
     const missing = rejectMissingOwnFields(value, ['type', 'sdp'], 'signal data');
     if (missing) return missing;
     if (typeof value.sdp !== 'string') return failure('signal sdp must be a string');
+    if (textEncoder.encode(value.sdp).byteLength > MAX_SDP_BYTES) {
+      return failure(`signal sdp cannot exceed ${MAX_SDP_BYTES} UTF-8 bytes`);
+    }
     const data = { type: value.type, sdp: value.sdp };
     if (Object.hasOwn(value, 'negotiationId')) {
       const negotiationId = normalizeNegotiationId(value.negotiationId);
@@ -337,8 +373,16 @@ function normalizeRtcSignal(value) {
     if (value.candidate !== null && typeof value.candidate !== 'string') {
       return failure('ICE candidate must be a string or null');
     }
+    if (typeof value.candidate === 'string'
+      && textEncoder.encode(value.candidate).byteLength > MAX_ICE_CANDIDATE_BYTES) {
+      return failure(`ICE candidate cannot exceed ${MAX_ICE_CANDIDATE_BYTES} UTF-8 bytes`);
+    }
     if (Object.hasOwn(value, 'sdpMid') && value.sdpMid !== null && typeof value.sdpMid !== 'string') {
       return failure('ICE sdpMid must be a string or null');
+    }
+    if (typeof value.sdpMid === 'string'
+      && textEncoder.encode(value.sdpMid).byteLength > MAX_ICE_METADATA_BYTES) {
+      return failure(`ICE sdpMid cannot exceed ${MAX_ICE_METADATA_BYTES} UTF-8 bytes`);
     }
     if (
       Object.hasOwn(value, 'sdpMLineIndex')
@@ -353,6 +397,10 @@ function normalizeRtcSignal(value) {
       && typeof value.usernameFragment !== 'string'
     ) {
       return failure('ICE usernameFragment must be a string or null');
+    }
+    if (typeof value.usernameFragment === 'string'
+      && textEncoder.encode(value.usernameFragment).byteLength > MAX_ICE_METADATA_BYTES) {
+      return failure(`ICE usernameFragment cannot exceed ${MAX_ICE_METADATA_BYTES} UTF-8 bytes`);
     }
 
     const data = { type: 'ice', candidate: value.candidate };
@@ -454,6 +502,20 @@ export function validateSignalMessage(value) {
     if (missing) return missing;
     if (typeof value.ready !== 'boolean') return failure('ready must be a Boolean');
     return success(Object.freeze({ type: value.type, ready: value.ready }));
+  }
+
+  if (value.type === 'lock-room') {
+    const unknown = rejectUnknownFields(
+      value,
+      new Set(['type', 'start']),
+      'lock-room message',
+    );
+    if (unknown) return unknown;
+    const missing = rejectMissingOwnFields(value, ['type', 'start'], 'lock-room message');
+    if (missing) return missing;
+    const start = normalizeStartDescriptor(value.start);
+    if (!start.ok) return start;
+    return success(deepFreeze({ type: value.type, start: start.value }));
   }
 
   if (value.type === 'signal') {

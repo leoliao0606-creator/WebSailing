@@ -11,6 +11,8 @@ import {
   normalizeControlIntent,
   normalizeNickname,
   normalizeRoomCode,
+  normalizeStartDescriptor,
+  startDescriptorsEqual,
   validatePeerMessage,
   validateSignalMessage,
 } from '../src/net/protocol.js';
@@ -43,6 +45,14 @@ const START_RACE_CONFIG = Object.freeze({
 
 function startConfigForTick(tick) {
   return { ...START_RACE_CONFIG, startTick: tick + START_RACE_CONFIG.countdown * 60 };
+}
+
+function startDescriptor(tick = 120) {
+  return {
+    tick,
+    seed: 'recoverable-race',
+    config: startConfigForTick(tick),
+  };
 }
 
 function successfulValue(result) {
@@ -201,7 +211,7 @@ test('signal validator accepts only the declared client command types', () => {
     { type: 'join-room', roomCode: 'AB2CD9', nickname: '水手' },
     { type: 'resume', roomCode: 'AB2CD9', playerId: 'player-1', resumeToken: 'secret' },
     { type: 'set-ready', ready: true },
-    { type: 'lock-room' },
+    { type: 'lock-room', start: startDescriptor() },
     { type: 'signal', targetId: 'player-2', data: { type: 'offer', sdp: 'v=0' } },
     { type: 'signal', targetId: 'player-2', data: { type: 'answer', sdp: 'v=0' } },
     {
@@ -224,11 +234,70 @@ test('signal validator accepts only the declared client command types', () => {
   }
 });
 
-test('lock-room signaling command rejects injected fields', () => {
-  assert.deepEqual(successfulValue(validateSignalMessage({ type: 'lock-room' })), {
+test('lock-room carries one canonical deeply immutable start descriptor', () => {
+  const input = startDescriptor();
+  const message = successfulValue(validateSignalMessage({ type: 'lock-room', start: input }));
+
+  assert.deepEqual(message, {
     type: 'lock-room',
+    start: startDescriptor(),
   });
-  assertRejected(validateSignalMessage({ type: 'lock-room', phase: 'racing' }), /unknown field/i);
+  assert.equal(Object.isFrozen(message), true);
+  assert.equal(Object.isFrozen(message.start), true);
+  assert.equal(Object.isFrozen(message.start.config), true);
+  assert.equal(Object.isFrozen(message.start.config.roster), true);
+  assert.notEqual(message.start, input);
+  assert.deepEqual(successfulValue(normalizeStartDescriptor(input)), input);
+});
+
+test('start descriptor equality compares canonical wire values and rejects invalid inputs', () => {
+  const descriptor = startDescriptor();
+  const equivalent = {
+    config: {
+      aiFill: descriptor.config.aiFill,
+      penaltyMode: descriptor.config.penaltyMode,
+      roster: descriptor.config.roster.map(({ nickname, playerId }) => ({ nickname, playerId })),
+      startTick: descriptor.config.startTick,
+      countdown: descriptor.config.countdown,
+      gustiness: descriptor.config.gustiness,
+      windKn: descriptor.config.windKn,
+      windPsi: descriptor.config.windPsi,
+    },
+    seed: descriptor.seed,
+    tick: descriptor.tick,
+  };
+
+  assert.equal(startDescriptorsEqual(descriptor, equivalent), true);
+  assert.equal(startDescriptorsEqual(
+    { ...descriptor, seed: -0 },
+    { ...descriptor, seed: 0 },
+  ), true);
+  assert.equal(startDescriptorsEqual(descriptor, startDescriptor(240)), false);
+  assert.equal(startDescriptorsEqual(descriptor, { ...descriptor, injected: true }), false);
+});
+
+test('lock-room strictly rejects missing, malformed, or injected start descriptors', () => {
+  assertRejected(validateSignalMessage({ type: 'lock-room' }), /start|required/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: { ...startDescriptor(), injected: true },
+  }), /unknown field/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: { ...startDescriptor(), tick: 121 },
+  }), /startTick|countdown/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: { ...startDescriptor(), seed: '界'.repeat(100) },
+  }), /seed|256|UTF-8/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: { ...startDescriptor(), config: { ...START_RACE_CONFIG, cheat: true } },
+  }), /unknown field/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: Object.assign(Object.create({ tick: 120 }), {
+      seed: 'recoverable-race', config: startConfigForTick(120),
+    }),
+  }), /plain|object|prototype/i);
+  assertRejected(validateSignalMessage({
+    type: 'lock-room', start: startDescriptor(), phase: 'racing',
+  }), /unknown field/i);
 });
 
 test('resume credentials enforce UTF-8 byte limits and a canonical room code', () => {
@@ -306,6 +375,26 @@ test('RTC signaling strictly validates an optional bounded negotiationId', () =>
     targetId: 'player-2',
     data: { type: 'ice', candidate: null, negotiationId: '界'.repeat(43) },
   }), /negotiationId|128/i);
+});
+
+test('RTC signaling bounds SDP and ICE text before the server can relay it', () => {
+  assertRejected(validateSignalMessage({
+    type: 'signal',
+    targetId: 'player-2',
+    data: { type: 'offer', sdp: 's'.repeat((48 * 1024) + 1) },
+  }), /sdp|49152|bytes/i);
+  assertRejected(validateSignalMessage({
+    type: 'signal',
+    targetId: 'player-2',
+    data: { type: 'ice', candidate: 'c'.repeat(4097) },
+  }), /candidate|4096|bytes/i);
+  for (const field of ['sdpMid', 'usernameFragment']) {
+    assertRejected(validateSignalMessage({
+      type: 'signal',
+      targetId: 'player-2',
+      data: { type: 'ice', candidate: 'candidate:1', [field]: 'm'.repeat(257) },
+    }), new RegExp(`${field}|256|bytes`, 'i'));
+  }
 });
 
 test('signal validator rejects a type inherited from a custom prototype', () => {

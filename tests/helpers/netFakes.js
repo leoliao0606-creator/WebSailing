@@ -148,12 +148,13 @@ export function makeRoom({
   includeGuest = true,
   phase = 'lobby',
   extraIds = [],
+  start,
 } = {}) {
   const ids = includeGuest ? ['host', 'guest'] : [localId];
   if (!ids.includes(hostId)) ids.push(hostId);
   if (!ids.includes(localId)) ids.push(localId);
   for (const id of extraIds) if (!ids.includes(id)) ids.push(id);
-  return {
+  const room = {
     roomCode: 'AB2CD9',
     hostId,
     hostEpoch,
@@ -167,6 +168,8 @@ export function makeRoom({
       isHost: playerId === hostId,
     })),
   };
+  if (start !== undefined) room.start = start;
+  return room;
 }
 
 export function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 } = {}) {
@@ -225,6 +228,33 @@ export function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 
       results: [],
     },
   };
+}
+
+// 与 start-race 授权名单一致的世界状态：boats/entries 用给定 boatId 列表铺开，
+// 让 checkpoint/snapshot 通过赛事身份审计(单船 makeWorldState 会被拒收)。
+export function makeAuthorizedWorldState({
+  tick = 60,
+  worldTime = 1,
+  hostEpoch = 1,
+  seed = 'race-seed',
+  boatIds = ['host', 'guest', 'ai:0'],
+  x = 0,
+} = {}) {
+  const state = makeWorldState({ tick, worldTime, hostEpoch, x });
+  const boatTemplate = state.boats[0];
+  const entryTemplate = state.race.entries[0];
+  state.seed = seed;
+  state.boats = boatIds.map((boatId, index) => ({
+    ...structuredClone(boatTemplate),
+    boatId,
+    phys: { ...structuredClone(boatTemplate.phys), x: x + index },
+  }));
+  state.race.entries = boatIds.map((boatId, index) => ({
+    ...structuredClone(entryTemplate),
+    boatId,
+    prevX: x + index,
+  }));
+  return state;
 }
 
 export const CONTROL = Object.freeze({
