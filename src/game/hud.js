@@ -210,6 +210,13 @@ export class HUD {
     const twd = ((w.currentFromPsi() * RAD) % 360 + 360) % 360;
     ctx.fillText(t('hud.trueWind', { v: o.twsKn.toFixed(1), d: twd.toFixed(0) }) + (gustF > 1.13 ? t('hud.gust') : ''), 0, -R - 20);
 
+    // 潮流读数(仅在有水流时):速度 + 去向罗盘角
+    if (o.currentKn > 0.1) {
+      ctx.fillStyle = 'rgba(150,210,255,0.82)';
+      ctx.font = '11px system-ui';
+      ctx.fillText(t('hud.current', { v: o.currentKn.toFixed(1), d: o.currentSetDeg.toFixed(0) }), 0, -R - 34);
+    }
+
     // 风摆读数:相对基准风的偏角;迎风时标注抬升(绿)/受压(红)
     const shift = wrapPi(w.currentFromPsi() - w.baseFromPsi) / DEG;
     if (Math.abs(shift) >= 3) {

@@ -146,6 +146,7 @@ const zh = {
   // HUD
   'hud.awsUnit': '视风 kn',
   'hud.trueWind': '真风 {v}kn  {d}°',
+  'hud.current': '潮流 {v}kn  {d}°',
   'hud.gust': ' 阵!',
   'hud.gustSoon': '⚠ 阵风将至(看上风水面暗纹)',
   'hud.shift': '风摆 {d}°',
@@ -400,6 +401,7 @@ const en = {
 
   'hud.awsUnit': 'AWS kn',
   'hud.trueWind': 'TWS {v}kn  {d}°',
+  'hud.current': 'Current {v}kn  {d}°',
   'hud.gust': ' gust!',
   'hud.gustSoon': '⚠ Gust incoming (dark patch upwind)',
   'hud.shift': 'Shift {d}°',
@@ -648,6 +650,7 @@ const ja = {
 
   'hud.awsUnit': '見かけ風 kn',
   'hud.trueWind': '真風 {v}kn  {d}°',
+  'hud.current': '潮流 {v}kn  {d}°',
   'hud.gust': ' 突風!',
   'hud.gustSoon': '⚠ 突風接近（風上の暗い水面）',
   'hud.shift': 'シフト {d}°',

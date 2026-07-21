@@ -51,7 +51,7 @@ export const BOAT = {
   cYawDampQ: 520,
   cRollDampL: 70,
   cRollDampQ: 260,
-  cHeelYaw: 26,         // 横倾诱导艏摇（抢风舵/broach 来源）
+  cHeelYaw: 30,         // 横倾诱导艏摇（抢风舵/broach 来源；右倾→左转力矩）
   windageArea: 1.1,     // 船体+船员受风面积 m²
   rudderRateDeg: 85,    // 舵机速率 °/s
   boomRateDeg: 150,     // 帆杠摆动速率 °/s
@@ -63,10 +63,19 @@ export const BOAT = {
   cSurf: 1.0,           // 浪面坡度推力增益（冲浪/顶浪的来源）
   cSurfRelief: 0.5,     // 冲浪时船体卸载：自身波系叠加浪面，兴波阻力下降比例
   cRollWave: 0.45,       // 浪面横向坡度 -> 横摇力矩增益（浮力回复趋向浪面法线；大浪摇船与横浪翻船风险的来源）
+  cRunHeel: 95,          // 正顺风上风侧横倾力矩（N·m@全深顺风）：平衡舵感/减摇的真实技巧，也是 death-roll 的种子
+  runHeelDeg: 8,         // 自动压舷在正顺风时目标的上风微倾角（°）
 };
 
 // 平水环境（不传波浪场时使用）
 const FLAT_WAVE = { ovx: 0, ovz: 0, ax: 0, az: 0 };
+
+// 来流从弦尾方向打来（倒航）时把弦参考翻 180°，使对称翼在反向流中给出正确反号的
+// 升力 —— 否则 foilForce2D 在 ~160° 反流区落入失速拟合，侧力不反号，倒航舵不会反打。
+// 对称翼翻弦不改变物理（同一块板的另一面），阻力沿来流方向不受影响。
+function chordForFlow(chord, flowX, flowY) {
+  return (flowX * Math.cos(chord) + flowY * Math.sin(chord) > 0) ? chord + Math.PI : chord;
+}
 
 export class BoatPhysics {
   constructor(params = BOAT) {
@@ -83,6 +92,7 @@ export class BoatPhysics {
     this.sheet = 1;                // 缭绳 0=收满 1=放尽
     this.board = 1;                // 稳向板 1=全放下
     this.crewY = 0;                // 船员横向位置（+右舷）
+    this.current = { vx: 0, vz: 0 }; // 环境水流（世界系 m/s）：整片水体的平移，默认静水
     this.capsized = false;
     this.rightProgress = 0;
     this.powerScale = 1;           // 帆效率外部缩放(航行规则处罚等),1 = 正常
@@ -94,6 +104,7 @@ export class BoatPhysics {
       heelDeg: 0, speedKn: 0, vmgKn: 0, leewayDeg: 0, fr: 0, planing: 0,
       driveN: 0, sideN: 0, rudderDeg: 0, inIrons: false, sternway: false,
       surf: 0, // 浪面坡度沿艏向的推进加速度 m/s²（+ = 正在被浪推，HUD 冲浪提示）
+      currentKn: 0, currentSetDeg: 0, // 环境水流速度（节）与去向罗盘角（HUD 潮流指示）
     };
   }
 
@@ -205,8 +216,11 @@ export class BoatPhysics {
 
     // —— 波浪环境：水体本身在动（轨道流速），船沿浪面还受坡度推力 ——
     const wv = this._waveEnv ?? FLAT_WAVE;
-    const owX = toBodyX(wv.ovx, wv.ovz) * p.cOrbital;
-    const owY = toBodyY(wv.ovx, wv.ovz) * p.cOrbital;
+    // 水动力参照系 = 波浪轨道流速（吃水处衰减）+ 环境水流（整片水体平移，不衰减）。
+    // 船位积分的是对地速度 u/v，故稳态下船会随水流漂移；表观风仍用对地速度（空气不随水动）。
+    const cur = this.current;
+    const owX = toBodyX(wv.ovx, wv.ovz) * p.cOrbital + toBodyX(cur.vx, cur.vz);
+    const owY = toBodyY(wv.ovx, wv.ovz) * p.cOrbital + toBodyY(cur.vx, cur.vz);
     const ru = this.u - owX; // 相对水体的体轴速度（一切水动力的参照系）
     const rv = this.v - owY;
     let surfAcc = 0;
@@ -227,19 +241,18 @@ export class BoatPhysics {
     {
       const flowX = -ru;
       const flowY = -(rv + this.yawRate * p.boardX);
-      const f = foilForce2D(flowX, flowY, 0, boardArea, RHO_WATER,
+      const f = foilForce2D(flowX, flowY, chordForFlow(0, flowX, flowY), boardArea, RHO_WATER,
         (a) => foilCoeffs(a, boardAspect, 16));
       Fx += f.fx; Fy += f.fy;
       tauYaw += p.boardX * f.fy;
       tauRoll += f.fy * -(p.boardDepth * this.board + 0.08);
     }
-    // 舵叶
-    let rudderStall = false;
+    // 舵叶（倒航时来流从艉打来，翻弦参考使舵效自然反向 —— 死区脱困的“反舵”）
     if (!this.capsized) {
       const flowX = -ru;
       const flowY = -(rv + this.yawRate * p.rudderX);
-      const f = foilForce2D(flowX, flowY, this.rudder, p.rudderArea, RHO_WATER,
-        (a) => { rudderStall = Math.abs(a) > 26 * DEG; return foilCoeffs(a, p.rudderAspect, 24); });
+      const f = foilForce2D(flowX, flowY, chordForFlow(this.rudder, flowX, flowY), p.rudderArea, RHO_WATER,
+        (a) => foilCoeffs(a, p.rudderAspect, 24));
       Fx += f.fx; Fy += f.fy;
       tauYaw += p.rudderX * f.fy;
       tauRoll += f.fy * -p.rudderDepth;
@@ -267,13 +280,23 @@ export class BoatPhysics {
     // 艏摇阻尼
     tauYaw -= p.cYawDampL * this.yawRate + p.cYawDampQ * this.yawRate * Math.abs(this.yawRate);
 
+    // —— 正顺风上风侧微倾 ——
+    // 现实里正顺风要把船向上风侧压一点：平衡舵感、减小横摇、也是 death-roll 的种子。
+    // 上风舷 = 帆的反侧；越接近正顺风越明显。physical 力矩让不自动压舷的玩家也自然
+    // 上风倾；phiTarget 供下方自动压舷把船摆到这个目标角(而非死平)。
+    const runDeep = smoothstep(140 * DEG, 175 * DEG, Math.abs(twa));
+    const windSide = -(Math.sign(this.boom) || 1); // 上风倾的 phi 符号
+    const phiTarget = windSide * runDeep * p.runHeelDeg * DEG;
+    if (!this.capsized) tauRoll += windSide * runDeep * p.cRunHeel * clamp(Math.abs(ru) / 2.5, 0, 1);
+
     // —— 船员压舷 ——
     let crewTarget;
     if (this.capsized) {
       crewTarget = 0;
     } else if (ctl.autoHike) {
-      // 自动配平到接近水平，手动输入作偏置
-      const needed = -tauRoll / Math.max(1, p.massCrew * G * Math.cos(this.phi));
+      // 自动配平到目标倾角（顺风时为上风微倾 phiTarget，其余为水平），手动输入作偏置
+      const hold = this.mass * G * p.gmEff * Math.sin(phiTarget); // 维持 phiTarget 需抵消的稳性回正
+      const needed = (-tauRoll + hold) / Math.max(1, p.massCrew * G * Math.cos(this.phi));
       crewTarget = clamp(needed, -p.hikeMax, p.hikeMax);
       crewTarget = clamp(crewTarget + ctl.hike * 0.45, -p.hikeMax, p.hikeMax);
     } else {
@@ -353,5 +376,7 @@ export class BoatPhysics {
     o.rudderDeg = -this.rudder / DEG; // 转右为正，供 HUD
     o.inIrons = Math.abs(o.twaDeg) < 35 && this.u < 0.6 && !this.capsized;
     o.sternway = this.u < -0.05;
+    o.currentKn = Math.hypot(cur.vx, cur.vz) / KN;
+    o.currentSetDeg = (Math.atan2(cur.vx, -cur.vz) / DEG + 360) % 360; // 水流去向罗盘角
   }
 }

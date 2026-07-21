@@ -83,15 +83,24 @@ export class AIHelm {
     const absBT = Math.abs(bearingTwa);
 
     if (absBT < UPWIND_TWA + 6 * DEG) {
-      // —— 迎风段：走 Z 字 ——
+      // —— 迎风段：沿走廊短抢风 ——
       const tackTwa = UPWIND_TWA + 3 * DEG;
       const headA = wrapPi(w.fromPsi + this.tackSide * tackTwa);
       // layline 判断：另一舷的航向能否直达目标（留 6° 余量）
       const otherHeading = wrapPi(w.fromPsi - this.tackSide * tackTwa);
       const fetch = Math.abs(wrapPi(bearing - otherHeading)) < 6 * DEG * this.skill;
+      // 走廊:偏离“过标迎风轴”超过阈值就抢回中线一侧。没有这条,AI 只在够到
+      // layline 时才换舷 —— 长迎风腿的 layline 在几百米外,会一路冲到角落“跑飞”。
+      // 阈值随剩余距离收窄:远处宽松多蛇行,近标自然过渡到 layline 进近。
+      const perpX = Math.cos(w.fromPsi), perpZ = Math.sin(w.fromPsi); // 迎风轴法向(起航线方向)
+      const lateral = (p.x - target.x) * perpX + (p.z - target.z) * perpZ;
+      const corridor = clamp(distToTarget * 0.25, 28, 62);
+      const latV1 = Math.sin(w.fromPsi + tackTwa) * perpX - Math.cos(w.fromPsi + tackTwa) * perpZ;
+      const corridorTack = -Math.sign(lateral || 1) * Math.sign(latV1 || 1); // 把船带回中线的舷
+      const strayed = Math.abs(lateral) > corridor && this.tackSide !== corridorTack;
       const sinceManeuver = t - this.lastManeuverT;
-      if (fetch && sinceManeuver > 12 && distToTarget > 30) {
-        this.tackSide *= -1;
+      if ((fetch || strayed) && sinceManeuver > 9 && distToTarget > 30) {
+        this.tackSide = (strayed && !fetch) ? corridorTack : -this.tackSide;
         this.lastManeuverT = t;
       } else if (this.skill >= 0.8
         && shouldEscapeShadow(this.boat.shadowF ?? 1, this.shadowT, sinceManeuver, distToTarget)) {
@@ -179,8 +188,9 @@ export class AIHelm {
 
   _holdStation(w, t) {
     const p = this.boat.phys;
-    const holdHeading = wrapPi(w.fromPsi + 90 * DEG);
-    steerTowards(p, holdHeading, 0.5);
-    p.ctl.sheet = 0.9;
+    // 无目标(已完赛/收帆):顶风放帆缓缓停住,别一路横漂到天边去
+    steerTowards(p, w.fromPsi, 0.5);
+    p.ctl.sheet = 1;
+    p.ctl.board = 1;
   }
 }

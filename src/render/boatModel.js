@@ -50,24 +50,34 @@ function buildHull(topColor = 0xf4f1e8, bottomColor = 0x35566b) {
       indices.push(a, b2, a + 1, a + 1, b2, b2 + 1);
     }
   }
-  // 艉封板:复制一圈独立轮缘顶点(不与侧壳共享,保证平面硬边法线),
-  // 绕序取从船艉(+z)看逆时针,面片朝外。
+  // 艉封板:独立轮缘顶点(不与侧壳共享,保证平面硬边法线),绕序从船艉(+z)看逆时针面片朝外。
+  // 由两条边界围成的封闭多边形铺满:下缘=船体艉环 U 形弧(舷缘经龙骨到舷缘),
+  // 上缘=甲板艉缘(带拱度冠线)。旧版只对下弧扇形展开、以船中一点收口,顶部留下
+  // 一块三角缺口 —— 正艉视角可透过缺口直接看进舱内甚至海面。补上甲板冠线一并封闭。
   const sternBase = positions.length / 3;
   const b0 = profileAt(P_BEAM, 0), d0 = profileAt(P_KEEL, 0), sh0 = profileAt(P_SHEER, 0);
-  for (let k = 0; k <= M; k++) {
-    const u = (k / M) * 2 - 1;
-    const tt = 1 - Math.abs(u);
-    const y = sh0 - (sh0 + d0) * Math.pow(tt, 1.18);
-    const x = Math.sign(u) * b0 * Math.pow(1 - Math.pow(tt, 2.1), 0.72);
+  const pushV = (x, y) => {
     positions.push(x, y, HALF);
     cTmp.copy(cBot).lerp(cTop, smooth01((y - WL) / 0.05));
     colors.push(cTmp.r, cTmp.g, cTmp.b);
+  };
+  // 下缘:船体艉环(u:-1 左舷缘 -> 0 龙骨 -> +1 右舷缘)
+  for (let k = 0; k <= M; k++) {
+    const u = (k / M) * 2 - 1;
+    const tt = 1 - Math.abs(u);
+    pushV(Math.sign(u) * b0 * Math.pow(1 - Math.pow(tt, 2.1), 0.72),
+      sh0 - (sh0 + d0) * Math.pow(tt, 1.18));
+  }
+  // 上缘:甲板艉缘冠线(端点取船体舷缘 b0 使艏艉角点重合、无缝)
+  const MC = 10, crownBase = positions.length / 3;
+  for (let j = 0; j <= MC; j++) {
+    const u = (j / MC) * 2 - 1;
+    pushV(u * b0, sh0 + (1 - u * u) * 0.035);
   }
   const cIdx = positions.length / 3;
-  positions.push(0, (sh0 - d0) / 2, HALF);
-  cTmp.copy(cBot).lerp(cTop, smooth01(((sh0 - d0) / 2 - WL) / 0.05));
-  colors.push(cTmp.r, cTmp.g, cTmp.b);
+  pushV(0, (sh0 - d0) / 2);
   for (let k = 0; k < M; k++) indices.push(sternBase + k, sternBase + k + 1, cIdx);
+  for (let j = 0; j < MC; j++) indices.push(crownBase + j + 1, crownBase + j, cIdx);
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
@@ -396,6 +406,7 @@ export function createBoatVisual(opts = {}) {
   // —— 每帧姿态更新 ——
   const sailPos = sailGeo.attributes.position;
   const _boomEnd = new THREE.Vector3();
+  const _sh = new THREE.Vector3(); // 复用:把肩点从躯干局部变换到 crew 局部
   let smPitch = 0, smRoll = 0, smHeave = 0, camberSm = 0, crewXSm = 0;
   // 帆法线重算降频:main.js 按到相机距离/是否玩家船设置(1=每帧,越远越稀)
   const sailNormals = { interval: 1, frame: 0 };
@@ -495,18 +506,22 @@ export function createBoatVisual(opts = {}) {
       placeLimb(thigh, hipX, hipY, fz, kx, ky, kz);
       placeLimb(shin, kx, ky, kz, fx, fy, fz + 0.04);
     }
-    // 肩点随躯干外倾旋转;后手持舵柄延伸杆收在体侧,前手拉住缭绳方向
-    const shX = -Math.sin(lean) * 0.42;
-    const shY = 0.08 + Math.cos(lean) * 0.42;
-    const aftHandX = shX - side * 0.06, aftHandY = shY - 0.34;
-    const fwdHandX = clamp(-crewXSm * 0.7, -0.5, 0.5), fwdHandY = shY - 0.3;
-    let ex = (shX + aftHandX) * 0.5 + side * 0.08, ey = (shY + aftHandY) * 0.5;
-    placeLimb(armAftU, shX, shY, 0.1, ex, ey, 0.2);
-    placeLimb(armAftF, ex, ey, 0.2, aftHandX, aftHandY, 0.3);
-    ex = (shX + fwdHandX) * 0.5 + side * 0.06;
-    ey = (shY + fwdHandY) * 0.5 - 0.04;
-    placeLimb(armFwdU, shX, shY, -0.1, ex, ey, -0.16);
-    placeLimb(armFwdF, ex, ey, -0.16, fwdHandX, fwdHandY, -0.2);
+    // 肩点锚在躯干上:取躯干局部肩位(胶囊上端、体侧 ±z 表面),经躯干实际
+    // 旋转/位移变换到 crew 局部 —— 无论躯干如何外倾、转体,双臂始终连在肩上,
+    // 不再因肩点与躯干变换脱节而“手臂飞离身体”。
+    _sh.set(0, 0.38, 0.13).applyEuler(torso.rotation).add(torso.position);
+    const aSx = _sh.x, aSy = _sh.y, aSz = _sh.z; // 后肩(舵手臂)
+    _sh.set(0, 0.38, -0.13).applyEuler(torso.rotation).add(torso.position);
+    const fSx = _sh.x, fSy = _sh.y, fSz = _sh.z; // 前肩(缭绳臂)
+    // 后手持舵柄延伸杆(收在体侧、略朝艉);前手拉缭绳(朝艏、近中线)
+    const aftHandX = aSx - side * 0.05, aftHandY = 0.06, aftHandZ = 0.32;
+    const fwdHandX = clamp(-crewXSm * 0.6, -0.45, 0.45) - side * 0.02, fwdHandY = 0.12, fwdHandZ = -0.18;
+    let ex = (aSx + aftHandX) * 0.5 + side * 0.06, ey = (aSy + aftHandY) * 0.5 + 0.02, ez = (aSz + aftHandZ) * 0.5;
+    placeLimb(armAftU, aSx, aSy, aSz, ex, ey, ez);
+    placeLimb(armAftF, ex, ey, ez, aftHandX, aftHandY, aftHandZ);
+    ex = (fSx + fwdHandX) * 0.5 + side * 0.05; ey = (fSy + fwdHandY) * 0.5; ez = (fSz + fwdHandZ) * 0.5;
+    placeLimb(armFwdU, fSx, fSy, fSz, ex, ey, ez);
+    placeLimb(armFwdF, ex, ey, ez, fwdHandX, fwdHandY, fwdHandZ);
     crew.visible = !phys.capsized;
 
     // 缭绳：帆杠末端 -> 舱底(boomGroup 原点在桅杆处,故 bz 再加 mastZ)

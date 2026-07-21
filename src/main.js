@@ -38,6 +38,8 @@ import {
 import { leaveOrCloseMultiplayer } from './net/multiplayerSession.js';
 import { t } from './i18n.js';
 
+const ZERO_CURRENT = Object.freeze({ vx: 0, vz: 0 });
+
 const AI_STYLES = [
   { hullColor: 0xdce9f2, sailNumber: 12, accent: '#2b6ea8', nameKey: 'name.ai1' },
   { hullColor: 0xf2ecd9, sailNumber: 7, accent: '#b8860b', nameKey: 'name.ai2' },
@@ -127,6 +129,7 @@ export class App {
     this.wind.setBase(environment.windPsi, environment.windKn);
     this.wind.gustiness = environment.gustiness;
     this.waveField.setConditions(environment.windPsi, environment.windKn);
+    this._currentVec = this._computeCurrent(environment.windPsi);
     this.audio.setVolume(s.volume);
     this.audio.setChannelVolume('music', s.volMusic);
     this.audio.setChannelVolume('ambient', s.volAmbient);
@@ -161,6 +164,15 @@ export class App {
       const preset = this.applySkyPreset(s.skyPreset);
       this.water.setSky(this.sunDir, preset);
     }
+  }
+
+  // 环境水流(整片水体缓慢平移):离线模式启用轻柔潮流(去向由风向确定性推导,便于回放/幽灵一致);
+  // 联机保持静水,确保各端物理逐位一致、不引入需同步的额外环境态。
+  _computeCurrent(windPsi) {
+    if (this.mode === 'multiplayer-race') return { vx: 0, vz: 0 };
+    const set = windPsi + 2.0;   // 潮流去向(相对风向固定偏置)
+    const spd = 0.16;            // m/s ≈0.31kn,轻柔可感不喧宾夺主
+    return { vx: Math.sin(set) * spd, vz: -Math.cos(set) * spd };
   }
 
   _applyPixelRatio() {
@@ -634,8 +646,10 @@ export class App {
 
     // 物理与视觉（每条船感受到被其他船遮挡后的风）
     this.shadowWind.boats = this.boats;
+    const cur = this._currentVec ?? ZERO_CURRENT;
     for (const b of this.boats) {
       this.shadowWind.exclude = b;
+      b.phys.current = cur; // 整片水体同一水流(离线轻柔潮流/联机静水)
       b.shadowF = shadowFactorAt(b.phys.x, b.phys.z, this.wind.currentFromPsi(), this.boats, b);
       this._tuneSailDetail(b);
       b.update(this.shadowWind, dt, this.time, this.islands, this.audio);
