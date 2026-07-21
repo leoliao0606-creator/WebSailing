@@ -13,11 +13,14 @@ const PHYS_NUMBER_FIELDS = Object.freeze([
   'board',
   'crewY',
   'rightProgress',
+  'powerScale',
 ]);
 
 const CTL_NUMBER_FIELDS = Object.freeze(['rudder', 'sheet', 'board', 'hike']);
 const CTL_BOOLEAN_FIELDS = Object.freeze(['autoHike', 'righting', 'autoTrim']);
 const CONTROL_FIELDS = Object.freeze(['rudderCmd', 'hikeLevel', 'manualSheetAt']);
+// 航行规则处罚状态(boat 顶层字段,rules.js 读写);host 权威判罚,guest 快照回填
+const RULES_FIELDS = Object.freeze(['penaltyT', 'ruleCooldown', 'penaltyTurns', 'turnAcc']);
 const RACE_ENTRY_FIELDS = Object.freeze([
   'boatId',
   'leg',
@@ -27,6 +30,8 @@ const RACE_ENTRY_FIELDS = Object.freeze([
   'finishT',
   'prevX',
   'prevZ',
+  'roundAcc',
+  'nearMark',
 ]);
 
 export const MAX_BOATS = 8;
@@ -142,9 +147,20 @@ function clonePhys(value, path) {
   clone.sheet = boundedNumber(value.sheet, 0, 1, `${path}.sheet`);
   clone.board = boundedNumber(value.board, 0, 1, `${path}.board`);
   clone.rightProgress = boundedNumber(value.rightProgress, 0, 1, `${path}.rightProgress`);
+  clone.powerScale = boundedNumber(value.powerScale, 0, 1, `${path}.powerScale`);
   clone.capsized = booleanValue(value.capsized, `${path}.capsized`);
   clone.ctl = cloneCtl(value.ctl, `${path}.ctl`);
   return clone;
+}
+
+function cloneRules(value, path) {
+  exactRecord(value, RULES_FIELDS, path);
+  return {
+    penaltyT: boundedNumber(value.penaltyT, 0, Number.MAX_VALUE, `${path}.penaltyT`),
+    ruleCooldown: finiteNumber(value.ruleCooldown, `${path}.ruleCooldown`),
+    penaltyTurns: nonNegativeInteger(value.penaltyTurns, `${path}.penaltyTurns`),
+    turnAcc: finiteNumber(value.turnAcc, `${path}.turnAcc`),
+  };
 }
 
 function cloneControl(value, path) {
@@ -158,11 +174,12 @@ function cloneControl(value, path) {
 
 function cloneBoat(value, index) {
   const path = `boats[${index}]`;
-  exactRecord(value, ['boatId', 'phys', 'control'], path);
+  exactRecord(value, ['boatId', 'phys', 'control', 'rules'], path);
   return {
     boatId: opaqueId(value.boatId, `${path}.boatId`),
     phys: clonePhys(value.phys, `${path}.phys`),
     control: cloneControl(value.control, `${path}.control`),
+    rules: cloneRules(value.rules, `${path}.rules`),
   };
 }
 
@@ -187,6 +204,8 @@ function cloneRaceEntry(value, index, boatIds) {
     finishT: finiteNumber(value.finishT, `${path}.finishT`),
     prevX: finiteNumber(value.prevX, `${path}.prevX`),
     prevZ: finiteNumber(value.prevZ, `${path}.prevZ`),
+    roundAcc: finiteNumber(value.roundAcc, `${path}.roundAcc`),
+    nearMark: booleanValue(value.nearMark, `${path}.nearMark`),
   };
 }
 
@@ -304,6 +323,8 @@ function captureRaceEntry(race, boat, boatId) {
     finishT: entry.finishT,
     prevX: entry.prevX,
     prevZ: entry.prevZ,
+    roundAcc: entry.roundAcc,
+    nearMark: entry.nearMark,
   };
 }
 
@@ -331,6 +352,7 @@ export function captureWorldState({ tick, worldTime, seed, hostEpoch, boats, rac
         },
       },
       control: Object.fromEntries(CONTROL_FIELDS.map((field) => [field, boat[field]])),
+      rules: Object.fromEntries(RULES_FIELDS.map((field) => [field, boat[field]])),
     };
   });
 
@@ -408,6 +430,7 @@ function targetBoatMap(boats, expectedIds) {
       requireWritableField(ctl, field, `${path}.phys.ctl`);
     }
     for (const field of CONTROL_FIELDS) requireWritableField(boat, field, path);
+    for (const field of RULES_FIELDS) requireWritableField(boat, field, path);
     byId.set(boatId, boat);
   }
   if (byId.size !== expectedIds.size) fail('target boats must exactly match snapshot boats');
@@ -450,6 +473,8 @@ export function applyWorldState(snapshot, target) {
       finishT: entry.finishT,
       prevX: entry.prevX,
       prevZ: entry.prevZ,
+      roundAcc: entry.roundAcc,
+      nearMark: entry.nearMark,
     },
   }));
   const nextResults = state.race.results.map((result) => ({
@@ -470,6 +495,7 @@ export function applyWorldState(snapshot, target) {
       writeDataField(ctl, field, boatState.phys.ctl[field]);
     }
     for (const field of CONTROL_FIELDS) writeDataField(boat, field, boatState.control[field]);
+    for (const field of RULES_FIELDS) writeDataField(boat, field, boatState.rules[field]);
   }
 
   writeDataField(race, 'state', state.race.state);

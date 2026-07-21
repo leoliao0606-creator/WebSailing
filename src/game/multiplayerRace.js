@@ -19,9 +19,11 @@ export const EMPTY_CONTROL_INTENT = Object.freeze({
 
 const PHYS_FIELDS = Object.freeze([
   'x', 'z', 'psi', 'u', 'v', 'yawRate', 'phi', 'phiRate', 'boom', 'rudder',
-  'sheet', 'board', 'crewY', 'rightProgress', 'capsized',
+  'sheet', 'board', 'crewY', 'rightProgress', 'powerScale', 'capsized',
 ]);
 const CONTROL_FIELDS = Object.freeze(['rudderCmd', 'hikeLevel', 'manualSheetAt']);
+// 处罚状态(boat 顶层):host 权威判罚,guest 一律直接覆盖不做混合
+const RULES_FIELDS = Object.freeze(['penaltyT', 'ruleCooldown', 'penaltyTurns', 'turnAcc']);
 const ANGLE_FIELDS = new Set(['psi', 'phi', 'boom', 'rudder']);
 const HARD_CLOCK_DRIFT_SECONDS = 0.5;
 
@@ -43,6 +45,9 @@ function copyBoatState(boat, state) {
   for (const field of PHYS_FIELDS) boat.phys[field] = state.phys[field];
   Object.assign(boat.phys.ctl, state.phys.ctl);
   for (const field of CONTROL_FIELDS) boat[field] = state.control[field];
+  for (const field of RULES_FIELDS) boat[field] = state.rules[field];
+  // 权威 psi 覆盖后重置回转跟踪基准,避免把快照跳变计成罚转
+  boat._rulesPrevPsi = state.phys.psi;
 }
 
 function copyRemoteBoatState(boat, state) {
@@ -210,6 +215,8 @@ export function reconcilePredictedBoat(boat, state, {
   for (const field of CONTROL_FIELDS) {
     boat[field] += (state.control[field] - boat[field]) * softBlend;
   }
+  // 处罚为 host 权威离散状态:直接覆盖(powerScale 已随 PHYS_FIELDS 混合收敛)
+  for (const field of RULES_FIELDS) boat[field] = state.rules[field];
   return 'soft';
 }
 

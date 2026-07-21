@@ -178,6 +178,7 @@ export class App {
     this.hud.setBanner('');
     this._resultsShown = false;
     this._prevCount = null;
+    this._prevPenalty = null;
   }
 
   // —— 多人会话 API（房间 UI 只需要依赖这三个公开入口）——
@@ -237,6 +238,7 @@ export class App {
       startTick: nested.startTick ?? tick + countdown * 60,
       roster,
       aiFill: nested.aiFill ?? 0,
+      penaltyMode: nested.penaltyMode ?? this.settings.penaltyMode,
     };
     return this.multiplayerSession.startRace({ tick, seed, config });
   }
@@ -307,6 +309,9 @@ export class App {
     this.cameraRig.pos.set(this.player.phys.x - 12, 5, this.player.phys.z + 12);
     this.race = new RaceManager(course, racers, raceClock.countdown);
     this.race.t = raceClock.raceTime;
+    // 所有参与者(host 与 guest)都持有规则引擎:guest 平时不调 update,
+    // 迁移晋升为 host 后免接线继续判罚(处罚状态经 checkpoint 的 boat.rules 恢复)
+    this.rules = new RulesEngine(this.wind, { mode: config.penaltyMode ?? 'turns' });
 
     this.multiplayerController = new MultiplayerRaceController({
       session: this.multiplayerSession,
@@ -706,6 +711,11 @@ export class App {
     }
     this.shadowWind.exclude = null;
     this._boatCollisions();
+    // host 权威判罚:碰撞/触标 -> 回转或减速处罚;处罚状态随快照下发 guest
+    if (this.rules) {
+      this.rules.update(this.boats, this._contacts, dt, this._markContacts);
+      this._consumeRuleEvents();
+    }
     this.race.update(dt);
   }
 
@@ -729,8 +739,13 @@ export class App {
       this.boats,
       this.player,
     );
-    // guest 只预测本船；岛屿、船间碰撞和比赛裁决全部等待 host 快照。
-    this.player.simulate(this.shadowWind, dt, worldTime, null, this.audio);
+    // guest 只预测本船;船间碰撞和比赛裁决等待 host 快照。
+    // 岛屿与赛道障碍在本地预测中做纯位置修正(不产生判罚,判罚只在 host),
+    // 避免"先穿模再被快照拽回"的观感。
+    this.player.simulate(this.shadowWind, dt, worldTime, this.islands, this.audio);
+    if (this.race?.course?.obstacles) {
+      resolveObstacleCollisions([this.player], this.race.course.obstacles);
+    }
     this.shadowWind.exclude = null;
   }
 
@@ -766,6 +781,26 @@ export class App {
     } else if (this._prevCount !== -1) {
       this._prevCount = -1;
       this.audio.beep(1760, 0.5, 0.3);
+    }
+
+    // 处罚提示:guest 的处罚状态经快照回填,没有本地规则事件,做沿检测;
+    // host 的提示已由权威步进的 _consumeRuleEvents 发出
+    if (this.multiplayerController?.role !== 'host') {
+      const turns = this.player.penaltyTurns ?? 0;
+      const slow = (this.player.penaltyT ?? 0) > 0;
+      const prev = this._prevPenalty ?? { turns: 0, slow: false };
+      if (turns > prev.turns) {
+        this.hud.toast(t('rules.penaltyTurns.you', { n: turns }), 3.5);
+        this.audio.beep(392, 0.35, 0.25);
+      } else if (turns < prev.turns) {
+        this.hud.toast(turns > 0 ? t('rules.turnDone.more', { n: turns }) : t('rules.turnDone.clear'), 3);
+        this.audio.beep(1040, 0.25, 0.22);
+      }
+      if (slow && !prev.slow) {
+        this.hud.toast(t('rules.penalty.you', { s: PENALTY_SECONDS }), 3.5);
+        this.audio.beep(392, 0.35, 0.25);
+      }
+      this._prevPenalty = { turns, slow };
     }
 
     const entry = this.race.entries.get(this.player);

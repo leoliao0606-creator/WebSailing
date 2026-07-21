@@ -28,6 +28,7 @@ function makeBoat(boatId, offset = 0) {
       crewY: -0.35,
       capsized: false,
       rightProgress: 0.25,
+      powerScale: 0.9,
       ctl: {
         rudder: 0.5,
         sheet: 0.55,
@@ -41,6 +42,10 @@ function makeBoat(boatId, offset = 0) {
     rudderCmd: 0.45,
     hikeLevel: -0.3,
     manualSheetAt: 12.5 + offset,
+    penaltyT: 2.5,
+    ruleCooldown: 4.5,
+    penaltyTurns: 1,
+    turnAcc: 0.75,
   };
 }
 
@@ -56,6 +61,8 @@ function makeRace(boats) {
       finishT: index === 1 ? 18.5 : 0,
       prevX: boat.phys.x - 0.5,
       prevZ: boat.phys.z + 0.25,
+      roundAcc: 0.4 + index,
+      nearMark: index === 0,
     }])),
     results: [{ boat: boats[1], time: 18.5 }],
   };
@@ -112,6 +119,7 @@ test('captureWorldState captures every authoritative boat and control field as J
       crewY: -0.35,
       capsized: false,
       rightProgress: 0.25,
+      powerScale: 0.9,
       ctl: {
         rudder: 0.5,
         sheet: 0.55,
@@ -126,6 +134,12 @@ test('captureWorldState captures every authoritative boat and control field as J
       rudderCmd: 0.45,
       hikeLevel: -0.3,
       manualSheetAt: 12.5,
+    },
+    rules: {
+      penaltyT: 2.5,
+      ruleCooldown: 4.5,
+      penaltyTurns: 1,
+      turnAcc: 0.75,
     },
   });
   assert.deepEqual(JSON.parse(JSON.stringify(snapshot)), snapshot);

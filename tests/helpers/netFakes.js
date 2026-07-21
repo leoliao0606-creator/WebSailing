@@ -193,6 +193,7 @@ export function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 
         crewY: 0,
         capsized: false,
         rightProgress: 0,
+        powerScale: 1,
         ctl: {
           rudder: 0,
           sheet: 0.5,
@@ -204,6 +205,7 @@ export function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 
         },
       },
       control: { rudderCmd: 0, hikeLevel: 0, manualSheetAt: -99 },
+      rules: { penaltyT: 0, ruleCooldown: 0, penaltyTurns: 0, turnAcc: 0 },
     }],
     race: {
       state: 'racing',
@@ -217,6 +219,8 @@ export function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 1, x = 0 
         finishT: 0,
         prevX: x,
         prevZ: 0,
+        roundAcc: 0,
+        nearMark: false,
       }],
       results: [],
     },
@@ -246,6 +250,7 @@ export const START_CONFIG = Object.freeze({
     Object.freeze({ playerId: 'guest', nickname: 'guest' }),
   ]),
   aiFill: 1,
+  penaltyMode: 'turns',
 });
 
 export function startConfigForTick(tick, playerIds = ['host', 'guest']) {

@@ -73,6 +73,10 @@ function makeBoat(boatId, playerId = boatId) {
     rudderCmd: 0,
     hikeLevel: 0,
     manualSheetAt: -99,
+    penaltyT: 0,
+    ruleCooldown: 0,
+    penaltyTurns: 0,
+    turnAcc: 0,
     phys: {
       x: 0,
       z: 0,
@@ -88,6 +92,7 @@ function makeBoat(boatId, playerId = boatId) {
       board: 1,
       crewY: 0,
       rightProgress: 0,
+      powerScale: 1,
       capsized: false,
       ctl: {
         rudder: 0,
@@ -111,6 +116,8 @@ function makeRace(boats) {
     finishT: 0,
     prevX: 0,
     prevZ: 0,
+    roundAcc: 0,
+    nearMark: false,
   }]));
   return {
     state: 'prestart',
@@ -158,6 +165,12 @@ function makeCheckpoint(boats, race, overrides = {}) {
         rudderCmd: boat.rudderCmd,
         hikeLevel: boat.hikeLevel,
         manualSheetAt: boat.manualSheetAt,
+      },
+      rules: {
+        penaltyT: boat.penaltyT,
+        ruleCooldown: boat.ruleCooldown,
+        penaltyTurns: boat.penaltyTurns,
+        turnAcc: boat.turnAcc,
       },
     })),
     race: race.captureState(),
@@ -590,6 +603,39 @@ test('remote interpolation samples 125ms behind estimated host world time', () =
   assert.ok(Math.abs(controller.estimatedHostWorldTime(now) - 10.175) < 1e-9);
   assert.equal(rendered.renderOnly, true);
   assert.ok(Math.abs(boats[0].phys.x - 10) < 1e-9);
+});
+
+test('authority penalty state round-trips to the guest local boat without blending', () => {
+  let now = 1_000;
+  const session = new FakeSession('guest');
+  const boats = [makeBoat('player-a'), makeBoat('player-b')];
+  const race = makeRace(boats);
+  const controller = new MultiplayerRaceController({
+    session,
+    boats,
+    race,
+    seed: 'private-race',
+    localPlayerId: 'player-b',
+    now: () => now,
+  });
+  controller.receiveAuthoritySnapshot(makeCheckpoint(boats, race, {
+    hostEpoch: 1, tick: 120, worldTime: 2,
+  }));
+
+  now = 1_050;
+  const snapshot = makeCheckpoint(boats, race, { hostEpoch: 1, tick: 123, worldTime: 2.05 });
+  // host 判罚:本地船 2 回转、减速处罚生效
+  snapshot.boats[1].rules = { penaltyT: 6.5, ruleCooldown: 10.5, penaltyTurns: 2, turnAcc: 1.2 };
+  snapshot.boats[1].phys.powerScale = 0.45;
+
+  assert.equal(controller.receiveAuthoritySnapshot(snapshot), true);
+  const local = boats[1];
+  assert.equal(local.penaltyTurns, 2, '处罚回转数应直接覆盖');
+  assert.equal(local.turnAcc, 1.2);
+  assert.equal(local.penaltyT, 6.5);
+  assert.equal(local.ruleCooldown, 10.5);
+  assert.ok(local.phys.powerScale < 1, 'powerScale 应向权威值收敛');
+  assert.equal(local._rulesPrevPsi !== undefined, true);
 });
 
 test('guest applies authoritative race and environment while rendering only remote buffered boats', () => {

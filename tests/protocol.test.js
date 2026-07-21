@@ -38,6 +38,7 @@ const START_RACE_CONFIG = Object.freeze({
     Object.freeze({ playerId: 'guest', nickname: '水手' }),
   ]),
   aiFill: 2,
+  penaltyMode: 'turns',
 });
 
 function startConfigForTick(tick) {
@@ -79,6 +80,7 @@ function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 4 } = {}) {
         crewY: 0,
         capsized: false,
         rightProgress: 0,
+        powerScale: 1,
         ctl: {
           rudder: 0,
           sheet: 0.5,
@@ -90,6 +92,7 @@ function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 4 } = {}) {
         },
       },
       control: { rudderCmd: 0, hikeLevel: 0, manualSheetAt: -99 },
+      rules: { penaltyT: 0, ruleCooldown: 0, penaltyTurns: 0, turnAcc: 0 },
     }],
     race: {
       state: 'racing',
@@ -103,6 +106,8 @@ function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 4 } = {}) {
         finishT: 0,
         prevX: 0,
         prevZ: 0,
+        roundAcc: 0,
+        nearMark: false,
       }],
       results: [],
     },
@@ -110,7 +115,7 @@ function makeWorldState({ tick = 60, worldTime = 1, hostEpoch = 4 } = {}) {
 }
 
 test('protocol exports the first-version limits', () => {
-  assert.equal(PROTOCOL_VERSION, 1);
+  assert.equal(PROTOCOL_VERSION, 2);
   assert.equal(MAX_PLAYERS, 8);
   assert.equal(MAX_NICKNAME_LENGTH, 20);
   assert.equal(MAX_CHAT_LENGTH, 500);
@@ -574,6 +579,10 @@ test('start-race carries one strict bounded environment and roster configuration
     ...raw,
     config: { ...START_RACE_CONFIG, windKn: 100 },
   }, 4), /windKn/i);
+  assertRejected(validatePeerMessage({
+    ...raw,
+    config: { ...START_RACE_CONFIG, penaltyMode: 'never' },
+  }, 4), /penaltyMode/i);
   assertRejected(validatePeerMessage({
     ...raw,
     config: { ...START_RACE_CONFIG, startTick: 121 },

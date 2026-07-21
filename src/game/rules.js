@@ -121,6 +121,8 @@ export class RulesEngine {
     if ((b.penaltyTurns ?? 0) <= 0) { b.turnAcc = 0; return; }
     if (b.phys.capsized || dt <= 0) return;
     const d = wrapPi(psi - prev);
+    // 单帧超过 0.5 rad 视为传送/快照回滚跳变,不计入
+    if (Math.abs(d) > 0.5) return;
     if (Math.abs(d / dt) < TURN_RATE_GATE) return;
     b.turnAcc = (b.turnAcc ?? 0) + d;
     if (Math.abs(b.turnAcc) >= TURN_COMPLETE) {

@@ -59,6 +59,8 @@ test('RaceManager captures JSON-only state keyed by stable boatId', () => {
         finishT: 0,
         prevX: 4,
         prevZ: 0,
+        roundAcc: 0,
+        nearMark: false,
       },
       {
         boatId: 'player-b',
@@ -69,6 +71,8 @@ test('RaceManager captures JSON-only state keyed by stable boatId', () => {
         finishT: 12.25,
         prevX: 15,
         prevZ: 0,
+        roundAcc: 0,
+        nearMark: false,
       },
     ],
     results: [{ boatId: 'player-b', time: 12.25 }],
@@ -93,11 +97,11 @@ test('RaceManager restores by boatId while preserving its Map and boat identitie
     entries: [
       {
         boatId: 'player-a', leg: 1, ocs: true, splits: [9.25], finished: false,
-        finishT: 0, prevX: 9, prevZ: -1,
+        finishT: 0, prevX: 9, prevZ: -1, roundAcc: 0.5, nearMark: true,
       },
       {
         boatId: 'player-b', leg: 2, ocs: false, splits: [8, 17], finished: true,
-        finishT: 18.5, prevX: 19, prevZ: 2,
+        finishT: 18.5, prevX: 19, prevZ: 2, roundAcc: 0, nearMark: false,
       },
     ],
     results: [{ boatId: 'player-b', time: 18.5 }],

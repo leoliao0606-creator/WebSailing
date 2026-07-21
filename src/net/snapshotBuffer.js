@@ -50,6 +50,8 @@ function interpolateBoat(left, right, alpha) {
     boatId: selected.boatId,
     phys: { ...selected.phys, ctl: { ...selected.phys.ctl } },
     control: { ...selected.control },
+    // 处罚状态为离散量:取最近快照,不插值(powerScale 同理经 selected.phys 展开)
+    rules: { ...selected.rules },
   };
 
   for (const field of PHYS_LINEAR_FIELDS) {

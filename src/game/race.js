@@ -2,11 +2,14 @@
 // 含起航倒计时、抢航（OCS）判定、分段计时、本地最佳成绩。
 
 import * as THREE from 'three';
-import { DEG, formatTime, headingToDir, wrapPi } from '../util/math.js';
+import { DEG, clamp, formatTime, headingToDir, wrapPi } from '../util/math.js';
 import { createBuoy, createCommitteeBoat } from '../render/terrain.js';
 import { t } from '../i18n.js';
 
-export const MARK_RADIUS = 16; // 绕标判定半径 m(与水面判定圈所见一致)
+export const MARK_RADIUS = 16;     // 绕标判定半径 m(与水面判定圈所见一致)
+export const CAPTURE_RADIUS = 48;  // 绕标捕获区半径:区内累计"标->船"方位角扫掠
+const ROUND_ANGLE = 110 * DEG;     // 完成绕标所需的正确方向净扫掠角
+const SWEEP_CLAMP = 30 * DEG;      // 单帧扫掠增量上限(防快照回滚跳变)
 
 export class RaceCourse {
   // 沿起赛时风向搭建赛道
@@ -28,6 +31,9 @@ export class RaceCourse {
       { x: center.x + up.x * beat, z: center.z + up.z * beat, nameKey: 'race.mark.wind' },
       { x: center.x - up.x * 60, z: center.z - up.z * 60, nameKey: 'race.mark.lee' },
     ];
+    // 绕标方向:全航线统一左舷绕标(标在船左侧,绕标时"标->船"方位角负向扫掠)。
+    // 符号由 tests/raceCourse.test.js 的合成轨迹校准。
+    this.roundSign = -1;
 
     // 航段序列（label 存 key，显示时翻译）：起航 -> 1上 -> 2下 -> 1上 -> 2下 -> 冲线
     this.legs = [
@@ -165,7 +171,11 @@ export class RaceManager {
     this.results = [];
     this.entries = new Map();
     for (const b of boats) {
-      this.entries.set(b, { leg: 0, ocs: false, splits: [], finished: false, finishT: 0, prevX: b.phys.x, prevZ: b.phys.z });
+      this.entries.set(b, {
+        leg: 0, ocs: false, splits: [], finished: false, finishT: 0,
+        prevX: b.phys.x, prevZ: b.phys.z,
+        roundAcc: 0, nearMark: false, // 绕标扫掠角累计 / 本次进近是否已进判定圈
+      });
     }
     this.events = []; // {msg, forPlayer}
   }
@@ -193,6 +203,8 @@ export class RaceManager {
         finishT: entry.finishT,
         prevX: entry.prevX,
         prevZ: entry.prevZ,
+        roundAcc: entry.roundAcc,
+        nearMark: entry.nearMark,
       };
     });
     return {
@@ -243,6 +255,7 @@ export class RaceManager {
       }
       const fields = new Set([
         'boatId', 'leg', 'ocs', 'splits', 'finished', 'finishT', 'prevX', 'prevZ',
+        'roundAcc', 'nearMark',
       ]);
       for (const key of Reflect.ownKeys(entry)) {
         if (typeof key !== 'string' || !fields.has(key)) {
@@ -256,13 +269,14 @@ export class RaceManager {
       if (!Number.isSafeInteger(entry.leg) || entry.leg < 0) {
         throw new TypeError('race entry leg must be a non-negative integer');
       }
-      if (typeof entry.ocs !== 'boolean' || typeof entry.finished !== 'boolean') {
+      if (typeof entry.ocs !== 'boolean' || typeof entry.finished !== 'boolean'
+        || typeof entry.nearMark !== 'boolean') {
         throw new TypeError('race entry flags must be Boolean');
       }
       if (!Array.isArray(entry.splits) || !entry.splits.every(Number.isFinite)) {
         throw new TypeError('race entry splits must contain finite numbers');
       }
-      for (const field of ['finishT', 'prevX', 'prevZ']) {
+      for (const field of ['finishT', 'prevX', 'prevZ', 'roundAcc']) {
         if (!Number.isFinite(entry[field])) throw new TypeError(`race entry ${field} must be finite`);
       }
       return {
@@ -275,6 +289,8 @@ export class RaceManager {
           finishT: entry.finishT,
           prevX: entry.prevX,
           prevZ: entry.prevZ,
+          roundAcc: entry.roundAcc,
+          nearMark: entry.nearMark,
         },
       };
     });
@@ -341,11 +357,28 @@ export class RaceManager {
       } else {
         const leg = c.legs[e.leg];
         if (leg.type === 'mark') {
+          // 绕标判定:捕获区内累计"标->船"方位角带符号扫掠;进过判定圈且
+          // 正确方向净扫掠 ≥ ROUND_ANGLE 才算绕过。错边通过时符号相反永不满足,
+          // 必须回头按正确侧重绕(RRS 28);离开捕获区清零重新进近。
           const m = c.marks[leg.mark];
-          if (Math.hypot(p.x - m.x, p.z - m.z) < MARK_RADIUS) {
-            e.splits.push(this.t);
-            e.leg++;
-            if (b.isPlayer) this.emit(t('race.msg.rounded', { mark: t(m.nameKey), next: c.legLabel(c.legs[e.leg]) }));
+          const d = Math.hypot(p.x - m.x, p.z - m.z);
+          if (d < CAPTURE_RADIUS) {
+            if (Math.hypot(e.prevX - m.x, e.prevZ - m.z) < CAPTURE_RADIUS) {
+              const bearing = Math.atan2(p.x - m.x, -(p.z - m.z));
+              const prevBearing = Math.atan2(e.prevX - m.x, -(e.prevZ - m.z));
+              e.roundAcc += clamp(wrapPi(bearing - prevBearing), -SWEEP_CLAMP, SWEEP_CLAMP);
+            }
+            if (d < MARK_RADIUS) e.nearMark = true;
+            if (e.nearMark && c.roundSign * e.roundAcc >= ROUND_ANGLE) {
+              e.roundAcc = 0;
+              e.nearMark = false;
+              e.splits.push(this.t);
+              e.leg++;
+              if (b.isPlayer) this.emit(t('race.msg.rounded', { mark: t(m.nameKey), next: c.legLabel(c.legs[e.leg]) }));
+            }
+          } else if (e.nearMark || e.roundAcc !== 0) {
+            e.roundAcc = 0;
+            e.nearMark = false;
           }
         } else if (leg.type === 'finish') {
           // 终点须自下风侧向上风穿越(与起航同向);反向穿线不算完赛。

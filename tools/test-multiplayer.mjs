@@ -9,8 +9,9 @@ import { fileURLToPath } from 'node:url';
 import { createSignalingServer } from '../server/signalingServer.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const STEP_TIMEOUT_MS = 20_000;
-const MIGRATION_TIMEOUT_MS = 12_000;
+// 低配/软渲染机器上游戏时钟远慢于实时,可用环境变量放宽
+const STEP_TIMEOUT_MS = Number(process.env.E2E_STEP_TIMEOUT_MS) || 20_000;
+const MIGRATION_TIMEOUT_MS = Number(process.env.E2E_MIGRATION_TIMEOUT_MS) || 12_000;
 const POSITION_TOLERANCE_METERS = 8;
 const SYSTEM_CHROMIUM_CANDIDATES = [
   '/usr/bin/google-chrome',
@@ -96,6 +97,8 @@ async function waitForGame(page, description, predicate, argument, timeout = STE
           tick: game?.multiplayerController?.tick ?? null,
           controllerRole: game?.multiplayerController?.role ?? null,
           session: game?.multiplayerSession?.state ?? null,
+          latestCheckpointTick: game?.multiplayerSession?.latestCheckpoint?.tick ?? null,
+          probe: window.__probe ?? null,
           visibleScreen: [...document.querySelectorAll('#menus > .screen.show')]
             .map((element) => element.id),
           lobbyStatus: document.querySelector('[data-testid="lobby-status"]')?.textContent ?? null,
@@ -308,8 +311,17 @@ async function main() {
       );
     }
 
-    hostContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 1280, height: 800 } });
-    guestContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 1280, height: 800 } });
+    hostContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 960, height: 600 } });
+    guestContext = await browser.newContext({ locale: 'zh-CN', viewport: { width: 960, height: 600 } });
+    // 软渲染 CI/低配机器:预置最低画质,避免两个 WebGL 实例把内存/CPU 打爆
+    const lowQuality = () => {
+      localStorage.setItem('windchaser.settings', JSON.stringify({
+        quality: 'low', resScale: 0.5, shadowQ: 'off', waterDetail: 'low',
+        effects: false, dynamicRes: false, ghost: false,
+      }));
+    };
+    await hostContext.addInitScript(lowQuality);
+    await guestContext.addInitScript(lowQuality);
     const hostPage = await hostContext.newPage();
     const guestPage = await guestContext.newPage();
     for (const [label, page] of [['host', hostPage], ['guest', guestPage]]) {
@@ -369,6 +381,15 @@ async function main() {
         && window.__game?.boats?.length === 2
         && Number.isSafeInteger(window.__game?.multiplayerController?.tick),
     )));
+
+    // 诊断探针:记录 guest 端消息拒收与检查点流,失败时随诊断一并输出
+    await guestPage.evaluate(() => {
+      window.__probe = { rejects: [], invalidated: [], checkpoints: [] };
+      const s = window.__game?.multiplayerSession;
+      s?.addEventListener('message-rejected', (e) => window.__probe.rejects.push({ ...e.detail }));
+      s?.addEventListener('invalidated', (e) => window.__probe.invalidated.push(e.detail));
+      s?.addEventListener('checkpoint', (e) => window.__probe.checkpoints.push(e.detail?.checkpoint?.tick));
+    });
 
     const guestPlayerId = await guestPage.evaluate(
       () => window.__game.multiplayerSession.state.playerId,

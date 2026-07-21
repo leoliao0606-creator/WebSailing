@@ -4,7 +4,9 @@ import {
   MAX_WORLD_STATE_BYTES,
 } from './worldState.js';
 
-export const PROTOCOL_VERSION = 1;
+// v2:世界状态增加 boats[].rules(处罚)/phys.powerScale/race entry roundAcc+nearMark,
+//    start-race config 增加 penaltyMode。严格校验对混版本 fail-closed。
+export const PROTOCOL_VERSION = 2;
 export const MAX_PLAYERS = 8;
 export const MAX_NICKNAME_LENGTH = 20;
 export const MAX_CHAT_LENGTH = 500;
@@ -170,6 +172,7 @@ function normalizeStartRaceConfig(value, envelopeTick) {
   if (!isRecord(value)) return failure('start-race config must be a plain object');
   const fields = new Set([
     'windPsi', 'windKn', 'gustiness', 'countdown', 'startTick', 'roster', 'aiFill',
+    'penaltyMode',
   ]);
   const unknown = rejectUnknownFields(value, fields, 'start-race config');
   if (unknown) return unknown;
@@ -201,6 +204,9 @@ function normalizeStartRaceConfig(value, envelopeTick) {
   if (roster.value.length + value.aiFill > MAX_PLAYERS) {
     return failure(`roster plus aiFill cannot exceed ${MAX_PLAYERS} boats`);
   }
+  if (value.penaltyMode !== 'turns' && value.penaltyMode !== 'slow') {
+    return failure('penaltyMode must be "turns" or "slow"');
+  }
 
   return success(deepFreeze({
     windPsi: windPsi.value,
@@ -210,6 +216,7 @@ function normalizeStartRaceConfig(value, envelopeTick) {
     startTick: startTick.value,
     roster: roster.value,
     aiFill: value.aiFill,
+    penaltyMode: value.penaltyMode,
   }));
 }
 
