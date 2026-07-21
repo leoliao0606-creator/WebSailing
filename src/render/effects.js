@@ -88,6 +88,8 @@ export class BoatEffects {
     this.PN = 200;
     this.parts = [];
     for (let i = 0; i < this.PN; i++) this.parts.push({ x: 0, y: -99, z: 0, vx: 0, vy: 0, vz: 0, life: 0, max: 1 });
+    // 空闲粒子索引栈:粒子死亡时压栈,spawn 时弹栈,避免每次线性扫描
+    this._freeParts = this.parts.map((_, i) => i);
     const pgeo = new THREE.BufferGeometry();
     pgeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.PN * 3), 3));
     pgeo.setAttribute('aAlpha', new THREE.BufferAttribute(new Float32Array(this.PN), 1));
@@ -131,6 +133,8 @@ export class BoatEffects {
     if (!on) {
       this.samples.length = 0;
       for (const p of this.parts) p.life = 0;
+      // 全部清死,重建空闲栈(否则被禁用后再启用会缺失可用粒子)
+      this._freeParts = this.parts.map((_, i) => i);
     }
   }
 
@@ -180,8 +184,9 @@ export class BoatEffects {
     const rgtX = Math.cos(phys.psi), rgtZ = Math.sin(phys.psi);
     while (this.spawnAcc >= 1) {
       this.spawnAcc -= 1;
-      const p = this.parts.find((q) => q.life <= 0);
-      if (!p) break;
+      const idx = this._freeParts.pop();
+      if (idx === undefined) break;
+      const p = this.parts[idx];
       const side = Math.random() > 0.5 ? 1 : -1;
       const bowX = phys.x + fwdX * 1.7, bowZ = phys.z + fwdZ * 1.7;
       p.x = bowX + rgtX * side * 0.35;
@@ -203,6 +208,7 @@ export class BoatEffects {
         p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
         ppos.setXYZ(i, p.x, p.y, p.z);
         pal.setX(i, clamp(p.life / p.max, 0, 1) * 0.85);
+        if (p.life <= 0) this._freeParts.push(i); // 本帧刚死亡,归还空闲栈
       } else {
         ppos.setXYZ(i, 0, -99, 0);
         pal.setX(i, 0);

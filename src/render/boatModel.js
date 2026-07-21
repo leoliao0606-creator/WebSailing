@@ -7,6 +7,7 @@ import { DEG, clamp, lerp, damp } from '../util/math.js';
 
 const LOA = 4.2;
 const HALF = LOA / 2;
+const AXIS_Y = new THREE.Vector3(0, 1, 0); // 复用的竖直轴,避免逐帧分配
 
 // 型线（沿船长 10 个控制站，t: 0=艉 1=艏）
 const P_BEAM = [0.54, 0.65, 0.685, 0.695, 0.68, 0.62, 0.52, 0.37, 0.19, 0.03];
@@ -349,7 +350,6 @@ export function createBoatVisual(opts = {}) {
   hip.position.y = 0.06;
 
   // 四肢:单位胶囊按两端点摆位拉伸(近似 IK,姿态由 update 每帧解出)
-  const limbUp = new THREE.Vector3(0, 1, 0);
   const _limbDir = new THREE.Vector3();
   function makeLimb(mat, radius, span) {
     const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, span, 4, 8), mat);
@@ -360,7 +360,7 @@ export function createBoatVisual(opts = {}) {
     _limbDir.set(bx - ax, by - ay, bz - az);
     const len = Math.max(_limbDir.length(), 1e-4);
     limb.mesh.position.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
-    limb.mesh.quaternion.setFromUnitVectors(limbUp, _limbDir.divideScalar(len));
+    limb.mesh.quaternion.setFromUnitVectors(AXIS_Y, _limbDir.divideScalar(len));
     limb.mesh.scale.set(1, len / limb.total, 1);
   }
   const thighL = makeLimb(wetsuit, 0.072, 0.2);
@@ -397,6 +397,8 @@ export function createBoatVisual(opts = {}) {
   const sailPos = sailGeo.attributes.position;
   const _boomEnd = new THREE.Vector3();
   let smPitch = 0, smRoll = 0, smHeave = 0, camberSm = 0, crewXSm = 0;
+  // 帆法线重算降频:main.js 按到相机距离/是否玩家船设置(1=每帧,越远越稀)
+  const sailNormals = { interval: 1, frame: 0 };
 
   function update(phys, waveField, time, dt) {
     // 波面姿态
@@ -443,7 +445,8 @@ export function createBoatVisual(opts = {}) {
       }
     }
     sailPos.needsUpdate = true;
-    sailGeo.computeVertexNormals();
+    // 帆形位置每帧更新,但法线重算(遍历 13×9 网格)按间隔降频降低远处/AI 船开销
+    if (sailNormals.frame++ % sailNormals.interval === 0) sailGeo.computeVertexNormals();
 
     // 纤维带:与帆面同一套成形公式取根部位置,再向后缘拖出摆动的短飘带
     const stalled = Math.abs(phys.out.alphaDeg) > 26;
@@ -506,9 +509,8 @@ export function createBoatVisual(opts = {}) {
     placeLimb(armFwdF, ex, ey, -0.16, fwdHandX, fwdHandY, -0.2);
     crew.visible = !phys.capsized;
 
-    // 缭绳：帆杠末端 -> 舱底
-    _boomEnd.set(0, 0.95, 2.45).applyAxisAngle(new THREE.Vector3(0, 1, 0), phys.boom);
-    _boomEnd.z += mastZ * 0 + 0; // boomGroup 原点在桅杆处
+    // 缭绳：帆杠末端 -> 舱底(boomGroup 原点在桅杆处,故 bz 再加 mastZ)
+    _boomEnd.set(0, 0.95, 2.45).applyAxisAngle(AXIS_Y, phys.boom);
     const bx = _boomEnd.x, by = _boomEnd.y, bz = _boomEnd.z + mastZ;
     const sp = sheetGeo.attributes.position;
     sp.setXYZ(0, bx, by, bz);
@@ -517,5 +519,5 @@ export function createBoatVisual(opts = {}) {
     sp.needsUpdate = true;
   }
 
-  return { group, update, boomGroup, crew };
+  return { group, update, boomGroup, crew, sailNormals };
 }

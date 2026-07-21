@@ -18,6 +18,7 @@ export class CameraRig {
     this.fov = 55;
     this._tmp = new THREE.Vector3();
     this._up = new THREE.Vector3(0, 1, 0);
+    this._upBoat = new THREE.Vector3();
   }
 
   cycle() {
@@ -75,8 +76,8 @@ export class CameraRig {
       this.pos.copy(this._tmp);
       this.camera.position.copy(this.pos);
       const lookA = psi + this.orbitYaw + backYaw;
-      const upBoat = new THREE.Vector3(0, 1, 0).applyQuaternion(g.quaternion);
-      this.camera.up.copy(upBoat.lerp(this._up.set(0, 1, 0), 0.35).normalize());
+      this._upBoat.set(0, 1, 0).applyQuaternion(g.quaternion);
+      this.camera.up.copy(this._upBoat.lerp(this._up.set(0, 1, 0), 0.35).normalize());
       this.look.set(
         this.pos.x + Math.sin(lookA) * 10,
         this.pos.y - 0.5 + this.orbitPitch * -8,

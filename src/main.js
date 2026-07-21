@@ -604,6 +604,7 @@ export class App {
     for (const b of this.boats) {
       this.shadowWind.exclude = b;
       b.shadowF = shadowFactorAt(b.phys.x, b.phys.z, this.wind.currentFromPsi(), this.boats, b);
+      this._tuneSailDetail(b);
       b.update(this.shadowWind, dt, this.time, this.islands, this.audio);
     }
     this.shadowWind.exclude = null;
@@ -750,7 +751,7 @@ export class App {
   }
 
   _renderMultiplayer(dt) {
-    for (const boat of this.boats) boat.render(this.time, dt);
+    for (const boat of this.boats) { this._tuneSailDetail(boat); boat.render(this.time, dt); }
     if (this.race && this.player) {
       this.race.course.setActiveTarget(this.race.activeTargetFor(this.player));
     }
@@ -871,6 +872,16 @@ export class App {
         this.hud.toast(t('rules.penalty.other', { name: ev.boat.displayName ?? t(ev.boat.nameKey) }));
       }
     }
+  }
+
+  // 帆法线重算降频:玩家船每帧,近处每 2 帧,远处每 6 帧(帆形位置仍每帧更新)
+  _tuneSailDetail(boat) {
+    const sn = boat.visual?.sailNormals;
+    if (!sn) return;
+    if (boat === this.player) { sn.interval = 1; return; }
+    const dx = boat.phys.x - this.camera.position.x;
+    const dz = boat.phys.z - this.camera.position.z;
+    sn.interval = (dx * dx + dz * dz) > 120 * 120 ? 6 : 2;
   }
 
   _boatCollisions() {
