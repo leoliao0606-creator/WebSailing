@@ -95,9 +95,13 @@ export class App {
     this.menu.show('menu-main');
     this.menu.refreshBest();
 
-    // 首次交互启动音频
-    window.addEventListener('pointerdown', () => this.audio.start(), { once: true });
-    window.addEventListener('keydown', () => this.audio.start(), { once: true });
+    // 首次交互启动音频;若此时在菜单,顺带起菜单音乐
+    const startAudio = () => {
+      this.audio.start();
+      if (this.mode === 'menu') this.audio.startMenuMusic();
+    };
+    window.addEventListener('pointerdown', startAudio, { once: true });
+    window.addEventListener('keydown', startAudio, { once: true });
 
     this._last = performance.now() / 1000;
     requestAnimationFrame(this._frame.bind(this));
@@ -111,6 +115,8 @@ export class App {
     this.wind.gustiness = s.gustiness;
     this.waveField.setConditions(this.wind.baseFromPsi, s.windKn);
     this.audio.setVolume(s.volume);
+    this.audio.setChannelVolume('music', s.volMusic);
+    this.audio.setChannelVolume('ambient', s.volAmbient);
 
     // —— 画质 ——
     this._applyPixelRatio();
@@ -162,6 +168,7 @@ export class App {
   }
 
   _clearMode() {
+    this.audio.stopMenuMusic();
     this.multiplayerController?.detach();
     this.multiplayerController = null;
     this._clearBoats();
@@ -338,6 +345,7 @@ export class App {
     // 主菜单背景：一条 AI 帆船自在巡航
     this._clearMode();
     this.mode = 'menu';
+    this.audio.startMenuMusic();
     this._newWindDirection();
     const demo = new Boat(this.scene, this.waveField, { ...AI_STYLES[0], isPlayer: false });
     demo.effects.setEnabled(this.settings.effects);

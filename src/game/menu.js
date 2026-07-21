@@ -17,6 +17,8 @@ const DEFAULTS = {
   coach: true,          // 新手教练提示(最佳帆/板参考 + 操作提示)
   ghost: true,
   volume: 0.7,
+  volMusic: 0.5,
+  volAmbient: 0.6,
   lang: null,           // null = 首次启动按浏览器语言
   quality: 'high',      // low/medium/high/ultra/custom
   resScale: 1.0,        // 渲染分辨率缩放（× devicePixelRatio）
@@ -61,6 +63,10 @@ export class Menu {
       app,
       showScreen: (id) => this.show(id),
     });
+    // 全局委托:任意按钮点击播放 UI 音效(捕获阶段,先于各屏 data-act 处理)
+    this.root.addEventListener('pointerdown', (e) => {
+      if (e.target?.closest?.('button')) this.app.audio.click();
+    }, true);
     this._buildAll();
   }
 
@@ -161,6 +167,10 @@ export class Menu {
         <label class="check"><input type="checkbox" id="s-ghost" ${s.ghost ? 'checked' : ''}> ${t('set.ghost')}</label>
         <label><span>${t('set.volume')} <output id="o-vol">${Math.round(s.volume * 100)}</output>%</span>
           <input type="range" id="s-vol" min="0" max="100" step="5" value="${s.volume * 100}"></label>
+        <label><span>${t('set.volMusic')} <output id="o-volm">${Math.round(s.volMusic * 100)}</output>%</span>
+          <input type="range" id="s-volm" min="0" max="100" step="5" value="${s.volMusic * 100}"></label>
+        <label><span>${t('set.volAmbient')} <output id="o-vola">${Math.round(s.volAmbient * 100)}</output>%</span>
+          <input type="range" id="s-vola" min="0" max="100" step="5" value="${s.volAmbient * 100}"></label>
 
         <div class="form-section">${t('set.graphics')}</div>
         <label>${t('set.quality')}
@@ -185,6 +195,8 @@ export class Menu {
     bind('#s-wind', '#o-wind');
     bind('#s-gust', '#o-gust');
     bind('#s-vol', '#o-vol');
+    bind('#s-volm', '#o-volm');
+    bind('#s-vola', '#o-vola');
     bind('#s-res', '#o-res');
 
     // 预设 -> 细项联动
@@ -236,6 +248,8 @@ export class Menu {
     st.coach = el.querySelector('#s-coach').checked;
     st.ghost = el.querySelector('#s-ghost').checked;
     st.volume = Number(el.querySelector('#s-vol').value) / 100;
+    st.volMusic = Number(el.querySelector('#s-volm').value) / 100;
+    st.volAmbient = Number(el.querySelector('#s-vola').value) / 100;
     st.quality = el.querySelector('#s-quality').value;
     st.resScale = Number(el.querySelector('#s-res').value) / 100;
     st.shadowQ = el.querySelector('#s-shadow').value;
