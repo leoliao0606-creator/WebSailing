@@ -1,21 +1,14 @@
 // 预加载脚本：沙箱模式下只能 require electron 内置模块，因此保持自包含。
-// 只向页面暴露桌面版必需的最小接口——本机信令地址与切换主机的动作。
+// 只暴露渲染进程真正用到的东西——本机信令地址与切换服务器的动作。局域网开关、
+// 全屏切换都由原生菜单在主进程里直接做，没必要在页面里留一个能绑 0.0.0.0 的入口。
 const { contextBridge, ipcRenderer } = require('electron');
 
 const bootstrap = ipcRenderer.sendSync('windchaser:bootstrap');
 
 contextBridge.exposeInMainWorld('windchaser', {
   desktop: true,
-  platform: bootstrap.platform,
-  version: bootstrap.version,
   signalingUrl: bootstrap.signalingUrl,
-  serverMode: bootstrap.serverMode,
   remoteAddress: bootstrap.remoteAddress,
-  lanHosting: bootstrap.lanHosting,
-  lanPort: bootstrap.lanPort,
   shareAddresses: bootstrap.shareAddresses,
   setServerAddress: (address) => ipcRenderer.invoke('windchaser:set-server-address', address),
-  setLanHosting: (enabled) => ipcRenderer.invoke('windchaser:set-lan-hosting', enabled),
-  lanAddresses: () => ipcRenderer.invoke('windchaser:lan-addresses'),
-  toggleFullscreen: () => ipcRenderer.invoke('windchaser:toggle-fullscreen'),
 });

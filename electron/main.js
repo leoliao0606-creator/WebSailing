@@ -15,11 +15,12 @@ import {
   ipcMain,
   net,
   protocol,
+  screen,
   shell,
 } from 'electron';
 
 import { DesktopServer, normalizeSignalingAddress } from './localServer.js';
-import { loadDesktopSettings, saveDesktopSettings } from './desktopSettings.js';
+import { loadDesktopSettings, saveDesktopSettings, visibleBounds } from './desktopSettings.js';
 import {
   APP_INDEX_URL,
   APP_ORIGIN,
@@ -71,18 +72,14 @@ const server = new DesktopServer({ publicDir: RENDERER_ROOT });
 let settings = null;
 let strings = menuStrings('en');
 let mainWindow = null;
-let updater = { mode: 'off', check: async () => null };
+let updaterMode = 'off';
+let updaterPromise = null;
 
 function bootstrapPayload() {
   return {
     desktop: true,
-    platform: process.platform,
-    version: app.getVersion(),
     signalingUrl: settings.remoteSignalingUrl ?? server.clientSignalUrl,
-    serverMode: settings.remoteSignalingUrl ? 'remote' : 'local',
     remoteAddress: settings.remoteSignalingUrl,
-    lanHosting: server.lanHosting,
-    lanPort: settings.lanPort,
     shareAddresses: server.shareAddresses,
   };
 }
@@ -93,8 +90,7 @@ async function applyServerSettings() {
     lanPort: settings.lanPort,
   });
   if (outcome.error) {
-    settings = { ...settings, lanHosting: false };
-    await saveDesktopSettings(app.getPath('userData'), settings);
+    await persist({ lanHosting: false });
     dialog.showMessageBox({
       type: 'warning',
       title: strings.lanFailedTitle,
@@ -104,9 +100,16 @@ async function applyServerSettings() {
   }
 }
 
-async function persist(patch) {
-  settings = { ...settings, ...patch };
-  settings = await saveDesktopSettings(app.getPath('userData'), settings);
+// 写盘串行化：读-改-写中间隔着 await，并发调用（拖窗口的同时切全屏、或者
+// 局域网监听失败要回滚开关）会互相覆盖——后完成的那次会把更早的快照写回去。
+let persistQueue = Promise.resolve();
+
+function persist(patch) {
+  persistQueue = persistQueue.then(async () => {
+    // 合并放在队列里做，保证每次都基于最新的 settings。
+    settings = await saveDesktopSettings(app.getPath('userData'), { ...settings, ...patch });
+  }).catch(() => {});
+  return persistQueue;
 }
 
 /** 改动监听方式或信令地址后重新载入窗口，让渲染进程拿到新的 bootstrap。 */
@@ -199,8 +202,8 @@ function buildMenu() {
       submenu: [
         {
           label: strings.checkUpdates,
-          enabled: updater.mode !== 'off',
-          click: () => { void updater.check({ manual: true }); },
+          enabled: updaterMode !== 'off',
+          click: () => { void checkForUpdates({ manual: true }); },
         },
         { type: 'separator' },
         {
@@ -237,7 +240,10 @@ function registerAppProtocol() {
 }
 
 function createWindow() {
-  const bounds = settings.windowBounds;
+  const bounds = visibleBounds(
+    settings.windowBounds,
+    screen.getAllDisplays().map((display) => display.workArea),
+  );
   mainWindow = new BrowserWindow({
     width: bounds?.width ?? 1600,
     height: bounds?.height ?? 900,
@@ -272,16 +278,29 @@ function createWindow() {
     if (!url.startsWith(`${APP_ORIGIN}/`)) event.preventDefault();
   });
 
+  // 'resized'/'moved' 只在 macOS 与 Windows 触发（Electron 文档里标着
+  // @platform darwin,win32），Linux 上一个都收不到，窗口几何就永远存不下来。
+  // 通用的 'resize'/'move' 三个平台都有，但拖动时每帧都发，所以做个防抖。
+  let boundsTimer = null;
   const rememberBounds = () => {
-    if (!mainWindow || mainWindow.isFullScreen() || mainWindow.isMinimized()) return;
-    void persist({ windowBounds: mainWindow.getNormalBounds() });
+    if (boundsTimer) clearTimeout(boundsTimer);
+    boundsTimer = setTimeout(() => {
+      boundsTimer = null;
+      if (!mainWindow || mainWindow.isFullScreen() || mainWindow.isMinimized()) return;
+      void persist({ windowBounds: mainWindow.getNormalBounds() });
+    }, 400);
+    boundsTimer.unref?.();
   };
-  mainWindow.on('resized', rememberBounds);
-  mainWindow.on('moved', rememberBounds);
+  mainWindow.on('resize', rememberBounds);
+  mainWindow.on('move', rememberBounds);
   // 在进入/退出全屏时就写盘；等到 'close' 再写，异步落盘可能赶不上进程退出。
   mainWindow.on('enter-full-screen', () => { void persist({ fullscreen: true }); });
   mainWindow.on('leave-full-screen', () => { void persist({ fullscreen: false }); });
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => {
+    if (boundsTimer) clearTimeout(boundsTimer);
+    boundsTimer = null;
+    mainWindow = null;
+  });
 
   void mainWindow.loadURL(APP_INDEX_URL);
 }
@@ -292,35 +311,37 @@ function registerIpc() {
     event.returnValue = bootstrapPayload();
   });
   ipcMain.handle('windchaser:set-server-address', (_event, address) => setServerAddress(address));
-  ipcMain.handle('windchaser:set-lan-hosting', (_event, enabled) => setLanHosting(enabled));
-  ipcMain.handle('windchaser:toggle-fullscreen', () => {
-    if (!mainWindow) return false;
-    mainWindow.setFullScreen(!mainWindow.isFullScreen());
-    return mainWindow.isFullScreen();
-  });
-  ipcMain.handle('windchaser:lan-addresses', () => server.shareAddresses);
 }
 
 /**
  * 接上自动更新。electron-updater 只在打包后有意义，开发模式与冒烟自检里
  * 直接跳过（也避免自检进程去连 GitHub）。
+ *
+ * 模式是同步算出来的（菜单项要用），但 electron-updater 本体懒加载：它是可选
+ * 功能，不该占着启动路径，更不该因为它加载不出来（asar 里漏文件、文件损坏）
+ * 就让整个游戏打不开——之前那样会走到 whenReady 的 catch 里弹错误框然后退出。
  */
-async function setupUpdater() {
-  const context = detectUpdateContext({ app });
-  const mode = process.env.WINDCHASER_SMOKE ? 'off' : updateMode(context);
-  if (mode === 'off') return;
-  const { autoUpdater } = await import('electron-updater');
-  updater = createUpdater({
+function updaterEnabled() {
+  return process.env.WINDCHASER_SMOKE ? 'off' : updateMode(detectUpdateContext({ app }));
+}
+
+function ensureUpdater() {
+  if (updaterMode === 'off') return Promise.resolve(null);
+  updaterPromise ??= import('electron-updater').then(({ autoUpdater }) => createUpdater({
     autoUpdater,
-    mode,
+    mode: updaterMode,
     strings,
     format: formatMenuString,
     dialog,
     openExternal: (url) => shell.openExternal(url),
     currentVersion: app.getVersion(),
-  });
-  // 启动即查会和首屏加载抢带宽，等玩家进到菜单再说。
-  setTimeout(() => { void updater.check(); }, 20_000).unref?.();
+  })).catch(() => null);
+  return updaterPromise;
+}
+
+async function checkForUpdates({ manual = false } = {}) {
+  const instance = await ensureUpdater();
+  await instance?.check({ manual });
 }
 
 /**
@@ -416,9 +437,11 @@ app.whenReady().then(async () => {
   registerAppProtocol();
   registerIpc();
   await applyServerSettings();
-  await setupUpdater();
+  updaterMode = updaterEnabled();
   buildMenu();
   createWindow();
+  // 启动即查会和首屏加载抢带宽，等玩家进到菜单再说。
+  setTimeout(() => { void checkForUpdates(); }, 20_000).unref?.();
   if (process.env.WINDCHASER_SMOKE) void runSmokeCheck();
 }).catch((error) => {
   dialog.showErrorBox('WindChaser', error.stack ?? String(error));

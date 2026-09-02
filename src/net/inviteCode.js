@@ -13,6 +13,20 @@ function bracketed(hostname) {
 }
 
 /**
+ * 输入里有没有显式写端口。
+ * WHATWG URL 会把「协议默认端口」抹掉（ws: 的默认端口正是 80），解析完
+ * `192.168.1.20:80` 和 `192.168.1.20` 的 parsed.port 都是空串，分不出来；
+ * 只看 parsed.port 会把玩家写死的 :80 悄悄改成 8787。
+ */
+function hasExplicitPort(address) {
+  const authority = address.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/, 1)[0];
+  const host = authority.slice(authority.lastIndexOf('@') + 1);
+  // IPv6 字面量自带冒号，端口只可能跟在方括号后面。
+  const tail = host.startsWith('[') ? host.slice(host.indexOf(']') + 1) : host;
+  return /^[^:]*:\d+$/.test(tail);
+}
+
+/**
  * 把玩家输入的主机地址规范成信令 URL。
  * 接受 `192.168.1.20`、`192.168.1.20:8787`、`http://…`、`ws://…/signal` 等写法。
  */
@@ -33,7 +47,9 @@ export function normalizeSignalingAddress(input, { defaultPort = DEFAULT_SIGNAL_
     throw new TypeError('address must use ws, wss, http, or https');
   }
   if (parsed.hostname === '') throw new TypeError('address must include a host');
-  if (parsed.port === '' && parsed.protocol === 'ws:') parsed.port = String(defaultPort);
+  if (parsed.port === '' && parsed.protocol === 'ws:' && !hasExplicitPort(trimmed)) {
+    parsed.port = String(defaultPort);
+  }
   if (parsed.pathname === '' || parsed.pathname === '/') parsed.pathname = '/signal';
   parsed.username = '';
   parsed.password = '';

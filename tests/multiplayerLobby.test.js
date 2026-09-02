@@ -367,7 +367,9 @@ function sessionState(overrides = {}) {
   };
 }
 
-function harness({ desktop = null, storage = new FakeStorage(), clipboard = null } = {}) {
+function harness({
+  desktop = null, storage = new FakeStorage(), clipboard = null, createStack = null,
+} = {}) {
   const documentRef = new FakeDocument();
   const root = documentRef.createElement('div');
   root.id = 'menus';
@@ -390,10 +392,10 @@ function harness({ desktop = null, storage = new FakeStorage(), clipboard = null
     storage,
     mountRoot: documentRef.body,
     showScreen: (id) => shown.push(id),
-    createStack: () => {
+    createStack: createStack ?? (() => {
       stacks += 1;
       return { signaling, transport, session };
-    },
+    }),
     random: () => 0.5,
     now: () => 1_234,
     desktop,
@@ -1221,11 +1223,8 @@ function fakeDesktop(overrides = {}) {
   const calls = [];
   return {
     desktop: true,
-    platform: 'linux',
     signalingUrl: 'ws://127.0.0.1:54321/signal',
-    serverMode: 'local',
     remoteAddress: null,
-    lanHosting: false,
     shareAddresses: [],
     setServerAddress(address) { calls.push(address); return Promise.resolve({}); },
     calls,
@@ -1249,7 +1248,6 @@ test('desktop build offers a server address field and reports the built-in serve
 
 test('desktop hint lists the shareable address while hosting on the LAN', () => {
   const desktop = fakeDesktop({
-    lanHosting: true,
     shareAddresses: [{ host: '192.168.1.20', port: 8787, pageUrl: 'http://192.168.1.20:8787/' }],
   });
   const { root } = harness({ desktop });
@@ -1261,18 +1259,18 @@ test('desktop hint lists the shareable address while hosting on the LAN', () => 
 
 test('desktop hint names the remote host once one is joined', () => {
   const desktop = fakeDesktop({
-    serverMode: 'remote',
     remoteAddress: 'ws://192.168.1.20:8787/signal',
     signalingUrl: 'ws://192.168.1.20:8787/signal',
   });
   const { root } = harness({ desktop });
+  // 显示成 UI 里教玩家输入的短写法，而不是内部的 ws://…/signal。
   assert.equal(
     root.querySelector('[data-testid="multiplayer-server-address"]').value,
-    'ws://192.168.1.20:8787/signal',
+    '192.168.1.20:8787',
   );
   assert.equal(
     root.querySelector('[data-testid="multiplayer-server-hint"]').textContent,
-    t('online.server.remote', { address: 'ws://192.168.1.20:8787/signal' }),
+    t('online.server.remote', { address: '192.168.1.20:8787' }),
   );
   assert.equal(root.querySelector('[data-testid="multiplayer-server-reset"]').disabled, false);
 });
@@ -1336,6 +1334,55 @@ test('an invite for the server already in use fills the code without a reload', 
   assert.equal(root.querySelector('[data-testid="multiplayer-room-code"]').value, 'AB2CD9');
 });
 
+test('a malformed room code is caught before the window reloads onto another server', async () => {
+  const desktop = fakeDesktop();
+  const storage = new FakeStorage();
+  const { lobby, root } = harness({ desktop, storage });
+  // 地址本身没问题，房间码是坏的。之前只在切完服务器、窗口重载完才发现，
+  // 那时人已经落在另一台服务器上，手里还没有房间。
+  assert.equal(await lobby.applyServerAddress('192.168.1.20:8787#zzz'), false);
+  assert.deepEqual(desktop.calls, []);
+  assert.equal(storage.getItem(PENDING_ROOM_STORAGE_KEY), null);
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-status"]').textContent,
+    t('online.error.code'),
+  );
+});
+
+test('a room code pasted into the server field fills the code box instead of switching servers', async () => {
+  const desktop = fakeDesktop();
+  const { lobby, root } = harness({ desktop });
+  // 服务器一栏就挨着房间码输入框，粘错格很常见。`ws://AB2CD9` 是能解析的，
+  // 照直切过去会把玩家永久指向一台不存在的主机。
+  assert.equal(await lobby.applyServerAddress('AB2CD9'), true);
+  assert.deepEqual(desktop.calls, []);
+  assert.equal(root.querySelector('[data-testid="multiplayer-room-code"]').value, 'AB2CD9');
+  assert.equal(root.querySelector('[data-testid="multiplayer-server-address"]').value, '');
+});
+
+test('a host that merely looks like a room code still works when a port is given', async () => {
+  const desktop = fakeDesktop();
+  const { lobby } = harness({ desktop });
+  assert.equal(await lobby.applyServerAddress('AB2CD9:8787'), true);
+  assert.deepEqual(desktop.calls, ['AB2CD9:8787']);
+});
+
+test('a stack that cannot be built fails the open instead of wedging the lobby', async () => {
+  const { lobby, root } = harness({
+    desktop: fakeDesktop(),
+    createStack: () => { throw new TypeError('page location must use http or https'); },
+  });
+  // 建栈的异常以前从 open() 里逃出去，_beginRoomCommand 的 roomCommandPending
+  // 就永远停在 true，大厅所有按钮从此点不动。
+  assert.equal(await lobby.open(), false);
+  assert.equal(await lobby.createRoom('Skipper'), false);
+  assert.equal(lobby.roomCommandPending, false);
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-status"]').textContent,
+    t('online.error.connection'),
+  );
+});
+
 test('an invite carrying a malformed room code is rejected before switching servers', async () => {
   const desktop = fakeDesktop();
   const storage = new FakeStorage();
@@ -1352,7 +1399,6 @@ test('an invite carrying a malformed room code is rejected before switching serv
 test('the invite code pairs the room code with the address crew can actually reach', async () => {
   const copied = [];
   const desktop = fakeDesktop({
-    lanHosting: true,
     shareAddresses: [{
       host: '192.168.1.20', port: 8787,
       pageUrl: 'http://192.168.1.20:8787/', signalUrl: 'ws://192.168.1.20:8787/signal',

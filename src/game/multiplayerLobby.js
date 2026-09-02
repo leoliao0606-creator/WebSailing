@@ -6,9 +6,11 @@ import {
 } from '../net/multiplayerSession.js';
 import { desktopBridge, desktopSignalingUrl } from '../net/desktopBridge.js';
 import {
+  INVITE_SEPARATOR,
   formatInviteCode,
   normalizeSignalingAddress,
   parseInviteCode,
+  shortSignalingAddress,
 } from '../net/inviteCode.js';
 import { PeerTransport } from '../net/peerTransport.js';
 import { normalizeNickname, normalizeRoomCode } from '../net/protocol.js';
@@ -236,14 +238,18 @@ export class MultiplayerLobby {
   }
 
   async open() {
-    this._ensureStack();
-    this.showScreen(this._effectiveState().roomCode ? 'menu-online-lobby' : 'menu-online');
+    // _ensureStack() 也可能抛（比如桥接没给出信令地址、SignalingClient 又没法从
+    // app:// 页面回落到同源 /signal）。放在 try 外面的话这个异常会一路逃到
+    // _beginRoomCommand，roomCommandPending 永远留在 true，大厅按钮全部锁死。
     try {
+      this._ensureStack();
+      this.showScreen(this._effectiveState().roomCode ? 'menu-online-lobby' : 'menu-online');
       await this._connect();
       this.statusKey = null;
       this._render();
       return true;
     } catch {
+      this.showScreen('menu-online');
       this.statusKey = 'online.error.connection';
       this._render();
       return false;
@@ -941,9 +947,7 @@ export class MultiplayerLobby {
     this.serverInput.setAttribute('aria-label', this.translate('online.server.label'));
     this.serverInput.placeholder = this.translate('online.server.placeholder');
     this.serverInput.setAttribute('title', this.translate('online.server.hint'));
-    this.serverInput.value = typeof this.desktop.remoteAddress === 'string'
-      ? this.desktop.remoteAddress
-      : '';
+    this.serverInput.value = this._displayAddress(this.desktop.remoteAddress);
     this.serverInput.addEventListener('keydown', (event) => {
       event.stopPropagation();
       if (event.key === 'Enter') {
@@ -987,6 +991,17 @@ export class MultiplayerLobby {
     const raw = typeof address === 'string' ? address.trim() : '';
     if (raw === '') return this._switchServer('', null);
 
+    // 只粘了六位房间码——服务器一栏就挨着房间码输入框，粘错格很常见。按房间码
+    // 处理，别当主机名：`ws://AB2CD9` 是能解析的，会把玩家静默切到一台不存在的
+    // 服务器，还跨重启记着。要连一台真叫这个名字的主机，写成 `AB2CD9:8787`。
+    if (!raw.includes(INVITE_SEPARATOR) && !/[.:/]/.test(raw) && normalizeRoomCode(raw).ok) {
+      this._applyRoomCode(raw);
+      this.serverInput.value = this._displayAddress(this.desktop.remoteAddress);
+      this.statusKey = 'online.status.inviteReady';
+      this._render();
+      return true;
+    }
+
     let invite;
     try {
       invite = parseInviteCode(raw);
@@ -1001,6 +1016,15 @@ export class MultiplayerLobby {
       normalized = normalizeSignalingAddress(invite.address);
     } catch {
       this.statusKey = 'online.error.serverAddress';
+      this._render();
+      return false;
+    }
+
+    // 房间码先验一遍再决定要不要换服务器：_switchServer 会重载窗口、掐断当前
+    // 连接，等重载完才发现房间码是错的就太晚了——人已经落在另一台服务器上，
+    // 手里还没有房间。
+    if (invite.roomCode !== null && !normalizeRoomCode(invite.roomCode).ok) {
+      this.statusKey = 'online.error.code';
       this._render();
       return false;
     }
@@ -1069,7 +1093,23 @@ export class MultiplayerLobby {
     if (!state.roomCode) return null;
     const signalUrl = this._shareableSignalUrl();
     if (!signalUrl) return null;
-    return formatInviteCode({ signalUrl, roomCode: state.roomCode });
+    try {
+      return formatInviteCode({ signalUrl, roomCode: state.roomCode });
+    } catch {
+      // 地址不是规范形式时宁可禁用按钮：_render() 每帧都调这里，让异常跑出去
+      // 会把整个大厅刷成空白。
+      return null;
+    }
+  }
+
+  /** 把内部的 ws://…/signal 压成 UI 里教玩家输入的短写法；压不动就原样显示。 */
+  _displayAddress(signalUrl) {
+    if (typeof signalUrl !== 'string' || signalUrl === '') return '';
+    try {
+      return shortSignalingAddress(signalUrl);
+    } catch {
+      return signalUrl;
+    }
   }
 
   _shareableSignalUrl() {
@@ -1115,7 +1155,7 @@ export class MultiplayerLobby {
     const share = Array.isArray(bridge.shareAddresses) ? bridge.shareAddresses : [];
     let hint;
     if (remote) {
-      hint = this.translate('online.server.remote', { address: remote });
+      hint = this.translate('online.server.remote', { address: this._displayAddress(remote) });
     } else if (share.length > 0) {
       hint = this.translate('online.server.share', {
         addresses: share.map((entry) => `${entry.host}:${entry.port}`).join(' / '),

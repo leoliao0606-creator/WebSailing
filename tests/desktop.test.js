@@ -4,9 +4,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import WebSocket from 'ws';
+
 import {
   DEFAULT_LAN_PORT,
   DesktopServer,
+  desktopAllowedOrigins,
   desktopServerConfig,
   lanAddresses,
   normalizeSignalingAddress,
@@ -16,6 +19,7 @@ import {
   DEFAULT_SETTINGS,
   loadDesktopSettings,
   sanitizeSettings,
+  visibleBounds,
   saveDesktopSettings,
   settingsPath,
 } from '../electron/desktopSettings.js';
@@ -38,18 +42,42 @@ async function withTempDir(run) {
   }
 }
 
+/** 发一次 WebSocket 握手，只看服务端给的状态码（101 = 放行）。 */
+function upgradeStatus(signalUrl, origin) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(signalUrl, { origin });
+    const done = (value) => { try { socket.close(); } catch { /* 已经断了 */ } resolve(value); };
+    socket.on('open', () => done(101));
+    socket.on('unexpected-response', (_request, response) => done(response.statusCode));
+    socket.on('error', reject);
+  });
+}
+
 test('desktopServerConfig keeps single-player traffic on the loopback interface', () => {
   const config = desktopServerConfig({ publicDir: '/tmp/dist' });
   assert.equal(config.host, '127.0.0.1');
   assert.equal(config.port, 0);
   assert.deepEqual(config.iceServers, []);
-  assert.deepEqual(config.allowedOrigins, []);
+  // 单机也必须给出白名单：signalingServer 把空数组当成「不检查 Origin」，
+  // 那样随便一个网页都能扫到这个端口并连上来。
+  assert.deepEqual(config.allowedOrigins, ['app://windchaser']);
 });
 
 test('desktopServerConfig binds every interface once LAN hosting is enabled', () => {
   const config = desktopServerConfig({ publicDir: '/tmp/dist', lanHosting: true });
   assert.equal(config.host, '0.0.0.0');
   assert.equal(config.port, DEFAULT_LAN_PORT);
+});
+
+test('the origin allowlist covers the desktop page and the LAN pages this server hands out', () => {
+  assert.deepEqual(desktopAllowedOrigins(), ['app://windchaser']);
+  const lan = desktopAllowedOrigins({ lanHosting: true, lanPort: 8787, addresses: ['192.168.1.20'] });
+  // 桌面访客的页面来自 app://，浏览器访客的页面由本服务在局域网地址上发出。
+  assert.ok(lan.includes('app://windchaser'));
+  assert.ok(lan.includes('http://192.168.1.20:8787'));
+  assert.ok(lan.includes('http://localhost:8787'));
+  // 端口不对（别的网站）一律不在名单里。
+  assert.ok(!lan.some((origin) => origin.endsWith(':443') || origin === 'https://example.com'));
 });
 
 test('desktopServerConfig rejects a missing public directory or bad port', () => {
@@ -92,6 +120,21 @@ test('normalizeSignalingAddress strips credentials, query and hash', () => {
     normalizeSignalingAddress('ws://user:secret@192.168.1.20:9000/signal?a=1#b'),
     'ws://192.168.1.20:9000/signal',
   );
+});
+
+test('an explicitly typed port survives, port 80 included', () => {
+  // WHATWG URL 会把协议默认端口抹掉，解析完 `:80` 和「没写端口」都是空串；
+  // 只看 parsed.port 会把玩家写死的 80 悄悄换成 8787，连到另一个服务上。
+  assert.equal(normalizeSignalingAddress('192.168.1.20:80'), 'ws://192.168.1.20/signal');
+  assert.equal(normalizeSignalingAddress('http://game.example.cn:80'), 'ws://game.example.cn/signal');
+  assert.equal(normalizeSignalingAddress('ws://[fd00::1]:80'), 'ws://[fd00::1]/signal');
+  // 没写端口才补默认值。
+  assert.equal(normalizeSignalingAddress('192.168.1.20'), 'ws://192.168.1.20:8787/signal');
+  // 复制出去的短写法再粘回来，仍然落在同一个端口上。
+  for (const typed of ['192.168.1.20:80', '192.168.1.20:8787', 'https://game.example.cn']) {
+    const url = normalizeSignalingAddress(typed);
+    assert.equal(normalizeSignalingAddress(shortSignalingAddress(url)), url);
+  }
 });
 
 test('normalizeSignalingAddress rejects empty and non-WebSocket addresses', () => {
@@ -181,6 +224,49 @@ test('DesktopServer falls back to loopback when the LAN port is taken', async ()
   await server.close();
 });
 
+test('the signaling endpoint turns away pages that are not the game', async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(path.join(dir, 'index.html'), '<!doctype html><title>WindChaser</title>');
+    const server = new DesktopServer({ publicDir: dir });
+    await server.start();
+    try {
+      // 桌面渲染进程的页面来自 app://，握手带的就是这个 Origin。
+      assert.equal(await upgradeStatus(server.clientSignalUrl, 'app://windchaser'), 101);
+      // 别的网站扫到这个回环端口也连不上——之前白名单是空的，等于不检查，
+      // 任意页面都能进来枚举房间或占满连接数。
+      assert.equal(await upgradeStatus(server.clientSignalUrl, 'https://example.com'), 403);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test('closing the server also clears the LAN-hosting flag it reports', async () => {
+  const server = new DesktopServer({
+    publicDir: '/tmp/dist',
+    createServer: async () => ({ port: 8787, close: async () => {} }),
+  });
+  await server.start({ lanHosting: true, lanPort: 8787 });
+  assert.equal(server.lanHosting, true);
+  await server.close();
+  // 关掉之后还报 lanHosting=true 的话，菜单会把「允许局域网加入」画成勾选、
+  // bootstrap 也会告诉页面正在主持，而实际上没有任何东西在监听。
+  assert.equal(server.lanHosting, false);
+  assert.equal(server.running, false);
+  assert.deepEqual(server.shareAddresses, []);
+});
+
+test('a failed start leaves the server stopped rather than half-hosting', async () => {
+  const server = new DesktopServer({
+    publicDir: '/tmp/dist',
+    createServer: async () => { throw new Error('EADDRINUSE'); },
+  });
+  await assert.rejects(server.start({ lanHosting: true, lanPort: 8787 }));
+  assert.equal(server.running, false);
+  assert.equal(server.lanHosting, false);
+  assert.equal(server.clientSignalUrl, null);
+});
+
 test('DesktopServer serves the built game and its own signaling endpoint', async () => {
   await withTempDir(async (dir) => {
     await writeFile(path.join(dir, 'index.html'), '<!doctype html><title>WindChaser</title>');
@@ -250,6 +336,23 @@ test('desktop settings survive a save/load round trip and tolerate a broken file
     assert.deepEqual(await loadDesktopSettings(dir), { ...DEFAULT_SETTINGS });
     assert.match(await readFile(settingsPath(dir), 'utf8'), /not json/);
   });
+});
+
+test('a window restored onto a monitor that is gone falls back to a centred one', () => {
+  const laptop = { x: 0, y: 0, width: 1920, height: 1080 };
+  const onLaptop = { x: 100, y: 80, width: 1600, height: 900 };
+  assert.deepEqual(visibleBounds(onLaptop, [laptop]), onLaptop);
+
+  // 存的是外接屏上的位置，显示器拔掉后这块坐标不再属于任何屏幕：保留尺寸、
+  // 丢掉坐标，否则窗口开在看不见的地方，玩家只能去手删配置文件。
+  const onExternal = { x: 2560, y: 200, width: 1600, height: 900 };
+  assert.deepEqual(visibleBounds(onExternal, [laptop]), { width: 1600, height: 900 });
+
+  // 只擦到屏幕一个角同样抓不住。
+  const corner = { x: 1900, y: 1060, width: 1600, height: 900 };
+  assert.deepEqual(visibleBounds(corner, [laptop]), { width: 1600, height: 900 });
+
+  assert.equal(visibleBounds(null, [laptop]), null);
 });
 
 test('resolveRendererFile maps app:// requests into the built renderer directory', () => {
@@ -405,6 +508,26 @@ test('a manual check reports being up to date, and failures only surface when ma
 
   const quiet = boxes.length;
   assert.equal(await updater.check(), null);
+  assert.equal(boxes.length, quiet);
+});
+
+test('a manual check in install mode says the download started, and reports its failure', async () => {
+  const { autoUpdater, boxes, updater } = updaterHarness('install');
+  autoUpdater.result = { isUpdateAvailable: true, updateInfo: { version: '0.2.0' } };
+  assert.equal(await updater.check({ manual: true }), '0.2.0');
+  // 下载在后台跑，重启提示要等 update-downloaded。中间一声不吭的话，玩家会
+  // 以为「检查更新」这个菜单项根本没反应。
+  assert.equal(boxes.length, 1);
+  assert.match(boxes[0].detail, /0\.2\.0/);
+
+  // 那次手动检查启动的下载失败了，必须有个交代。
+  await autoUpdater.emit('error', new Error('connection reset'));
+  assert.equal(boxes.at(-1).title, menuStrings('en').updateFailedTitle);
+  assert.match(boxes.at(-1).detail, /connection reset/);
+
+  // 之后的后台错误照旧咽掉，不打断航行。
+  const quiet = boxes.length;
+  await autoUpdater.emit('error', new Error('offline'));
   assert.equal(boxes.length, quiet);
 });
 

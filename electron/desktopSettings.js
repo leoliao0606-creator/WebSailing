@@ -5,13 +5,15 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { DEFAULT_LAN_PORT, normalizeSignalingAddress } from './localServer.js';
+// 直接取共用的纯字符串模块：从 localServer.js 转手会把 ws、node:http 和整套
+// 信令实现拖进启动路径，而这里只用到两个跟服务无关的常量/函数。
+import { DEFAULT_SIGNAL_PORT, normalizeSignalingAddress } from '../src/net/inviteCode.js';
 
 export const SETTINGS_FILE = 'desktop-settings.json';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   lanHosting: false,
-  lanPort: DEFAULT_LAN_PORT,
+  lanPort: DEFAULT_SIGNAL_PORT,
   remoteSignalingUrl: null,
   windowBounds: null,
   fullscreen: false,
@@ -55,6 +57,27 @@ export function sanitizeSettings(raw) {
     windowBounds: sanitizeBounds(source.windowBounds ?? null),
     fullscreen: source.fullscreen === true,
   };
+}
+
+/**
+ * 把存下来的窗口几何裁到「至少有一块看得见」。
+ *
+ * 位置可能来自一台已经拔掉的外接显示器（x=2560 之类）。窗口开在所有屏幕之外
+ * 就等于既看不见也拖不回来，只能手删配置文件；这种情况丢掉坐标、保留尺寸，
+ * 交给 Electron 居中。workAreas 由调用方从 screen.getAllDisplays() 取，
+ * 这样这段判断不依赖 Electron，能单测。
+ */
+export function visibleBounds(bounds, workAreas = []) {
+  if (bounds === null || typeof bounds !== 'object') return null;
+  const fits = workAreas.some((area) => {
+    const overlapX = Math.min(bounds.x + bounds.width, area.x + area.width)
+      - Math.max(bounds.x, area.x);
+    const overlapY = Math.min(bounds.y + bounds.height, area.y + area.height)
+      - Math.max(bounds.y, area.y);
+    // 要露出抓得住的一块标题栏，只擦到一个角不算「看得见」。
+    return overlapX >= 120 && overlapY >= 40;
+  });
+  return fits ? bounds : { width: bounds.width, height: bounds.height };
 }
 
 export function settingsPath(userDataDir) {

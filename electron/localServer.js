@@ -8,6 +8,7 @@
 import os from 'node:os';
 
 import { DEFAULT_SIGNAL_PORT, normalizeSignalingAddress } from '../src/net/inviteCode.js';
+import { APP_ORIGIN } from './rendererFiles.js';
 import { createSignalingServer } from '../server/signalingServer.js';
 
 export const LOOPBACK_HOST = '127.0.0.1';
@@ -22,12 +23,53 @@ export { normalizeSignalingAddress };
 const DESKTOP_ICE_SERVERS = Object.freeze([]);
 
 /**
+ * 信令服务的 Origin 白名单。
+ *
+ * 必须给出非空列表：signalingServer 把空数组当成「不检查 Origin」，那样任何
+ * 网页都能对本机这个端口发起 WebSocket 握手（端口是内核随机分的，但可以扫），
+ * 进而枚举房间或占满连接数。桌面渲染进程的页面来自 app://，握手会带上
+ * `app://windchaser`；开局域网主持时，浏览器访客的页面由本服务自己发出，
+ * Origin 就是 `http://<主机地址>:<端口>`，这里把局域网 IP、回环和本机主机名
+ * 都列上。用别的别名（自定义 hosts 之类）访问会被 403，改用分享出去的地址即可。
+ */
+export function desktopAllowedOrigins({
+  lanHosting = false,
+  lanPort = DEFAULT_LAN_PORT,
+  addresses = undefined,
+} = {}) {
+  const origins = [APP_ORIGIN];
+  if (!lanHosting) return origins;
+  const hostname = safeHostname();
+  const hosts = [
+    ...(addresses ?? lanAddresses()),
+    LOOPBACK_HOST,
+    'localhost',
+    ...(hostname ? [hostname, `${hostname}.local`] : []),
+  ];
+  for (const host of hosts) {
+    const origin = `http://${bracket(host)}:${lanPort}`;
+    if (!origins.includes(origin)) origins.push(origin);
+  }
+  return origins;
+}
+
+function safeHostname() {
+  try {
+    const name = os.hostname();
+    return typeof name === 'string' && name !== '' ? name.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 把「允许局域网加入」开关翻译成 createSignalingServer 的监听参数。
  */
 export function desktopServerConfig({
   publicDir,
   lanHosting = false,
   lanPort = DEFAULT_LAN_PORT,
+  addresses = undefined,
 } = {}) {
   if (typeof publicDir !== 'string' || publicDir === '') {
     throw new TypeError('publicDir must be a non-empty string');
@@ -42,9 +84,7 @@ export function desktopServerConfig({
     port: lanHosting ? lanPort : 0,
     publicDir,
     iceServers: DESKTOP_ICE_SERVERS,
-    // 桌面版访客的页面来自 app://，主持端浏览器访客来自 http://<局域网地址>，
-    // 两者 Origin 都不固定，因此这里不做 Origin 白名单（仅监听回环或局域网）。
-    allowedOrigins: [],
+    allowedOrigins: desktopAllowedOrigins({ lanHosting, lanPort, addresses }),
   };
 }
 
@@ -127,6 +167,8 @@ export class DesktopServer {
 
   async start({ lanHosting = false, lanPort = DEFAULT_LAN_PORT } = {}) {
     const config = desktopServerConfig({ publicDir: this.#publicDir, lanHosting, lanPort });
+    // close() 会把 lanHosting 归位，createServer 抛出时状态停在「没在跑」，
+    // 不会留下「服务已关闭但 lanHosting 仍报 true」这种自相矛盾的组合。
     await this.close();
     this.#instance = await this.#createServer(config);
     this.#lanHosting = lanHosting;
@@ -149,6 +191,7 @@ export class DesktopServer {
   async close() {
     const instance = this.#instance;
     this.#instance = null;
+    this.#lanHosting = false;
     if (instance) await instance.close();
   }
 }

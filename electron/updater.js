@@ -57,14 +57,33 @@ export function createUpdater({
 
   autoUpdater.autoDownload = mode === 'install';
   autoUpdater.autoInstallOnAppQuit = mode === 'install';
-  // 更新出错不该打断航行；只有玩家手动检查时才把失败说出来。
-  autoUpdater.on('error', () => {});
-
   let announcedVersion = null;
+  let reportErrors = false;
+
+  function report({ type, title, detail }) {
+    dialog.showMessageBox({ type, title, message: title, detail }).catch(() => {});
+  }
+
+  function reportFailure(error) {
+    report({
+      type: 'warning',
+      title: strings.updateFailedTitle,
+      detail: String(error?.message ?? error),
+    });
+  }
+
+  // 更新出错不该打断航行：后台检查失败一律咽掉。但玩家手动点过「检查更新」、
+  // 下载已经在后台跑起来之后，再失败就必须说出来，否则那次点击永远没有下文。
+  autoUpdater.on('error', (error) => {
+    if (!reportErrors) return;
+    reportErrors = false;
+    reportFailure(error);
+  });
 
   async function announce(version) {
     if (announcedVersion === version) return;
     announcedVersion = version;
+    reportErrors = false;
     const notifyOnly = mode === 'notify';
     const answer = await dialog.showMessageBox({
       type: 'info',
@@ -91,25 +110,31 @@ export function createUpdater({
     if (manual) announcedVersion = null;
     try {
       const result = await autoUpdater.checkForUpdates();
-      if (result?.isUpdateAvailable === true) return result?.updateInfo?.version ?? null;
+      if (result?.isUpdateAvailable === true) {
+        const version = result?.updateInfo?.version ?? null;
+        // install 模式的下载在后台跑，提示要等 update-downloaded 才弹。手动检查
+        // 时中间这段一声不吭，玩家会以为菜单项没反应，所以先回一句「正在下载」，
+        // 并打开错误上报，让这次下载万一失败也有交代。
+        if (manual && mode === 'install') {
+          reportErrors = true;
+          report({
+            type: 'info',
+            title: strings.updateFoundTitle,
+            detail: format(strings.updateDownloadingBody, { version }),
+          });
+        }
+        return version;
+      }
       if (manual) {
-        dialog.showMessageBox({
+        report({
           type: 'info',
           title: strings.updateNoneTitle,
-          message: strings.updateNoneTitle,
           detail: format(strings.updateNoneBody, { version: currentVersion }),
-        }).catch(() => {});
+        });
       }
       return null;
     } catch (error) {
-      if (manual) {
-        dialog.showMessageBox({
-          type: 'warning',
-          title: strings.updateFailedTitle,
-          message: strings.updateFailedTitle,
-          detail: String(error?.message ?? error),
-        }).catch(() => {});
-      }
+      if (manual) reportFailure(error);
       return null;
     }
   }

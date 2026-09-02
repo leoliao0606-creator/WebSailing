@@ -14,9 +14,11 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TIMEOUT_MS = 90_000;
 
-async function exists(file) {
+// mode 分开传：可执行文件查 X_OK，构建产物（dist/index.html 这种 644 的数据文件）
+// 只能查 F_OK——之前一律用 X_OK，对 index.html 永远为假，那半个判断等于没写。
+async function exists(file, mode = constants.F_OK) {
   try {
-    await access(file, constants.X_OK);
+    await access(file, mode);
     return true;
   } catch {
     return false;
@@ -34,13 +36,14 @@ const binArg = process.argv.find((arg) => arg.startsWith('--bin='))?.slice('--bi
 const electronBin = binArg
   ? path.resolve(ROOT, binArg)
   : path.join(ROOT, 'node_modules', '.bin', 'electron');
-if (!await exists(electronBin)) {
+if (!await exists(electronBin, constants.X_OK)) {
   fail(binArg ? `${electronBin} is not executable` : 'electron is not installed; run npm install first');
   process.exit(1);
 }
-if (!await exists(path.join(ROOT, 'dist', 'index.html')).catch(() => false)
-  && !await exists(path.join(ROOT, 'dist'))) {
-  fail('dist/ is missing; run npm run build first');
+// 只认 index.html：dist/ 目录还在但内容被清掉（构建中断、手动删文件）是真会发生的，
+// 之前的「两个都不存在才报错」会放行，然后在 Electron 里以一句 did-fail-load 收场。
+if (!await exists(path.join(ROOT, 'dist', 'index.html'))) {
+  fail('dist/index.html is missing; run npm run build first');
   process.exit(1);
 }
 
