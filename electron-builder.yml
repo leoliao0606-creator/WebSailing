@@ -1,0 +1,68 @@
+# 桌面版打包配置。产物写入 release/，不签名也能在本机安装运行；
+# 要对外分发请自行配置签名/公证（macOS 见 CSC_LINK/APPLE_ID,Windows 见 CSC_LINK）。
+appId: dev.windchaser.game
+productName: WindChaser
+copyright: WindChaser contributors
+
+directories:
+  buildResources: assets
+  output: release
+
+# 只打包运行期真正需要的东西：主进程、信令服务、共享协议模块，以及 ws。
+# src/net/ 整目录随包：server/ 依赖 protocol.js，而它又依赖同目录的 worldState.js。
+# three 已经被 Vite 打进 dist/，不必再随 node_modules 复制一份。
+files:
+  - electron/**/*
+  - server/**/*
+  - src/net/**/*
+  - package.json
+  - node_modules/ws/**/*
+  - '!node_modules/three/**/*'
+
+# dist/ 放在 resources/dist（不进 asar）:app:// 与局域网静态服务都按普通目录读取。
+extraResources:
+  - from: dist
+    to: dist
+    filter:
+      - '**/*'
+
+asar: true
+npmRebuild: false          # 没有原生模块,跳过重编译
+
+mac:
+  category: public.app-category.games
+  icon: assets/icon.png
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+
+win:
+  icon: assets/icon.png
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  icon: assets/icon.png
+  category: Game
+  # 让运行中的窗口与 .desktop 条目关联（任务栏图标/名称）
+  syncDesktopName: true
+  synopsis: 3D dinghy sailing simulator
+  # deb 需要 "Name <email>" 形式的维护者；对外分发前请替换成真实联系方式。
+  maintainer: WindChaser <windchaser@example.invalid>
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64]
+    - target: tar.gz
+      arch: [x64, arm64]

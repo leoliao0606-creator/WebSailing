@@ -4,6 +4,7 @@ import {
   MultiplayerSession,
   leaveOrCloseMultiplayer,
 } from '../net/multiplayerSession.js';
+import { desktopBridge, desktopSignalingUrl } from '../net/desktopBridge.js';
 import { PeerTransport } from '../net/peerTransport.js';
 import { normalizeNickname, normalizeRoomCode } from '../net/protocol.js';
 import { SignalingClient } from '../net/signalingClient.js';
@@ -20,7 +21,8 @@ const DEFINITIVE_LOCK_ERRORS = [
 ];
 
 function defaultStackFactory() {
-  const signaling = new SignalingClient();
+  // 桌面版连内置或局域网房主的信令服务；网页版 url 为 undefined，走同源 /signal。
+  const signaling = new SignalingClient({ url: desktopSignalingUrl() });
   const transport = new PeerTransport({ signaling });
   const session = new MultiplayerSession({
     signaling,
@@ -156,6 +158,7 @@ export class MultiplayerLobby {
     showScreen,
     createStack = defaultStackFactory,
     createChatPanel = (options) => new ChatPanel(options),
+    desktop = desktopBridge(),
     random = Math.random,
     now = Date.now,
     translate = t,
@@ -180,6 +183,7 @@ export class MultiplayerLobby {
     this.showScreen = showScreen;
     this.createStack = createStack;
     this.createChatPanel = createChatPanel;
+    this.desktop = desktop ?? null;
     this.random = random;
     this.now = now;
     this.translate = translate;
@@ -902,8 +906,104 @@ export class MultiplayerLobby {
       makeLabel(documentRef, this.translate('online.code'), this.codeInput),
       this.joinButton,
     );
-    screen.append(title, form, this.onlineStatus, back);
+    const serverRow = this._buildServerRow();
+    screen.append(title, form, ...(serverRow ? [serverRow] : []), this.onlineStatus, back);
     this.onlineScreen = screen;
+  }
+
+  /**
+   * 桌面版专属：选择连本机内置信令服务，还是同一局域网里房主的机器。
+   * 网页版没有 window.windchaser，这一行不渲染，页面与之前完全一致。
+   */
+  _buildServerRow() {
+    this.serverInput = null;
+    this.serverApplyButton = null;
+    this.serverResetButton = null;
+    this.serverHint = null;
+    if (!this.desktop || typeof this.desktop.setServerAddress !== 'function') return null;
+
+    const documentRef = this.document;
+    const row = setTestId(documentRef.createElement('div'), 'multiplayer-server-row');
+    row.classList.add('online-server-row');
+
+    this.serverInput = setTestId(documentRef.createElement('input'), 'multiplayer-server-address');
+    this.serverInput.type = 'text';
+    this.serverInput.maxLength = 120;
+    this.serverInput.setAttribute('autocomplete', 'off');
+    this.serverInput.setAttribute('aria-label', this.translate('online.server.label'));
+    this.serverInput.placeholder = this.translate('online.server.placeholder');
+    this.serverInput.value = typeof this.desktop.remoteAddress === 'string'
+      ? this.desktop.remoteAddress
+      : '';
+    this.serverInput.addEventListener('keydown', (event) => {
+      event.stopPropagation();
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        void this.applyServerAddress();
+      }
+    });
+
+    this.serverApplyButton = makeButton(
+      documentRef,
+      'multiplayer-server-apply',
+      this.translate('online.server.apply'),
+    );
+    this.serverApplyButton.addEventListener('click', () => { void this.applyServerAddress(); });
+    this.serverResetButton = makeButton(
+      documentRef,
+      'multiplayer-server-reset',
+      this.translate('online.server.reset'),
+    );
+    this.serverResetButton.addEventListener('click', () => { void this.applyServerAddress(''); });
+
+    this.serverHint = setTestId(documentRef.createElement('div'), 'multiplayer-server-hint');
+    this.serverHint.classList.add('online-server-hint');
+
+    row.append(
+      makeLabel(documentRef, this.translate('online.server.label'), this.serverInput),
+      this.serverApplyButton,
+      this.serverResetButton,
+      this.serverHint,
+    );
+    return row;
+  }
+
+  /**
+   * 切换信令服务。主进程持久化后会重新载入窗口，因此这里不必自己重建连接。
+   */
+  async applyServerAddress(address = this.serverInput?.value ?? '') {
+    if (!this.desktop || typeof this.desktop.setServerAddress !== 'function') return false;
+    try {
+      await this.desktop.setServerAddress(address);
+      return true;
+    } catch {
+      this.statusKey = 'online.error.serverAddress';
+      this._render();
+      return false;
+    }
+  }
+
+  _renderServerRow() {
+    if (!this.serverHint) return;
+    const bridge = this.desktop;
+    const remote = typeof bridge.remoteAddress === 'string' && bridge.remoteAddress !== ''
+      ? bridge.remoteAddress
+      : null;
+    const share = Array.isArray(bridge.shareAddresses) ? bridge.shareAddresses : [];
+    let hint;
+    if (remote) {
+      hint = this.translate('online.server.remote', { address: remote });
+    } else if (share.length > 0) {
+      hint = this.translate('online.server.share', {
+        addresses: share.map((entry) => `${entry.host}:${entry.port}`).join(' / '),
+      });
+    } else {
+      hint = this.translate('online.server.lanOff');
+    }
+    this.serverHint.textContent = hint;
+    this.serverInput.disabled = this.roomCommandPending;
+    this.serverApplyButton.disabled = this.roomCommandPending;
+    this.serverResetButton.disabled = this.roomCommandPending || remote === null;
   }
 
   _buildLobbyScreen() {
@@ -954,6 +1054,7 @@ export class MultiplayerLobby {
     this.joinButton.disabled = this.roomCommandPending;
     this.nicknameInput.disabled = this.roomCommandPending;
     this.codeInput.disabled = this.roomCommandPending;
+    this._renderServerRow();
     this._renderMembers(state);
     const local = state.members.find((member) => member.playerId === state.playerId);
     this.readyButton.textContent = this.translate(local?.ready ? 'lobby.unready' : 'lobby.ready');

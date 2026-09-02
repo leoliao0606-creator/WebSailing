@@ -1,6 +1,6 @@
 # 逐风 WindChaser · 3D 稳向板帆船模拟
 
-一款跑在浏览器里的硬核拟真稳向板帆船（ILCA/Laser 级）游戏。
+一款硬核拟真的稳向板帆船（ILCA/Laser 级）游戏，可以**在浏览器里跑，也可以装成 macOS / Windows / Linux 的本地桌面程序**。
 纯 Three.js + 自研帆船动力学，无任何外部美术/音频素材 —— 船体、帆、水面、岛屿、音效全部程序化生成。
 
 ![模式] 自由航行 · 绕标计时赛（含幽灵船） · AI 对手竞速 · 2–8 人私人联机绕标赛 · 交互式新手教学（10 课）
@@ -15,13 +15,18 @@
 npm install
 ```
 
-需要支持 WebGL2 的现代浏览器（Chrome / Edge / Firefox / Safari 16+）。
+网页版需要支持 WebGL2 的现代浏览器（Chrome / Edge / Firefox / Safari 16+）；
+桌面版自带 Chromium，不依赖系统浏览器，详见 [桌面版（macOS / Windows / Linux）](#桌面版macos--windows--linux)。
 
 | 命令 | 用途 |
 | --- | --- |
 | `npm run dev` | Vite 开发服务器，默认 `http://localhost:5173`，并代理 `/signal` |
 | `npm run build` | 构建 `dist/` 静态站点 |
 | `npm run preview` | 仅预览构建产物，默认 `http://localhost:4173` |
+| `npm run desktop` | 构建后用 Electron 打开桌面版（本机开发用） |
+| `npm run dist` | 为当前系统打包桌面安装包，产物在 `release/` |
+| `npm run dist:mac` / `dist:win` / `dist:linux` | 为指定平台打包 |
+| `npm run test:desktop` | 桌面壳冒烟检查（起真实 Electron 进程） |
 | `npm run signal` | 启动信令及静态文件服务，默认 `http://localhost:8787` |
 | `npm run serve` | `npm run signal` 的部署别名 |
 | `npm test` / `npm run test:unit` | 运行 Node 单元及集成测试 |
@@ -37,6 +42,77 @@ npx playwright install chromium
 `npm run test:multiplayer` 会自行启动临时 Vite/信令服务和三个隔离的浏览器上下文，无需先手动启动服务。测试会关闭原房主，并验证新房主与另一名幸存访客在 5 秒内继续同步。CI 若使用系统 Chromium，可通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定其可执行文件。
 
 详细覆盖范围、实测结果和仍未验证的边界见 [私人多人绕标赛验证记录](docs/multiplayer-verification.md)。
+
+## 桌面版（macOS / Windows / Linux）
+
+桌面版和网页版是同一份代码，不存在第二套实现：`src/` 仍由 Vite 构建成 `dist/`，`server/` 的信令服务原样复用，Electron 只是把「静态站点 + 信令进程 + 浏览器」装进一个可执行文件。
+
+```bash
+npm install
+npm run desktop      # 构建 dist/ 并直接打开桌面版
+npm run dist         # 为当前系统打包安装包到 release/
+```
+
+`npm run dist` 的默认产物：
+
+| 平台 | 产物 |
+| --- | --- |
+| macOS | `.dmg` 与 `.zip`（arm64 + x64） |
+| Windows | NSIS 安装包（x64 + arm64）与免安装 `.exe`（x64） |
+| Linux | `.AppImage`（x64 + arm64）、`.deb`（x64）、`.tar.gz`（x64 + arm64） |
+
+打包配置在 `electron-builder.yml`。electron-builder 只能在对应平台上产出该平台的安装包（macOS 包需要 macOS 机器），交叉打包请用各平台的 CI runner。默认**不做代码签名**：本机安装可用，但 macOS 首次打开需右键「打开」绕过 Gatekeeper，Windows 会弹 SmartScreen 提示。对外分发时通过 `CSC_LINK` / `CSC_KEY_PASSWORD`（以及 macOS 的 `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD`）配置签名与公证；`electron-builder.yml` 里的 `linux.maintainer` 也要换成真实联系方式。
+
+### 桌面版的三点结构差异
+
+- **页面来源固定为 `app://windchaser`**，由自定义协议直接读取打包进去的 `dist/`。这样 `localStorage` 里的最佳成绩、幽灵船和画质设置不会因为本机端口变化而丢失 —— 若改用 `http://127.0.0.1:<随机端口>`，每次换端口都相当于换了一个站点，存档全部清零。
+- **信令服务跑在主进程内**，单机时只监听回环、端口交给内核分配；页面地址由 preload 注入的 `window.windchaser.signalingUrl` 提供，而不是网页版的同源 `/signal`。
+- **窗口失焦不降频**（`backgroundThrottling: false`）：航行是连续物理仿真，浏览器默认的后台降频会让联机状态跑飞。
+
+渲染进程仍按 Electron 推荐姿势收紧：`contextIsolation` + `sandbox` 打开、`nodeIntegration` 关闭，preload 只暴露信令地址与切换主机这几个动作，外链一律交给系统浏览器。
+
+### 局域网联机
+
+桌面版之间不需要任何公网服务，同一个 Wi‑Fi/局域网就能开房：
+
+1. **房主**：菜单栏 →「联机」→ 勾选「允许局域网加入」。服务改为监听所有网卡的 `8787` 端口；再点「显示本机局域网地址」拿到形如 `192.168.1.20:8787` 的地址。
+2. **其他玩家**：进入「多人联机」页面，在「联机服务器」里填房主念的地址（`192.168.1.20` 或 `192.168.1.20:8787` 都可以），点「连接」，窗口会重载并连到房主的信令服务。
+3. 之后照常创建/加入六位房间码房间。想改回单机，点「用本机」或菜单里的「使用本机服务」。
+
+没装桌面版的队友也可以直接用浏览器打开 `http://192.168.1.20:8787/` —— 房主的进程同时提供构建好的静态站点。
+
+局域网内 WebRTC 靠 host 候选直连，因此桌面版默认不配置 STUN/TURN。**跨公网联机仍然要用 README「联机部署」里的自建信令服务**：把地址填进「联机服务器」即可（`wss://game.example.cn` 这类写法会被识别为 `wss://game.example.cn/signal`）。
+
+开启局域网主持等于把游戏静态站点和信令服务暴露给同网段的所有人；房间码之外没有额外鉴权，公共 Wi‑Fi 下用完请关掉。若 `8787` 已被占用，启动时会提示并退回仅本机可用。
+
+### 存档与配置位置
+
+游戏内设置、最佳成绩和幽灵船仍走 `localStorage`，随 Electron 的用户数据目录走：
+
+| 平台 | 路径 |
+| --- | --- |
+| macOS | `~/Library/Application Support/windchaser/` |
+| Windows | `%APPDATA%\windchaser\` |
+| Linux | `~/.config/windchaser/` |
+
+窗口大小、局域网主持开关和已填写的服务器地址另存在同一目录下的 `desktop-settings.json`（这些在渲染进程启动前就要用到，放不进 `localStorage`）。文件损坏时会静默退回默认值，不会导致启动失败。
+
+想在同一台机器上开两个客户端自测联机，用 `WINDCHASER_USER_DATA` 指定各自独立的数据目录，它同时会跳过单实例锁：
+
+```bash
+WINDCHASER_USER_DATA=/tmp/wc-a npm run desktop:run
+WINDCHASER_USER_DATA=/tmp/wc-b npm run desktop:run
+```
+
+### 桌面壳回归
+
+```bash
+npm run test:desktop            # 起真实 Electron 进程做冒烟检查
+node tools/test-desktop.mjs --lan               # 额外验证局域网监听这条路
+node tools/test-desktop.mjs --bin=release/linux-unpacked/windchaser   # 对打包产物跑同一套检查
+```
+
+检查项：`app://` 能加载构建产物、渲染进程拿到 WebGL2 上下文与 `RTCPeerConnection`、preload 注入的地址指向真正在监听的本机信令服务、`localStorage` 可写。无显示环境会自动套 `xvfb-run` 并退回 SwiftShader 软件光栅。`--bin` 那条尤其重要：它挡住「开发模式能跑、装完打不开」这类打包漏文件的问题。
 
 ## 本地 2–8 人私人联机
 
@@ -139,6 +215,7 @@ ICE_SERVERS_JSON='[{"urls":"stun:stun.game.example.cn:3478"},{"urls":["turn:turn
 - 临时昵称不是身份认证。聊天不做内容过滤，支持任意 Unicode，最多 500 个 Unicode 字符，并以每位玩家每 5 秒最多 5 条限流；玩家可在本地静音。没有举报、审核或持久化聊天记录，其他玩家仍可自行保存内容。信令连接默认每秒 120 条/256 KiB，且 SDP/ICE 分别限制为 48 KiB/4 KiB；每个 WebRTC 对端默认每秒 120 条/512 KiB。超限只断开违规端，连接、来源地址和房间另有硬容量上限。
 - 恢复令牌存入当前标签页的 `sessionStorage`。只在 HTTPS/WSS 下部署、限制脚本来源并避免把令牌写入日志。
 - 当前只实现 2–8 人私人绕标赛。公开匹配、联机自由巡航、排位和可验证的专用权威服务器不在这一版中。
+- 桌面版开启「允许局域网加入」后，静态站点和信令服务会暴露给同网段的所有人，除房间码外没有额外鉴权；桌面版默认不做代码签名与自动更新。上面这些浏览器侧的限制（房主权威、迁移边界、IP 暴露、聊天无审核）在桌面版同样成立。
 
 ## 操作
 
@@ -209,9 +286,18 @@ server/
   index.js              环境配置与服务入口
   signalingServer.js    静态文件、健康检查、WebSocket 信令与房主迁移协调
   roomRegistry.js       进程内房间、座位租约与 host epoch
+electron/
+  main.js               桌面版主进程：窗口、原生菜单、app:// 协议、IPC
+  localServer.js        进程内信令服务的监听策略与局域网地址规范化
+  desktopSettings.js    窗口几何 / 局域网开关 / 服务器地址的持久化
+  rendererFiles.js      app:// 到 dist/ 的路径解析（含越权防护）
+  menuStrings.js        原生菜单的中/英/日文案
+  preload.cjs           向页面暴露 window.windchaser 的最小桥接
 tools/
   polar.js    极曲线与物理自检（node）
+  make-icon.mjs          程序化生成应用图标 assets/icon.png
   test-multiplayer.mjs   Playwright 三浏览器联机与房主迁移回归
+  test-desktop.mjs       桌面壳冒烟检查（真实 Electron 进程）
 ```
 
 ## 画质与性能

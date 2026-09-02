@@ -366,7 +366,7 @@ function sessionState(overrides = {}) {
   };
 }
 
-function harness() {
+function harness({ desktop = null } = {}) {
   const documentRef = new FakeDocument();
   const root = documentRef.createElement('div');
   root.id = 'menus';
@@ -396,6 +396,7 @@ function harness() {
     },
     random: () => 0.5,
     now: () => 1_234,
+    desktop,
   });
   lobby.mount(root);
   return {
@@ -1213,4 +1214,84 @@ test('multiplayer results hide the unsupported restart action while offline resu
   } finally {
     globalThis.document = previousDocument;
   }
+});
+
+function fakeDesktop(overrides = {}) {
+  const calls = [];
+  return {
+    desktop: true,
+    platform: 'linux',
+    signalingUrl: 'ws://127.0.0.1:54321/signal',
+    serverMode: 'local',
+    remoteAddress: null,
+    lanHosting: false,
+    shareAddresses: [],
+    setServerAddress(address) { calls.push(address); return Promise.resolve({}); },
+    calls,
+    ...overrides,
+  };
+}
+
+test('web build renders no desktop server row', () => {
+  const { root } = harness();
+  assert.equal(root.querySelector('[data-testid="multiplayer-server-row"]'), null);
+});
+
+test('desktop build offers a server address field and reports the built-in server', () => {
+  const desktop = fakeDesktop();
+  const { root } = harness({ desktop });
+  assert.notEqual(root.querySelector('[data-testid="multiplayer-server-row"]'), null);
+  const hint = root.querySelector('[data-testid="multiplayer-server-hint"]');
+  assert.equal(hint.textContent, t('online.server.lanOff'));
+  assert.equal(root.querySelector('[data-testid="multiplayer-server-reset"]').disabled, true);
+});
+
+test('desktop hint lists the shareable address while hosting on the LAN', () => {
+  const desktop = fakeDesktop({
+    lanHosting: true,
+    shareAddresses: [{ host: '192.168.1.20', port: 8787, pageUrl: 'http://192.168.1.20:8787/' }],
+  });
+  const { root } = harness({ desktop });
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-server-hint"]').textContent,
+    t('online.server.share', { addresses: '192.168.1.20:8787' }),
+  );
+});
+
+test('desktop hint names the remote host once one is joined', () => {
+  const desktop = fakeDesktop({
+    serverMode: 'remote',
+    remoteAddress: 'ws://192.168.1.20:8787/signal',
+    signalingUrl: 'ws://192.168.1.20:8787/signal',
+  });
+  const { root } = harness({ desktop });
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-server-address"]').value,
+    'ws://192.168.1.20:8787/signal',
+  );
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-server-hint"]').textContent,
+    t('online.server.remote', { address: 'ws://192.168.1.20:8787/signal' }),
+  );
+  assert.equal(root.querySelector('[data-testid="multiplayer-server-reset"]').disabled, false);
+});
+
+test('applying a server address hands the raw input to the desktop bridge', async () => {
+  const desktop = fakeDesktop();
+  const { lobby, root } = harness({ desktop });
+  root.querySelector('[data-testid="multiplayer-server-address"]').value = ' 192.168.1.20 ';
+  assert.equal(await lobby.applyServerAddress(), true);
+  assert.deepEqual(desktop.calls, [' 192.168.1.20 ']);
+  assert.equal(await lobby.applyServerAddress(''), true);
+  assert.deepEqual(desktop.calls, [' 192.168.1.20 ', '']);
+});
+
+test('a rejected server address surfaces an error instead of throwing', async () => {
+  const desktop = fakeDesktop({ setServerAddress: () => Promise.reject(new TypeError('bad address')) });
+  const { lobby, root } = harness({ desktop });
+  assert.equal(await lobby.applyServerAddress('nope://x'), false);
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-status"]').textContent,
+    t('online.error.serverAddress'),
+  );
 });

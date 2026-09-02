@@ -22,6 +22,25 @@ jobs:
           node tools/polar.js 25
       - run: npm run build
 
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # 无 GPU/无显示：tools/test-desktop.mjs 自动套 xvfb-run 并退回 SwiftShader
+      - name: 桌面壳冒烟(开发模式)
+        run: node tools/test-desktop.mjs
+      - name: 打包未压缩产物
+        run: npx electron-builder --linux dir --publish never
+      # 用同一套检查跑打包产物，挡住「开发能跑、装完打不开」的漏文件问题
+      - name: 桌面壳冒烟(打包产物)
+        run: node tools/test-desktop.mjs --bin=release/linux-unpacked/windchaser
+
   multiplayer:
     runs-on: ubuntu-latest
     continue-on-error: true

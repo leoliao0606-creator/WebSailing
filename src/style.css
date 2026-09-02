@@ -152,6 +152,23 @@ table.results tr.me td { color: var(--gold); font-weight: 700; }
   border-radius: 10px; padding: 11px 13px; user-select: text; text-transform: none;
 }
 .online-form input:focus { outline: 2px solid rgba(57,198,192,0.45); border-color: var(--accent); }
+/* 桌面版专属：选择本机内置信令服务还是局域网房主 */
+.online-server-row {
+  display: grid; grid-template-columns: minmax(220px, 340px) auto auto;
+  gap: 10px 12px; width: min(560px, 92vw); align-items: end; margin-top: 14px;
+}
+.online-server-row label { display: flex; flex-direction: column; gap: 7px; color: #cfdde6; font-size: 14px; }
+.online-server-row input {
+  width: 100%; min-width: 0; font: inherit; font-size: 15px; color: var(--ink);
+  background: rgba(12,30,43,0.9); border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 10px; padding: 9px 12px; user-select: text; text-transform: none;
+}
+.online-server-row input:focus { outline: 2px solid rgba(57,198,192,0.45); border-color: var(--accent); }
+.online-server-row button { padding: 9px 14px; font-size: 14px; border-radius: 9px; }
+.online-server-hint {
+  grid-column: 1 / -1; color: #8fa8b6; font-size: 12px; line-height: 1.5; user-select: text;
+}
+
 .online-status, .lobby-status {
   min-height: 22px; margin-top: 14px; max-width: min(680px, 90vw);
   color: #b7ccd7; font-size: 13px; line-height: 1.5; text-align: center;
@@ -237,6 +254,8 @@ table.results tr.me td { color: var(--gold); font-weight: 700; }
 @media (max-width: 720px) {
   .online-form { grid-template-columns: 1fr; max-height: 66vh; overflow-y: auto; padding: 2px; }
   .online-form button { width: 100%; }
+  .online-server-row { grid-template-columns: 1fr; }
+  .online-server-row button { width: 100%; }
   .lobby-members { max-height: 42vh; }
   .lobby-member { align-items: flex-start; flex-direction: column; gap: 4px; }
   .lobby-member-badges { text-align: left; }
