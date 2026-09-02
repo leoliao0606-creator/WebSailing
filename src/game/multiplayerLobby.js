@@ -5,12 +5,19 @@ import {
   leaveOrCloseMultiplayer,
 } from '../net/multiplayerSession.js';
 import { desktopBridge, desktopSignalingUrl } from '../net/desktopBridge.js';
+import {
+  formatInviteCode,
+  normalizeSignalingAddress,
+  parseInviteCode,
+} from '../net/inviteCode.js';
 import { PeerTransport } from '../net/peerTransport.js';
 import { normalizeNickname, normalizeRoomCode } from '../net/protocol.js';
 import { SignalingClient } from '../net/signalingClient.js';
 import { ChatPanel } from './chatPanel.js';
 
 export const NICKNAME_STORAGE_KEY = 'windchaser.multiplayer.nickname.v1';
+// 换服务器要重载窗口，房间码得跨这一次重载活下来；sessionStorage 正好只活在本标签页。
+export const PENDING_ROOM_STORAGE_KEY = 'windchaser.multiplayer.pendingRoom.v1';
 const MAX_PLAYERS = 8;
 const MAX_LOCKED_START_ATTEMPTS = 3;
 const DEFINITIVE_LOCK_ERRORS = [
@@ -222,6 +229,7 @@ export class MultiplayerLobby {
     this._buildOnlineScreen();
     this._buildLobbyScreen();
     root.append(this.onlineScreen, this.lobbyScreen);
+    if (this.desktop) this._consumePendingRoom();
     this._render();
     this.chatPanel?.refreshLanguage?.();
     return this;
@@ -932,6 +940,7 @@ export class MultiplayerLobby {
     this.serverInput.setAttribute('autocomplete', 'off');
     this.serverInput.setAttribute('aria-label', this.translate('online.server.label'));
     this.serverInput.placeholder = this.translate('online.server.placeholder');
+    this.serverInput.setAttribute('title', this.translate('online.server.hint'));
     this.serverInput.value = typeof this.desktop.remoteAddress === 'string'
       ? this.desktop.remoteAddress
       : '';
@@ -969,15 +978,129 @@ export class MultiplayerLobby {
   }
 
   /**
-   * 切换信令服务。主进程持久化后会重新载入窗口，因此这里不必自己重建连接。
+   * 切换信令服务。输入可以是纯地址，也可以是整串邀请码（`地址#房间码`）：
+   * 房间码会先寄存到 sessionStorage，等主进程重载窗口后自动填回房间码输入框。
+   * 地址和当前用的一致时不重载，直接把房间码填上就行。
    */
   async applyServerAddress(address = this.serverInput?.value ?? '') {
     if (!this.desktop || typeof this.desktop.setServerAddress !== 'function') return false;
+    const raw = typeof address === 'string' ? address.trim() : '';
+    if (raw === '') return this._switchServer('', null);
+
+    let invite;
+    try {
+      invite = parseInviteCode(raw);
+    } catch {
+      this.statusKey = 'online.error.serverAddress';
+      this._render();
+      return false;
+    }
+
+    let normalized;
+    try {
+      normalized = normalizeSignalingAddress(invite.address);
+    } catch {
+      this.statusKey = 'online.error.serverAddress';
+      this._render();
+      return false;
+    }
+
+    if (normalized === this.desktop.signalingUrl) {
+      // 已经连在这台服务器上：只把房间码填好，不必重载窗口打断连接。
+      if (!this._applyRoomCode(invite.roomCode)) return false;
+      this.statusKey = invite.roomCode ? 'online.status.inviteReady' : null;
+      this._render();
+      return true;
+    }
+    return this._switchServer(invite.address, invite.roomCode);
+  }
+
+  async _switchServer(address, roomCode) {
+    this._savePendingRoom(roomCode);
     try {
       await this.desktop.setServerAddress(address);
       return true;
     } catch {
+      this._savePendingRoom(null);
       this.statusKey = 'online.error.serverAddress';
+      this._render();
+      return false;
+    }
+  }
+
+  /** 把房间码填进输入框；格式不对时报错并保持原样。 */
+  _applyRoomCode(roomCode) {
+    if (roomCode === null || roomCode === undefined) return true;
+    const normalized = normalizeRoomCode(roomCode);
+    if (!normalized.ok) {
+      this.statusKey = 'online.error.code';
+      this._render();
+      return false;
+    }
+    if (this.codeInput) this.codeInput.value = normalized.value;
+    return true;
+  }
+
+  /** 换服务器要重载窗口，房间码先寄存一手。 */
+  _savePendingRoom(roomCode) {
+    try {
+      if (roomCode) this.storage?.setItem?.(PENDING_ROOM_STORAGE_KEY, roomCode);
+      else this.storage?.removeItem?.(PENDING_ROOM_STORAGE_KEY);
+    } catch { /* 存储不可用：顶多让队友再手填一次房间码 */ }
+  }
+
+  /** 重载后取回寄存的房间码，取一次就清掉。 */
+  _consumePendingRoom() {
+    let pending = null;
+    try {
+      pending = this.storage?.getItem?.(PENDING_ROOM_STORAGE_KEY) ?? null;
+      if (pending) this.storage?.removeItem?.(PENDING_ROOM_STORAGE_KEY);
+    } catch { return; }
+    if (!pending) return;
+    if (this._applyRoomCode(pending)) this.statusKey = 'online.status.inviteReady';
+  }
+
+  /**
+   * 复制邀请码：地址取当前连的服务器（远端优先，其次本机的局域网地址）。
+   * 没开局域网主持又只连着本机时无址可分享，按钮保持禁用。
+   */
+  inviteCode() {
+    const state = this._effectiveState();
+    if (!state.roomCode) return null;
+    const signalUrl = this._shareableSignalUrl();
+    if (!signalUrl) return null;
+    return formatInviteCode({ signalUrl, roomCode: state.roomCode });
+  }
+
+  _shareableSignalUrl() {
+    const bridge = this.desktop;
+    if (!bridge) return null;
+    if (typeof bridge.remoteAddress === 'string' && bridge.remoteAddress !== '') {
+      return bridge.remoteAddress;
+    }
+    const share = Array.isArray(bridge.shareAddresses) ? bridge.shareAddresses : [];
+    return share[0]?.signalUrl ?? null;
+  }
+
+  async copyInviteCode() {
+    const invite = this.inviteCode();
+    if (!invite) {
+      this.statusKey = 'lobby.status.inviteUnavailable';
+      this._render();
+      return false;
+    }
+    if (typeof this.clipboard?.writeText !== 'function') {
+      this.statusKey = 'lobby.status.copyFailed';
+      this._render();
+      return false;
+    }
+    try {
+      await this.clipboard.writeText(invite);
+      this.statusKey = 'lobby.status.inviteCopied';
+      this._render();
+      return true;
+    } catch {
+      this.statusKey = 'lobby.status.copyFailed';
       this._render();
       return false;
     }
@@ -1023,6 +1146,13 @@ export class MultiplayerLobby {
     this.copyButton = makeButton(documentRef, 'lobby-copy-code', this.translate('lobby.copy'));
     this.copyButton.addEventListener('click', () => { void this.copyRoomCode(); });
     codeRow.append(codeLabel, this.lobbyCode, this.copyButton);
+    // 邀请码把服务器地址一起带上，只有桌面版能让队友粘贴后直接切过来。
+    this.inviteButton = null;
+    if (this.desktop) {
+      this.inviteButton = makeButton(documentRef, 'lobby-copy-invite', this.translate('lobby.copyInvite'));
+      this.inviteButton.addEventListener('click', () => { void this.copyInviteCode(); });
+      codeRow.append(this.inviteButton);
+    }
 
     this.memberList = setTestId(documentRef.createElement('ul'), 'lobby-members');
     this.memberList.classList.add('lobby-members');
@@ -1050,6 +1180,7 @@ export class MultiplayerLobby {
     const state = this._effectiveState();
     this.lobbyCode.textContent = state.roomCode ?? '------';
     this.copyButton.disabled = !state.roomCode;
+    if (this.inviteButton) this.inviteButton.disabled = this.inviteCode() === null;
     this.createButton.disabled = this.roomCommandPending;
     this.joinButton.disabled = this.roomCommandPending;
     this.nicknameInput.disabled = this.roomCommandPending;

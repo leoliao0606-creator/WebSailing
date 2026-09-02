@@ -27,6 +27,17 @@ const zh = {
   lanFailedTitle: '局域网主持启动失败',
   lanFailedBody: '端口 {port} 可能已被占用，已退回仅本机可用。',
   aboutBody: '逐风 WindChaser · 稳向板帆船模拟\n版本 {version}\nElectron {electron} · Chromium {chrome}',
+  checkUpdates: '检查更新',
+  updateFoundTitle: '有新版本 {version}',
+  updateReadyTitle: '新版本 {version} 已就绪',
+  updateNotifyBody: '当前安装形态不支持就地更新，请到发布页下载 {version} 覆盖安装。',
+  updateReadyBody: '{version} 已下载完成，重启后生效。比赛进行中可以先选「稍后」。',
+  updateOpenPage: '打开下载页',
+  updateRestart: '重启并安装',
+  updateLater: '稍后',
+  updateNoneTitle: '已是最新版本',
+  updateNoneBody: '当前版本 {version}。',
+  updateFailedTitle: '检查更新失败',
 };
 
 const en = {
@@ -56,6 +67,17 @@ const en = {
   lanFailedBody: 'Port {port} is probably in use; the server fell back to this machine only.',
   aboutBody: 'WindChaser · dinghy sailing simulator\nVersion {version}\n'
     + 'Electron {electron} · Chromium {chrome}',
+  checkUpdates: 'Check for Updates',
+  updateFoundTitle: 'Version {version} is available',
+  updateReadyTitle: 'Version {version} is ready',
+  updateNotifyBody: 'This install cannot update itself; download {version} from the releases page.',
+  updateReadyBody: '{version} has been downloaded and applies on restart. Pick “Later” if a race is running.',
+  updateOpenPage: 'Open releases page',
+  updateRestart: 'Restart and install',
+  updateLater: 'Later',
+  updateNoneTitle: 'Already up to date',
+  updateNoneBody: 'Running version {version}.',
+  updateFailedTitle: 'Update check failed',
 };
 
 const ja = {
@@ -85,6 +107,17 @@ const ja = {
   lanFailedBody: 'ポート {port} が使用中の可能性があります。この端末のみに切り替えました。',
   aboutBody: 'WindChaser · ディンギー航海シミュレーター\nバージョン {version}\n'
     + 'Electron {electron} · Chromium {chrome}',
+  checkUpdates: '更新を確認',
+  updateFoundTitle: '新しいバージョン {version} があります',
+  updateReadyTitle: 'バージョン {version} の準備ができました',
+  updateNotifyBody: 'このインストール形式は自動更新に対応していません。リリースページから {version} を入手してください。',
+  updateReadyBody: '{version} のダウンロードが完了しました。再起動で適用されます。レース中は「後で」を選んでください。',
+  updateOpenPage: 'リリースページを開く',
+  updateRestart: '再起動してインストール',
+  updateLater: '後で',
+  updateNoneTitle: '最新バージョンです',
+  updateNoneBody: '現在のバージョンは {version} です。',
+  updateFailedTitle: '更新の確認に失敗しました',
 };
 
 const DICTIONARIES = { zh, en, ja };

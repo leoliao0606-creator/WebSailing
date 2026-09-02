@@ -21,7 +21,13 @@ import {
 } from '../electron/desktopSettings.js';
 import { APP_ORIGIN, resolveRendererFile } from '../electron/rendererFiles.js';
 import { formatMenuString, menuLanguage, menuStrings } from '../electron/menuStrings.js';
+import { createUpdater, detectUpdateContext, updateMode } from '../electron/updater.js';
 import { desktopBridge, desktopSignalingUrl } from '../src/net/desktopBridge.js';
+import {
+  formatInviteCode,
+  parseInviteCode,
+  shortSignalingAddress,
+} from '../src/net/inviteCode.js';
 
 async function withTempDir(run) {
   const dir = await mkdtemp(path.join(tmpdir(), 'windchaser-desktop-'));
@@ -93,6 +99,42 @@ test('normalizeSignalingAddress rejects empty and non-WebSocket addresses', () =
   assert.throws(() => normalizeSignalingAddress('   '), TypeError);
   assert.throws(() => normalizeSignalingAddress(null), TypeError);
   assert.throws(() => normalizeSignalingAddress('file:///etc/passwd'), TypeError);
+});
+
+test('an invite code round-trips through the short address form', () => {
+  for (const typed of ['192.168.1.20', '192.168.1.20:9000', 'https://game.example.cn', 'ws://[fd00::1]:8787']) {
+    const signalUrl = normalizeSignalingAddress(typed);
+    assert.equal(normalizeSignalingAddress(shortSignalingAddress(signalUrl)), signalUrl);
+  }
+  assert.equal(shortSignalingAddress('ws://192.168.1.20:8787/signal'), '192.168.1.20:8787');
+  assert.equal(shortSignalingAddress('wss://game.example.cn/signal'), 'wss://game.example.cn');
+  assert.equal(shortSignalingAddress('ws://192.168.1.20:80/signal'), '192.168.1.20:80');
+  assert.equal(shortSignalingAddress('ws://[fd00::1]:8787/signal'), '[fd00::1]:8787');
+});
+
+test('formatInviteCode pairs the address with the room code', () => {
+  assert.equal(
+    formatInviteCode({ signalUrl: 'ws://192.168.1.20:8787/signal', roomCode: 'AB2CD9' }),
+    '192.168.1.20:8787#AB2CD9',
+  );
+  assert.equal(
+    formatInviteCode({ signalUrl: 'ws://192.168.1.20:8787/signal' }),
+    '192.168.1.20:8787',
+  );
+});
+
+test('parseInviteCode splits on the last separator and tolerates a bare address', () => {
+  assert.deepEqual(parseInviteCode('192.168.1.20:8787#AB2CD9'), {
+    address: '192.168.1.20:8787', roomCode: 'AB2CD9',
+  });
+  assert.deepEqual(parseInviteCode('  192.168.1.20  '), { address: '192.168.1.20', roomCode: null });
+  assert.deepEqual(parseInviteCode('wss://game.example.cn/signal#AB2CD9'), {
+    address: 'wss://game.example.cn/signal', roomCode: 'AB2CD9',
+  });
+  assert.deepEqual(parseInviteCode('192.168.1.20#'), { address: '192.168.1.20', roomCode: null });
+  assert.throws(() => parseInviteCode('#AB2CD9'), TypeError);
+  assert.throws(() => parseInviteCode('   '), TypeError);
+  assert.throws(() => parseInviteCode(null), TypeError);
 });
 
 test('DesktopServer points the renderer at loopback even while hosting on every interface', async () => {
@@ -252,4 +294,122 @@ test('desktopBridge only activates for the Electron preload bridge', () => {
   assert.equal(desktopSignalingUrl({ windchaser: bridge }), 'ws://127.0.0.1:8787/signal');
   assert.equal(desktopSignalingUrl({}), undefined);
   assert.equal(desktopSignalingUrl({ windchaser: { desktop: true, signalingUrl: '' } }), undefined);
+});
+
+test('only self-replacing installs update in place', () => {
+  assert.equal(updateMode({ platform: 'win32' }), 'install');
+  assert.equal(updateMode({ platform: 'linux', appImage: true }), 'install');
+  assert.equal(updateMode({ platform: 'darwin', signed: true }), 'install');
+  // deb / tar.gz 装不回自己，未签名的 macOS 包过不了 Squirrel.Mac 校验
+  assert.equal(updateMode({ platform: 'linux', appImage: false }), 'notify');
+  assert.equal(updateMode({ platform: 'darwin', signed: false }), 'notify');
+  // 开发模式没有已发布版本可比
+  assert.equal(updateMode({ platform: 'win32', packaged: false }), 'off');
+});
+
+test('detectUpdateContext reads the install shape out of the environment', () => {
+  assert.deepEqual(
+    detectUpdateContext({ app: { isPackaged: true }, env: { APPIMAGE: '/tmp/a.AppImage' }, platform: 'linux' }),
+    { platform: 'linux', packaged: true, appImage: true, signed: true },
+  );
+  assert.deepEqual(
+    detectUpdateContext({ app: { isPackaged: true }, env: {}, platform: 'darwin' }),
+    { platform: 'darwin', packaged: true, appImage: false, signed: false },
+  );
+  assert.equal(
+    detectUpdateContext({ app: { isPackaged: true }, env: { WINDCHASER_MAC_SIGNED: '1' }, platform: 'darwin' }).signed,
+    true,
+  );
+  assert.equal(detectUpdateContext({ app: {}, env: {}, platform: 'win32' }).packaged, false);
+});
+
+class FakeAutoUpdater {
+  handlers = new Map();
+
+  autoDownload = null;
+
+  autoInstallOnAppQuit = null;
+
+  installs = 0;
+
+  result = { isUpdateAvailable: false, updateInfo: { version: '0.1.0' } };
+
+  error = null;
+
+  on(event, handler) { this.handlers.set(event, handler); }
+  emit(event, payload) { return this.handlers.get(event)?.(payload); }
+  checkForUpdates() {
+    if (this.error) return Promise.reject(this.error);
+    return Promise.resolve(this.result);
+  }
+
+  quitAndInstall() { this.installs += 1; }
+}
+
+function updaterHarness(mode, { response = 0 } = {}) {
+  const boxes = [];
+  const opened = [];
+  const autoUpdater = new FakeAutoUpdater();
+  const updater = createUpdater({
+    autoUpdater,
+    mode,
+    strings: menuStrings('en'),
+    format: formatMenuString,
+    dialog: { showMessageBox: (options) => { boxes.push(options); return Promise.resolve({ response }); } },
+    openExternal: (url) => { opened.push(url); return Promise.resolve(); },
+    currentVersion: '0.1.0',
+  });
+  return { autoUpdater, boxes, opened, updater };
+}
+
+test('install mode downloads in the background and offers a restart', async () => {
+  const { autoUpdater, boxes, updater } = updaterHarness('install');
+  assert.equal(autoUpdater.autoDownload, true);
+  await autoUpdater.emit('update-downloaded', { version: '0.2.0' });
+  assert.equal(boxes.length, 1);
+  assert.match(boxes[0].message, /0\.2\.0/);
+  // 默认停在「稍后」，别把人从比赛里踢出去
+  assert.equal(boxes[0].defaultId, 1);
+  assert.equal(autoUpdater.installs, 1);
+  assert.equal(updater.mode, 'install');
+});
+
+test('notify mode never downloads and sends the player to the releases page', async () => {
+  const { autoUpdater, boxes, opened } = updaterHarness('notify');
+  assert.equal(autoUpdater.autoDownload, false);
+  await autoUpdater.emit('update-available', { version: '0.2.0' });
+  assert.equal(boxes.length, 1);
+  assert.equal(autoUpdater.installs, 0);
+  assert.deepEqual(opened, ['https://github.com/leoliao0606-creator/WebSailing/releases/latest']);
+});
+
+test('the same version is announced once, but a manual check can ask again', async () => {
+  const { autoUpdater, boxes, updater } = updaterHarness('notify', { response: 1 });
+  await autoUpdater.emit('update-available', { version: '0.2.0' });
+  await autoUpdater.emit('update-available', { version: '0.2.0' });
+  assert.equal(boxes.length, 1);
+  autoUpdater.result = { isUpdateAvailable: true, updateInfo: { version: '0.2.0' } };
+  assert.equal(await updater.check({ manual: true }), '0.2.0');
+  await autoUpdater.emit('update-available', { version: '0.2.0' });
+  assert.equal(boxes.length, 2);
+});
+
+test('a manual check reports being up to date, and failures only surface when manual', async () => {
+  const { autoUpdater, boxes, updater } = updaterHarness('install');
+  assert.equal(await updater.check({ manual: true }), null);
+  assert.equal(boxes.at(-1).title, menuStrings('en').updateNoneTitle);
+
+  autoUpdater.error = new Error('offline');
+  assert.equal(await updater.check({ manual: true }), null);
+  assert.equal(boxes.at(-1).title, menuStrings('en').updateFailedTitle);
+
+  const quiet = boxes.length;
+  assert.equal(await updater.check(), null);
+  assert.equal(boxes.length, quiet);
+});
+
+test('an off-mode updater is inert', async () => {
+  const updater = createUpdater({ mode: 'off' });
+  assert.equal(updater.mode, 'off');
+  assert.equal(await updater.check({ manual: true }), null);
 });

@@ -29,6 +29,7 @@
     "polar": "node tools/polar.js"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "three": "^0.180.0",
     "ws": "^8.21.0"
   },

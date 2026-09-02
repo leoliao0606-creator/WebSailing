@@ -1,5 +1,5 @@
 # 桌面版打包配置。产物写入 release/，不签名也能在本机安装运行；
-# 要对外分发请自行配置签名/公证（macOS 见 CSC_LINK/APPLE_ID,Windows 见 CSC_LINK）。
+# 要对外分发请自行配置签名/公证（macOS 见 CSC_LINK/APPLE_ID，Windows 见 CSC_LINK）。
 appId: dev.windchaser.game
 productName: WindChaser
 copyright: WindChaser contributors
@@ -8,15 +8,22 @@ directories:
   buildResources: assets
   output: release
 
-# 只打包运行期真正需要的东西：主进程、信令服务、共享协议模块，以及 ws。
-# src/net/ 整目录随包：server/ 依赖 protocol.js，而它又依赖同目录的 worldState.js。
+# electron-updater 从这里拉 latest*.yml 与安装包；写死仓库，免得 CI 上
+# 因为 checkout 的 remote 形态不同而推断错目标。
+publish:
+  provider: github
+  owner: leoliao0606-creator
+  repo: WebSailing
+
+# 只列自己的源码；生产依赖（ws、electron-updater 及其依赖）由 electron-builder
+# 自动带上。src/net/ 整目录随包：server/ 依赖 protocol.js，它又依赖同目录的
+# worldState.js；inviteCode.js 还是主进程与渲染进程共用的那份地址解析。
 # three 已经被 Vite 打进 dist/，不必再随 node_modules 复制一份。
 files:
   - electron/**/*
   - server/**/*
   - src/net/**/*
   - package.json
-  - node_modules/ws/**/*
   - '!node_modules/three/**/*'
 
 # dist/ 放在 resources/dist（不进 asar）:app:// 与局域网静态服务都按普通目录读取。

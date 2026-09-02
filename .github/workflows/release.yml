@@ -1,0 +1,42 @@
+name: Release
+
+# 打 v* 标签时在三个平台并行出包，产物汇进同一个 GitHub Release 草稿。
+# electron-builder 只能在对应系统上产出该系统的安装包，所以必须用矩阵。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: --mac
+          - os: windows-latest
+            platform: --win
+          - os: ubuntu-latest
+            platform: --linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build
+      - name: 打包并上传到 Release 草稿
+        run: npx electron-builder ${{ matrix.platform }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 暂不签名：没有证书时让 electron-builder 直接跳过，而不是报错退出。
+          # 配好 CSC_LINK / CSC_KEY_PASSWORD（macOS 再加 APPLE_ID /
+          # APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID）后删掉这一行即可。
+          CSC_IDENTITY_AUTO_DISCOVERY: false

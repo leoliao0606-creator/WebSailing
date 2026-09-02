@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   MultiplayerLobby,
   NICKNAME_STORAGE_KEY,
+  PENDING_ROOM_STORAGE_KEY,
   buildMultiplayerStartOptions,
   lobbyEligibility,
 } from '../src/game/multiplayerLobby.js';
@@ -366,12 +367,11 @@ function sessionState(overrides = {}) {
   };
 }
 
-function harness({ desktop = null } = {}) {
+function harness({ desktop = null, storage = new FakeStorage(), clipboard = null } = {}) {
   const documentRef = new FakeDocument();
   const root = documentRef.createElement('div');
   root.id = 'menus';
   documentRef.body.append(root);
-  const storage = new FakeStorage();
   const signaling = new FakeSignaling();
   const transport = new FakeTransport();
   const session = new FakeSession();
@@ -397,6 +397,7 @@ function harness({ desktop = null } = {}) {
     random: () => 0.5,
     now: () => 1_234,
     desktop,
+    clipboard,
   });
   lobby.mount(root);
   return {
@@ -1276,14 +1277,14 @@ test('desktop hint names the remote host once one is joined', () => {
   assert.equal(root.querySelector('[data-testid="multiplayer-server-reset"]').disabled, false);
 });
 
-test('applying a server address hands the raw input to the desktop bridge', async () => {
+test('applying a server address trims the input before handing it to the desktop bridge', async () => {
   const desktop = fakeDesktop();
   const { lobby, root } = harness({ desktop });
   root.querySelector('[data-testid="multiplayer-server-address"]').value = ' 192.168.1.20 ';
   assert.equal(await lobby.applyServerAddress(), true);
-  assert.deepEqual(desktop.calls, [' 192.168.1.20 ']);
+  assert.deepEqual(desktop.calls, ['192.168.1.20']);
   assert.equal(await lobby.applyServerAddress(''), true);
-  assert.deepEqual(desktop.calls, [' 192.168.1.20 ', '']);
+  assert.deepEqual(desktop.calls, ['192.168.1.20', '']);
 });
 
 test('a rejected server address surfaces an error instead of throwing', async () => {
@@ -1294,4 +1295,101 @@ test('a rejected server address surfaces an error instead of throwing', async ()
     root.querySelector('[data-testid="multiplayer-status"]').textContent,
     t('online.error.serverAddress'),
   );
+});
+
+test('an invite code sends only the address onward and parks the room code for the reload', async () => {
+  const desktop = fakeDesktop();
+  const storage = new FakeStorage();
+  const { lobby } = harness({ desktop, storage });
+  assert.equal(await lobby.applyServerAddress('192.168.1.20:8787#AB2CD9'), true);
+  assert.deepEqual(desktop.calls, ['192.168.1.20:8787']);
+  assert.equal(storage.getItem(PENDING_ROOM_STORAGE_KEY), 'AB2CD9');
+});
+
+test('the parked room code is filled in once and then cleared', () => {
+  const storage = new FakeStorage();
+  storage.setItem(PENDING_ROOM_STORAGE_KEY, 'AB2CD9');
+  const { root } = harness({ desktop: fakeDesktop(), storage });
+  assert.equal(root.querySelector('[data-testid="multiplayer-room-code"]').value, 'AB2CD9');
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-status"]').textContent,
+    t('online.status.inviteReady'),
+  );
+  assert.equal(storage.getItem(PENDING_ROOM_STORAGE_KEY), null);
+
+  const second = harness({ desktop: fakeDesktop(), storage });
+  assert.equal(second.root.querySelector('[data-testid="multiplayer-room-code"]').value, '');
+});
+
+test('the web build ignores a parked room code left behind by a desktop session', () => {
+  const storage = new FakeStorage();
+  storage.setItem(PENDING_ROOM_STORAGE_KEY, 'AB2CD9');
+  const { root } = harness({ storage });
+  assert.equal(root.querySelector('[data-testid="multiplayer-room-code"]').value, '');
+});
+
+test('an invite for the server already in use fills the code without a reload', async () => {
+  const desktop = fakeDesktop({ signalingUrl: 'ws://192.168.1.20:8787/signal' });
+  const { lobby, root } = harness({ desktop });
+  assert.equal(await lobby.applyServerAddress('192.168.1.20:8787#AB2CD9'), true);
+  assert.deepEqual(desktop.calls, []);
+  assert.equal(root.querySelector('[data-testid="multiplayer-room-code"]').value, 'AB2CD9');
+});
+
+test('an invite carrying a malformed room code is rejected before switching servers', async () => {
+  const desktop = fakeDesktop();
+  const storage = new FakeStorage();
+  const { lobby, root } = harness({ desktop, storage });
+  assert.equal(await lobby.applyServerAddress('nope://x#AB2CD9'), false);
+  assert.deepEqual(desktop.calls, []);
+  assert.equal(storage.getItem(PENDING_ROOM_STORAGE_KEY), null);
+  assert.equal(
+    root.querySelector('[data-testid="multiplayer-status"]').textContent,
+    t('online.error.serverAddress'),
+  );
+});
+
+test('the invite code pairs the room code with the address crew can actually reach', async () => {
+  const copied = [];
+  const desktop = fakeDesktop({
+    lanHosting: true,
+    shareAddresses: [{
+      host: '192.168.1.20', port: 8787,
+      pageUrl: 'http://192.168.1.20:8787/', signalUrl: 'ws://192.168.1.20:8787/signal',
+    }],
+  });
+  const { lobby, root, session, signaling } = harness({
+    desktop,
+    clipboard: { writeText: (text) => { copied.push(text); return Promise.resolve(); } },
+  });
+  await lobby.open();
+  signaling.state.playerId = 'host';
+  signaling.room(room());
+  session.updateState(sessionState());
+
+  assert.equal(lobby.inviteCode(), '192.168.1.20:8787#AB2CD9');
+  assert.equal(await lobby.copyInviteCode(), true);
+  assert.deepEqual(copied, ['192.168.1.20:8787#AB2CD9']);
+  assert.equal(root.querySelector('[data-testid="lobby-copy-invite"]').disabled, false);
+});
+
+test('with nothing shareable the invite button stays disabled and says why', async () => {
+  const { lobby, root, session, signaling } = harness({ desktop: fakeDesktop() });
+  await lobby.open();
+  signaling.state.playerId = 'host';
+  signaling.room(room());
+  session.updateState(sessionState());
+
+  assert.equal(lobby.inviteCode(), null);
+  assert.equal(root.querySelector('[data-testid="lobby-copy-invite"]').disabled, true);
+  assert.equal(await lobby.copyInviteCode(), false);
+  assert.equal(
+    root.querySelector('[data-testid="lobby-status"]').textContent,
+    t('lobby.status.inviteUnavailable'),
+  );
+});
+
+test('the web build has no invite button at all', async () => {
+  const { root } = harness();
+  assert.equal(root.querySelector('[data-testid="lobby-copy-invite"]'), null);
 });

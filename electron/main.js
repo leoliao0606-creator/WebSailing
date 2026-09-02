@@ -27,6 +27,7 @@ import {
   resolveRendererFile,
 } from './rendererFiles.js';
 import { formatMenuString, menuStrings } from './menuStrings.js';
+import { createUpdater, detectUpdateContext, updateMode } from './updater.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, '..');
@@ -70,6 +71,7 @@ const server = new DesktopServer({ publicDir: RENDERER_ROOT });
 let settings = null;
 let strings = menuStrings('en');
 let mainWindow = null;
+let updater = { mode: 'off', check: async () => null };
 
 function bootstrapPayload() {
   return {
@@ -196,6 +198,12 @@ function buildMenu() {
       label: strings.help,
       submenu: [
         {
+          label: strings.checkUpdates,
+          enabled: updater.mode !== 'off',
+          click: () => { void updater.check({ manual: true }); },
+        },
+        { type: 'separator' },
+        {
           label: strings.about,
           click: () => {
             dialog.showMessageBox({
@@ -294,6 +302,28 @@ function registerIpc() {
 }
 
 /**
+ * 接上自动更新。electron-updater 只在打包后有意义，开发模式与冒烟自检里
+ * 直接跳过（也避免自检进程去连 GitHub）。
+ */
+async function setupUpdater() {
+  const context = detectUpdateContext({ app });
+  const mode = process.env.WINDCHASER_SMOKE ? 'off' : updateMode(context);
+  if (mode === 'off') return;
+  const { autoUpdater } = await import('electron-updater');
+  updater = createUpdater({
+    autoUpdater,
+    mode,
+    strings,
+    format: formatMenuString,
+    dialog,
+    openExternal: (url) => shell.openExternal(url),
+    currentVersion: app.getVersion(),
+  });
+  // 启动即查会和首屏加载抢带宽，等玩家进到菜单再说。
+  setTimeout(() => { void updater.check(); }, 20_000).unref?.();
+}
+
+/**
  * 冒烟自检：tools/test-desktop.mjs 用它确认桌面壳能起窗口、渲染进程能拿到
  * WebGL 上下文与桥接地址、localStorage 可写（存档不会因端口变化丢失）；
  * WINDCHASER_SMOKE=lan 时再验证 app:// 页面能连上监听在局域网网卡上的 ws://，
@@ -386,6 +416,7 @@ app.whenReady().then(async () => {
   registerAppProtocol();
   registerIpc();
   await applyServerSettings();
+  await setupUpdater();
   buildMenu();
   createWindow();
   if (process.env.WINDCHASER_SMOKE) void runSmokeCheck();

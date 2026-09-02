@@ -7,11 +7,15 @@
 
 import os from 'node:os';
 
+import { DEFAULT_SIGNAL_PORT, normalizeSignalingAddress } from '../src/net/inviteCode.js';
 import { createSignalingServer } from '../server/signalingServer.js';
 
 export const LOOPBACK_HOST = '127.0.0.1';
 export const ANY_HOST = '0.0.0.0';
-export const DEFAULT_LAN_PORT = 8787;
+export const DEFAULT_LAN_PORT = DEFAULT_SIGNAL_PORT;
+
+// 地址规范化与渲染进程共用一份实现，避免「菜单里能连、页面里连不上」这种分叉。
+export { normalizeSignalingAddress };
 
 // 桌面端默认不配置 STUN/TURN：回环与同一局域网靠 host 候选即可直连，
 // 跨公网联机仍应使用 README「联机部署」里的自建信令服务。
@@ -74,36 +78,6 @@ export function signalUrlFor(host, port) {
     throw new TypeError('port must be a port number');
   }
   return `ws://${bracket(host)}:${port}/signal`;
-}
-
-/**
- * 把玩家在菜单里输入的主机地址规范成信令 URL。
- * 接受 `192.168.1.20`、`192.168.1.20:8787`、`http://…`、`ws://…/signal` 等写法。
- */
-export function normalizeSignalingAddress(input, { defaultPort = DEFAULT_LAN_PORT } = {}) {
-  if (typeof input !== 'string') throw new TypeError('address must be a string');
-  const trimmed = input.trim();
-  if (trimmed === '') throw new TypeError('address must not be empty');
-  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
-  let parsed;
-  try {
-    parsed = new URL(hasScheme ? trimmed : `ws://${trimmed}`);
-  } catch {
-    throw new TypeError('address is not a valid URL');
-  }
-  if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
-  else if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
-  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
-    throw new TypeError('address must use ws, wss, http, or https');
-  }
-  if (parsed.hostname === '') throw new TypeError('address must include a host');
-  if (parsed.port === '' && parsed.protocol === 'ws:') parsed.port = String(defaultPort);
-  if (parsed.pathname === '' || parsed.pathname === '/') parsed.pathname = '/signal';
-  parsed.username = '';
-  parsed.password = '';
-  parsed.search = '';
-  parsed.hash = '';
-  return parsed.href;
 }
 
 /**
