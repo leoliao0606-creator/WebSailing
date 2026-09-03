@@ -64,8 +64,8 @@ linux:
   # 让运行中的窗口与 .desktop 条目关联（任务栏图标/名称）
   syncDesktopName: true
   synopsis: 3D dinghy sailing simulator
-  # deb 需要 "Name <email>" 形式的维护者；对外分发前请替换成真实联系方式。
-  maintainer: WindChaser <windchaser@example.invalid>
+  # deb 需要 "Name <email>" 形式的维护者；用 GitHub 的 noreply 地址，可达但不暴露私人邮箱。
+  maintainer: WindChaser <leoliao0606-creator@users.noreply.github.com>
   target:
     - target: AppImage
       arch: [x64, arm64]

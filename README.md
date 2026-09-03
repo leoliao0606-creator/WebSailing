@@ -61,7 +61,7 @@ npm run dist         # 为当前系统打包安装包到 release/
 | Windows | NSIS 安装包（x64 + arm64）与免安装 `.exe`（x64） |
 | Linux | `.AppImage`（x64 + arm64）、`.deb`（x64）、`.tar.gz`（x64 + arm64） |
 
-打包配置在 `electron-builder.yml`。electron-builder 只能在对应平台上产出该平台的安装包（macOS 包需要 macOS 机器），交叉打包请用各平台的 CI runner。默认**不做代码签名**：本机安装可用，但 macOS 首次打开需右键「打开」绕过 Gatekeeper，Windows 会弹 SmartScreen 提示。对外分发时通过 `CSC_LINK` / `CSC_KEY_PASSWORD`（以及 macOS 的 `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD`）配置签名与公证；`electron-builder.yml` 里的 `linux.maintainer` 也要换成真实联系方式。
+打包配置在 `electron-builder.yml`。electron-builder 只能在对应平台上产出该平台的安装包（macOS 包需要 macOS 机器），交叉打包请用各平台的 CI runner。默认**不做代码签名**：本机安装可用，但 macOS 首次打开需右键「打开」绕过 Gatekeeper，Windows 会弹 SmartScreen 提示。对外分发时通过 `CSC_LINK` / `CSC_KEY_PASSWORD`（以及 macOS 的 `APPLE_ID` / `APPLE_APP_SPECIFIC_PASSWORD`）配置签名与公证。
 
 ### 桌面版的三点结构差异
 
