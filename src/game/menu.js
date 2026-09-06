@@ -18,7 +18,9 @@ const DEFAULTS = {
   ghost: true,
   volume: 0.7,
   volMusic: 0.5,
-  volAmbient: 0.6,
+  volSea: 0.7,       // 海浪声(劈水/涌浪/拍岸)
+  volAmbient: 0.6,   // 环境点缀(海鸥)
+  volSfx: 0.8,       // 风/操帆/提示音/UI
   lang: null,           // null = 首次启动按浏览器语言
   quality: 'high',      // low/medium/high/ultra/custom
   resScale: 1.0,        // 渲染分辨率缩放（× devicePixelRatio）
@@ -69,6 +71,10 @@ export function loadSettings() {
   try {
     stored = JSON.parse(localStorage.getItem('windchaser.settings') || '{}');
   } catch { /* 损坏则用默认 */ }
+  // JSON.parse 成功不代表拿到的是对象:'null'、'5'、'"abc"' 都是合法 JSON,
+  // catch 挡不住它们。下面几处 'xxx' in stored 只能用在对象上,不挡一下会抛
+  // TypeError;坏值又一直留在 localStorage 里,刷新页面照样崩,玩家自己恢复不了。
+  if (!stored || typeof stored !== 'object') stored = {};
   const s = { ...DEFAULTS, ...stored };
   // 旧版只有 quality 预设：迁移到细项
   if (QUALITY_PRESETS[s.quality] && !('shadowQ' in stored)) {
@@ -196,8 +202,12 @@ export class Menu {
           <input type="range" id="s-vol" min="0" max="100" step="5" value="${s.volume * 100}"></label>
         <label><span>${t('set.volMusic')} <output id="o-volm">${Math.round(s.volMusic * 100)}</output>%</span>
           <input type="range" id="s-volm" min="0" max="100" step="5" value="${s.volMusic * 100}"></label>
+        <label><span>${t('set.volSea')} <output id="o-vols">${Math.round(s.volSea * 100)}</output>%</span>
+          <input type="range" id="s-vols" min="0" max="100" step="5" value="${s.volSea * 100}"></label>
         <label><span>${t('set.volAmbient')} <output id="o-vola">${Math.round(s.volAmbient * 100)}</output>%</span>
           <input type="range" id="s-vola" min="0" max="100" step="5" value="${s.volAmbient * 100}"></label>
+        <label><span>${t('set.volSfx')} <output id="o-volx">${Math.round(s.volSfx * 100)}</output>%</span>
+          <input type="range" id="s-volx" min="0" max="100" step="5" value="${s.volSfx * 100}"></label>
 
         <div class="form-section">${t('set.graphics')}</div>
         <label>${t('set.quality')}
@@ -226,7 +236,9 @@ export class Menu {
     bind('#s-gust', '#o-gust');
     bind('#s-vol', '#o-vol');
     bind('#s-volm', '#o-volm');
+    bind('#s-vols', '#o-vols');
     bind('#s-vola', '#o-vola');
+    bind('#s-volx', '#o-volx');
     bind('#s-res', '#o-res');
 
     // 预设 -> 细项联动
@@ -280,7 +292,9 @@ export class Menu {
     st.ghost = el.querySelector('#s-ghost').checked;
     st.volume = Number(el.querySelector('#s-vol').value) / 100;
     st.volMusic = Number(el.querySelector('#s-volm').value) / 100;
+    st.volSea = Number(el.querySelector('#s-vols').value) / 100;
     st.volAmbient = Number(el.querySelector('#s-vola').value) / 100;
+    st.volSfx = Number(el.querySelector('#s-volx').value) / 100;
     st.quality = el.querySelector('#s-quality').value;
     st.resScale = Number(el.querySelector('#s-res').value) / 100;
     st.shadowQ = el.querySelector('#s-shadow').value;

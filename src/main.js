@@ -132,7 +132,9 @@ export class App {
     this._currentVec = this._computeCurrent(environment.windPsi);
     this.audio.setVolume(s.volume);
     this.audio.setChannelVolume('music', s.volMusic);
+    this.audio.setChannelVolume('sea', s.volSea);
     this.audio.setChannelVolume('ambient', s.volAmbient);
+    this.audio.setChannelVolume('sfx', s.volSfx);
 
     // —— 画质 ——
     this._applyPixelRatio();
