@@ -466,6 +466,31 @@ async function main() {
     )));
 
     step('readying all players and waiting for the reliable WebRTC topology');
+    // 大厅是居中的整屏菜单,聊天面板是 body 级浮层。两者曾经在窗口宽度小于约
+    // 1010px 时重叠,把「准备」按钮压住 —— 非房主的按钮行少一个「开始比赛」,
+    // 居中后准备按钮更靠右,正好撞进面板。先做一次命中测试,免得回归时只看到
+    // 一条 20 秒的点击超时,看不出是谁挡的。
+    for (const [label, page] of [
+      ['host', hostPage],
+      ['guest', guestPage],
+      ['observer', observerPage],
+    ]) {
+      const blocker = await page.evaluate(() => {
+        const button = document.querySelector('[data-testid="lobby-ready"]');
+        const box = button.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          Math.round(box.x + box.width / 2),
+          Math.round(box.y + box.height / 2),
+        );
+        if (button.contains(hit)) return null;
+        return hit?.closest('[data-testid]')?.dataset.testid ?? hit?.tagName ?? 'unknown';
+      });
+      assert.equal(
+        blocker,
+        null,
+        `${label}'s ready button is covered by ${blocker} — the lobby layout overlaps it`,
+      );
+    }
     await testId(hostPage, 'lobby-ready').click();
     await testId(guestPage, 'lobby-ready').click();
     await testId(observerPage, 'lobby-ready').click();
@@ -500,6 +525,16 @@ async function main() {
         && window.__game?.boats?.length === 3
         && Number.isSafeInteger(window.__game?.multiplayerController?.tick),
     )));
+
+    // 大厅那套并排布局只能存在于大厅。开赛后菜单全隐,body 上的标记必须跟着摘掉,
+    // 否则聊天面板会一直贴着屏幕右缘,压住赛中的小地图和仪表。
+    for (const [label, page] of [['host', hostPage], ['guest', guestPage]]) {
+      assert.equal(
+        await page.evaluate(() => document.body.classList.contains('lobby-open')),
+        false,
+        `${label} still carries the lobby chat layout after the race started`,
+      );
+    }
 
     // 诊断探针:记录 guest 端消息拒收与检查点流,失败时随诊断一并输出
     await guestPage.evaluate(() => {

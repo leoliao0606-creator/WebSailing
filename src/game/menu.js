@@ -123,6 +123,10 @@ export class Menu {
   show(id) {
     for (const el of this.root.children) el.classList.toggle('show', el.id === id);
     this.root.classList.toggle('active', !!id);
+    // 聊天面板挂在 <body> 下、不在菜单层里，CSS 选不到「现在显示的是哪个菜单页」。
+    // 赛前大厅是居中的整屏菜单，聊天面板那套避开赛中 HUD 的固定坐标会正好压住
+    // 成员列表和准备按钮，所以把大厅状态标到 body 上，让样式表切到并排布局。
+    this.root.ownerDocument?.body?.classList.toggle('lobby-open', id === 'menu-online-lobby');
   }
   hideAll() { this.show(null); }
 

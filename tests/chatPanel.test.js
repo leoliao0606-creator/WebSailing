@@ -7,6 +7,7 @@ import {
   ChatPanel,
   unicodeLength,
 } from '../src/game/chatPanel.js';
+import { Menu } from '../src/game/menu.js';
 
 function detailEvent(type, detail) {
   const event = new Event(type);
@@ -401,4 +402,82 @@ test('chat and lobby CSS stay bounded and responsive around the sailing HUD', ()
     const minimapTop = height - 232;
     assert.ok(chatBottom <= minimapTop - 18, `chat overlaps minimap at ${height}px high`);
   }
+});
+
+// —— 赛前大厅的聊天面板避让 ——
+//
+// 聊天面板那套 right:236px / top:242px 是照着赛中画面定的（避开右上风向表、
+// 右下小地图）。赛前大厅却是一个居中的整屏菜单，同一个坐标会压在成员列表和
+// 「准备」按钮上。窗口宽度小于约 1010px 时，非房主根本点不到「准备」——
+// 房主的按钮行里多一个「开始比赛」，整行更宽、准备按钮被推到更左边，反而躲开了，
+// 所以这个缺陷只在非房主身上出现，端到端测试里表现为一条 20 秒的点击超时。
+
+test('打开多人大厅时把 lobby-open 标到 body 上，离开时收回', () => {
+  const marked = new Set();
+  const noop = { toggle() {} };
+  const menu = {
+    root: {
+      children: [
+        { id: 'menu-main', classList: noop },
+        { id: 'menu-online-lobby', classList: noop },
+      ],
+      classList: noop,
+      ownerDocument: {
+        body: {
+          classList: {
+            toggle(name, on) { if (on) marked.add(name); else marked.delete(name); },
+          },
+        },
+      },
+    },
+  };
+  const show = (id) => Menu.prototype.show.call(menu, id);
+
+  show('menu-online-lobby');
+  assert.ok(marked.has('lobby-open'), '大厅界面显示时样式表要能切到并排布局');
+  show('menu-main');
+  assert.ok(!marked.has('lobby-open'), '离开大厅要恢复赛中那套 HUD 避让坐标');
+  show('menu-online-lobby');
+  show(null);
+  assert.ok(!marked.has('lobby-open'), '开赛后菜单全隐，标记也要收回');
+});
+
+test('大厅态的聊天面板有独立定位，并给大厅内容留出等宽内边距', () => {
+  const css = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8');
+
+  const lobbyPanel = css.match(/body\.lobby-open\s+\.chat-panel\s*\{([^}]*)\}/)?.[1];
+  assert.ok(lobbyPanel, '缺少 body.lobby-open .chat-panel 规则，大厅会退回赛中坐标');
+  assert.ok(
+    /right:\s*var\(--lobby-chat-gap\)/.test(lobbyPanel),
+    '大厅态面板应贴屏幕右缘，而不是留 236px 悬在中间',
+  );
+  assert.ok(
+    /width:\s*var\(--lobby-chat-w\)/.test(lobbyPanel),
+    '面板宽度要和大厅让出的内边距用同一个变量，两处数字不能各写各的',
+  );
+
+  const lobbyScreen = css.match(/body\.lobby-open\s+#menu-online-lobby\s*\{([^}]*)\}/)?.[1];
+  assert.ok(lobbyScreen, '大厅界面没有让位的内边距，内容仍会被面板压住');
+  assert.ok(
+    /padding-right:\s*calc\(var\(--lobby-chat-w\)\s*\+\s*var\(--lobby-chat-gap\)\s*\*\s*2\)/
+      .test(lobbyScreen),
+    '让出的宽度必须等于面板宽加两侧留白',
+  );
+
+  // 让出右侧后可用宽度变窄，大厅里的定宽块必须跟着收，否则横向溢出
+  assert.ok(
+    /#menu-online-lobby\s+\.lobby-members\s*\{[^}]*width:\s*min\(620px,\s*100%\)/.test(css),
+    '成员列表要受父容器可用宽度约束',
+  );
+
+  // 窄屏左右并排挤不开，必须改成面板贴底、大厅内容往上让
+  const mobileSource = css.slice(css.lastIndexOf('@media (max-width: 720px)'));
+  const mobilePanel = mobileSource.match(/body\.lobby-open\s+\.chat-panel\s*\{([^}]*)\}/)?.[1];
+  assert.ok(mobilePanel, '窄屏缺少大厅态面板规则');
+  assert.ok(/bottom:\s*0/.test(mobilePanel), '窄屏大厅态面板应贴底');
+  const mobileScreen = mobileSource.match(/body\.lobby-open\s+#menu-online-lobby\s*\{([^}]*)\}/)?.[1];
+  assert.ok(
+    mobileScreen && /padding-bottom:\s*40vh/.test(mobileScreen),
+    '窄屏大厅内容要为贴底的面板让出等高的下内边距',
+  );
 });
