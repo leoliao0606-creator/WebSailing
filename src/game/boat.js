@@ -68,6 +68,7 @@ export class Boat {
     p.capsized = false;
     p.sheet = p.ctl.sheet = 1;
     p.board = p.ctl.board = 1;
+    p._boomSettled = false; // 换了航向，帆杠要按新风况重新落位（见 _substep）
     p.powerScale = 1;
     this.penaltyT = 0;
     this.ruleCooldown = 0;

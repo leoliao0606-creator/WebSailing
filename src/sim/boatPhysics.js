@@ -114,6 +114,7 @@ export class BoatPhysics {
     this.phi = 0;                  // 横倾
     this.phiRate = 0;
     this.boom = 0;                 // 帆杠实际角（+右舷）
+    this._boomSettled = false;     // 首帧让帆杠瞬间落位，见 _substep
     this.rudder = 0;               // 舵角（弦向角，+鼻朝右）
     this.sheet = 1;                // 缭绳 0=收满 1=放尽
     this.board = 1;                // 稳向板 1=全放下
@@ -331,7 +332,13 @@ export class BoatPhysics {
     }
     let boomTarget = clamp(vane, -boomMax, boomMax);
     if (this.capsized) boomTarget = boomSide * boomMax;
-    const boomStep = p.boomRateDeg * DEG * dt;
+    // 首帧让帆杠瞬间落位，不受摆动速率限制。新建或 place() 重置的船缭绳是放尽的
+    // (sheet=1)，帆杠却还留在中线(boom=0) —— 这个组合在真实里不存在，缭绳一放
+    // 帆杠立刻就被风吹到下风侧。让它按 150°/s 慢慢摆出去的话，横风起步的头半秒
+    // 帆的攻角接近 90°(帆面几乎正对风)，侧力是正常吃风时的好几倍：25 节出生
+    // 横倾会冲到 51°，30 节直接在 1.2 秒内翻船 —— 玩家什么都没做就翻了。
+    const boomStep = this._boomSettled ? p.boomRateDeg * DEG * dt : Math.PI * 2;
+    this._boomSettled = true;
     this.boom += clamp(boomTarget - this.boom, -boomStep, boomStep);
 
     // —— 力累加（体轴）——

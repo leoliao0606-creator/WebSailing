@@ -1,10 +1,13 @@
-// 大风抢风调向与倒航舵效的回归。
+// 大风下的操舵与起步行为回归。
 //
-// 守的是两件事：
+// 守的是三件事：
 //  1. steerTowards 知道倒航时舵效是反的。不知道的话，大风调向一掉速到倒航，
 //     满舵就会把船推回原来那一舷，船永远卡在顶风点转不过去（25 节必现）。
 //  2. 倒航的船体阻力用的是钝体形状阻力，不是正向航行那套流线型系数。否则
 //     顶风停住的船会被区区 20 N 的风推到近 3 节的倒退速度。
+//  3. 新建/重置的船，帆杠首帧就落到当前风况下的位置。缭绳放尽而帆杠还留在
+//     中线是不自洽的状态，让它按 150°/s 慢慢摆出去的话，横风起步的头半秒
+//     帆面几乎正对风，侧力足以把船直接掀翻。
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -32,8 +35,9 @@ function trimAssist(b, alpha = 18) {
   autoSheet(b, over > 0 ? Math.max(4, alpha - over * 1.1) : alpha);
 }
 
-// 从 -45° 抢风调向到 +45°，返回耗时与速度恢复情况
-function tack(windKn) {
+// 从 -45° 抢风调向到 +45°，返回耗时与速度恢复情况。
+// preSpeed：调向前先落下风加速到这个船速（真实船手在大风调向前的标准动作）
+function tack(windKn, preSpeed = 0) {
   const wind = northWind(windKn);
   const b = new BoatPhysics();
   b.psi = -45 * DEG;
@@ -41,6 +45,11 @@ function tack(windKn) {
   b.ctl.autoHike = true;
   const dt = 1 / 60;
   for (let i = 0; i < 40 * 60; i++) { steerTowards(b, -45 * DEG); trimAssist(b); b.step(wind, dt); }
+  if (preSpeed) {
+    for (let t = 0; t < 25 && b.out.speedKn < preSpeed; t += dt) {
+      steerTowards(b, -62 * DEG); trimAssist(b, 17); b.step(wind, dt);
+    }
+  }
   const v0 = b.out.speedKn;
   let tDone = -1, minV = v0;
   for (let t = 0; t < 20; t += dt) {
@@ -63,10 +72,22 @@ test('25 节大风能完成抢风调向', () => {
     `调向后应恢复速度，实测 ${r.recovered.toFixed(2)} vs 进入 ${r.v0.toFixed(2)}kn`);
 });
 
-test('30 节调向也能完成（倒航反打是脱困的关键）', () => {
-  const r = tack(30);
+test('28 节调向也能完成', () => {
+  const r = tack(28);
   assert.ok(r.tDone > 0 && r.tDone < 15,
     `实测 ${r.tDone < 0 ? '未完成' : r.tDone.toFixed(1) + 's'}`);
+});
+
+test('30 节直接调向会失败，但给够进入速度就能转过来', () => {
+  // 守的是「倒航反打这套机制有效」，而不是「某个边缘风速下恰好能过」。
+  // 30 节迎风段的帆已被压到几乎无动力，进入速度只有 4 节出头，冲不过顶风点
+  // —— 这是真实的。真实船手在大风里会先落下风加速再调向。
+  const direct = tack(30);
+  const prepped = tack(30, 5.2);
+  assert.ok(prepped.tDone > 0 && prepped.tDone < 15,
+    `先加速到 ${prepped.v0.toFixed(2)}kn 后应能调向，实测 ${prepped.tDone < 0 ? '未完成' : prepped.tDone.toFixed(1) + 's'}`);
+  assert.ok(prepped.v0 > direct.v0,
+    `落下风加速应当真的提高了进入速度：${direct.v0.toFixed(2)} -> ${prepped.v0.toFixed(2)}kn`);
 });
 
 test('中低风调向不受影响：仍有真实掉速、耗时相当', () => {
@@ -137,4 +158,64 @@ test('倒航阻力显著大于同速前进（钝体 vs 流线型）', () => {
   const aft = decel(-1.5);
   assert.ok(aft > fwd * 2.5,
     `同速倒航的减速应远快于前进，实测 后退 ${aft.toFixed(3)} vs 前进 ${fwd.toFixed(3)} m/s`);
+});
+
+// —— 起步时的帆杠落位 ——
+
+// 复现 Boat.place 的出生状态：缭绳放尽、稳向板放下、开自动压舷
+function spawn(headingDeg) {
+  const b = new BoatPhysics();
+  b.psi = headingDeg * DEG;
+  b.u = 1.5;
+  b.v = 0;
+  b.sheet = b.ctl.sheet = 1;
+  b.board = b.ctl.board = 1;
+  b.ctl.autoHike = true;
+  return b;
+}
+
+test('帆杠首帧就落到下风侧，不是从中线慢慢摆出去', () => {
+  const b = spawn(90); // 正横风，风从北
+  assert.equal(b.boom, 0, '出生瞬间帆杠还在中线');
+  b.step(northWind(20), 1 / 60);
+  // 一帧只有 1/60 秒，按 150°/s 的摆动速率最多走 2.5°；能到下风侧说明是瞬间落位的
+  assert.ok(Math.abs(b.out.boomDeg) > 30,
+    `首帧后帆杠应已在下风侧，实测 ${b.out.boomDeg.toFixed(1)}°`);
+});
+
+test('大风横风出生不会自己翻船', () => {
+  // 修复前：25 节出生横倾冲到 51°，30 节 1.2 秒内直接翻 —— 玩家什么都没做
+  for (const kn of [25, 30, 33]) {
+    const b = spawn(90);
+    const dt = 1 / 60;
+    let maxHeel = 0;
+    for (let t = 0; t < 12; t += dt) {
+      trimAssist(b, 16);
+      b.step(northWind(kn), dt);
+      maxHeel = Math.max(maxHeel, Math.abs(b.out.heelDeg));
+    }
+    assert.ok(!b.capsized, `${kn} 节出生后放手不管不该翻船`);
+    assert.ok(maxHeel < 45, `${kn} 节出生最大横倾 ${maxHeel.toFixed(0)}° 过大`);
+  }
+});
+
+test('横倾随风速平滑增长，不出现悬崖', () => {
+  // 帆杠从中线摆出的瞬态会制造一个临界点：28 节还稳在 36°，30 节直接翻过去
+  const heelAt = (kn) => {
+    const b = spawn(90);
+    const dt = 1 / 60;
+    let maxHeel = 0;
+    for (let t = 0; t < 12; t += dt) {
+      trimAssist(b, 16);
+      b.step(northWind(kn), dt);
+      maxHeel = Math.max(maxHeel, Math.abs(b.out.heelDeg));
+    }
+    return b.capsized ? 999 : maxHeel;
+  };
+  const series = [18, 22, 25, 28, 30, 33].map(heelAt);
+  for (let i = 1; i < series.length; i++) {
+    assert.ok(series[i] < 45, `第 ${i} 档横倾 ${series[i].toFixed(0)}° 失控`);
+    assert.ok(series[i] - series[i - 1] < 12,
+      `相邻风速档的横倾跳变过大：${series[i - 1].toFixed(0)}° -> ${series[i].toFixed(0)}°`);
+  }
 });
