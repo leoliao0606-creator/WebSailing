@@ -144,7 +144,12 @@ console.log('\n=== 场景：顶风死区 ===');
   simulate(b, 30, (bt) => { steerTowards(bt, -45 * DEG); trimAssist(bt, 18); });
   simulate(b, 25, (bt) => { steerTowards(bt, 0); bt.ctl.sheet = 0; });
   console.log(`  顶风 25s 后：速度 ${b.out.speedKn.toFixed(2)}kn  u=${b.u.toFixed(2)}m/s  inIrons=${b.out.inIrons}  sternway=${b.out.sternway}`);
-  check('顶风失速（死区）', Math.abs(b.u) < 0.8, `u=${b.u.toFixed(2)}`);
+  // 死区(in irons)的定义是「无法前进」而不是「静止」：正顶风、帆收在中线的船
+  // 会被风推着倒退，这正是 in irons 的表现。原判据写的是 |u|<0.8，把倒退一并
+  // 算成失败；而且在 steerTowards 学会倒航反打之前，船压根保持不住顶风
+  // (艏向在 -44°~-1° 之间来回摆)，u 只是那个震荡里的瞬时采样，换个时刻就会翻。
+  check('顶风失速（死区）', b.u < 0.2, `u=${b.u.toFixed(2)}`);
+  check('死区倒退速度有界', b.u > -2.2, `u=${b.u.toFixed(2)}`);
 }
 
 console.log('\n=== 场景：波浪中的航行（对照平水）===');
