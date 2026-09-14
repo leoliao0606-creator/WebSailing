@@ -412,20 +412,36 @@ export function createBoatVisual(opts = {}) {
   const sailNormals = { interval: 1, frame: 0 };
 
   function update(phys, waveField, time, dt) {
-    // 波面姿态
-    const w = waveField.sample(phys.x, phys.z);
-    const fwdX = Math.sin(phys.psi), fwdZ = -Math.cos(phys.psi);
+    // 姿态优先取物理的浮体状态（升沉/纵摇是真的有惯性的自由度，见 boatPhysics
+    // .stepBuoyancy）。没有浮体状态的对象——幽灵船回放用的桩状态——退回原来的
+    // "贴浪面"近似。
+    const buoy = phys.wave;
     const rgtX = Math.cos(phys.psi), rgtZ = Math.sin(phys.psi);
-    const pitchWave = Math.atan2(-(w.nx * fwdX + w.nz * fwdZ), w.ny) * 0.7;
-    const rollWave = Math.atan2(-(w.nx * rgtX + w.nz * rgtZ), w.ny) * 0.35;
-    const bowUp = phys.out.planing * 0.06 + clamp(phys.u, 0, 6) * 0.004;
-    smPitch = damp(smPitch, pitchWave + bowUp, 5, dt);
-    smRoll = damp(smRoll, rollWave, 5, dt);
-    smHeave = damp(smHeave, w.y, 8, dt);
+    let pitchT, heaveT, rollT;
+    if (buoy && buoy.active) {
+      // 滑行抬艏是船底只有后半段贴水的几何姿态，物理层加成力矩会引起刚度崩溃
+      // （见 boatPhysics.stepBuoyancy 的注释），所以在这里做视觉偏置
+      pitchT = buoy.theta + phys.out.planing * 0.06 + clamp(phys.u, 0, 6) * 0.004;
+      heaveT = buoy.heaveY;
+      // 横摇主体已经在 phys.phi 里（浪面横向坡度的力矩进了物理），这里只补一点
+      // 船体贴合浪面的瞬时几何
+      const w = waveField.sample(phys.x, phys.z);
+      rollT = Math.atan2(-(w.nx * rgtX + w.nz * rgtZ), w.ny) * 0.12;
+    } else {
+      const w = waveField.sample(phys.x, phys.z);
+      const fwdX = Math.sin(phys.psi), fwdZ = -Math.cos(phys.psi);
+      pitchT = Math.atan2(-(w.nx * fwdX + w.nz * fwdZ), w.ny) * 0.7
+        + phys.out.planing * 0.06 + clamp(phys.u, 0, 6) * 0.004;
+      rollT = Math.atan2(-(w.nx * rgtX + w.nz * rgtZ), w.ny) * 0.35;
+      heaveT = w.y - 0.04;
+    }
+    smPitch = damp(smPitch, pitchT, 12, dt);
+    smRoll = damp(smRoll, rollT, 5, dt);
+    smHeave = damp(smHeave, heaveT, 16, dt);
 
     // 大角度横倾时船体浮起（舷宽 < 型深，侧躺吃水更浅）
     const heelLift = Math.pow(Math.abs(Math.sin(phys.phi)), 2) * 0.3;
-    group.position.set(phys.x, smHeave - 0.04 + heelLift, phys.z);
+    group.position.set(phys.x, smHeave + heelLift, phys.z);
     group.rotation.set(smPitch, -phys.psi, -(phys.phi + smRoll), 'YXZ');
 
     // 帆杠 / 舵 / 稳向板 / 风向标

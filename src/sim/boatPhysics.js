@@ -1,4 +1,5 @@
-// 稳向板帆船 4 自由度动力学：前进(surge)/横漂(sway)/艏摇(yaw)/横摇(roll)。
+// 稳向板帆船 6 自由度动力学：前进(surge)/横漂(sway)/艏摇(yaw)/横摇(roll)
+// + 升沉(heave)/纵摇(pitch)。后两个由分段浮力驱动，见 stepBuoyancy。
 // 船体坐标系：x=艏向前，y=右舷。横倾 φ>0 = 右舷下沉。罗盘角顺时针为正。
 //
 // 物理来源一览：
@@ -6,6 +7,8 @@
 //  - 稳向板/舵叶：有限展弦比对称翼，失速角 ~16°（低速大侧滑时横漂）
 //  - 船体：黏性 + 兴波阻力（Froude 峰），高速滑行减阻
 //  - 横摇：帆侧力 × 力臂 vs 船员压舷 + 船型稳性（大角度崩溃 → 翻船）
+//  - 升沉/纵摇：沿船长 5 站的水线面浮力，船有自己的惯性和固有周期，不是贴在浪面上
+//  - 顶浪掉速、冲上浪顶后腾空砸水、碎浪被船长平均掉，全部由上一条自然涌现
 //  - 表观风、艏摇诱导流、倒车流动（失速进入死区后会倒漂）全部自然涌现
 
 import { DEG, KN, clamp, lerp, smoothstep, wrapPi } from '../util/math.js';
@@ -59,16 +62,37 @@ export const BOAT = {
   boardRate: 0.6,
   capsizeDeg: 80,       // 判定翻船角
   rightingTime: 3.0,    // 按住扶正到位所需秒数
-  cOrbital: 0.7,        // 波浪轨道流速对水动力的耦合系数（船体吃水处略衰减）
+  cOrbital: 0.85,       // 波浪轨道流速对水动力的耦合系数（深度衰减已由 orbitalDepth 承担）
   cSurf: 1.0,           // 浪面坡度推力增益（冲浪/顶浪的来源）
   cSurfRelief: 0.5,     // 冲浪时船体卸载：自身波系叠加浪面，兴波阻力下降比例
   cRollWave: 0.45,       // 浪面横向坡度 -> 横摇力矩增益（浮力回复趋向浪面法线；大浪摇船与横浪翻船风险的来源）
   cRunHeel: 95,          // 正顺风上风侧横倾力矩（N·m@全深顺风）：平衡舵感/减摇的真实技巧，也是 death-roll 的种子
   runHeelDeg: 8,         // 自动压舷在正顺风时目标的上风微倾角（°）
+  // —— 垂向（浮体）动力学 ——
+  lwlHalf: 2.03,        // 半水线长 m：浮力站位沿船长的分布范围
+  awp: 3.45,            // 水线面积 m²；浮力刚度 = ρ·g·Awp ≈ 34.7 kN/m
+  submMax: 0.22,        // 浸没深度的软饱和上限 m（线性浮力在深浸没时会严重高估）
+  kHeaveAdd: 1.55,      // 升沉附加质量系数 → 固有周期 ~0.53 s
+  Iy: 175,              // 纵摇转动惯量 kg·m²（回转半径 ~0.26 倍船长）
+  kPitchAdd: 2.6,       // 纵摇附加惯量系数（小艇纵摇要带动大量水）→ 固有周期 ~0.60 s
+  draft: 0.13,          // 船体吃水 m（不含稳向板）：浸没率以它为尺度
+  cHeaveDamp: 2640,     // 升沉阻尼 N·s/m（阻尼比 ~0.45）
+  cHeaveDampQ: 900,     // 升沉二次阻尼 N/(m/s)²：大幅运动时才显著，压住砸水回弹
+  cPitchDamp: 3990,     // 纵摇阻尼 N·m·s/rad（阻尼比 ~0.40）
+  cPitchDampQ: 3200,    // 纵摇二次阻尼 N·m/(rad/s)²：压住大浪里的纵摇发散
+  cSlam: 55,            // 艏部埋首增阻 N/(m·(m/s)²)：埋进浪里那部分船体的正面阻力
+  cAddRes: 115,         // 波浪增阻 N/(m/s)²：艏部相对水面上下越猛，辐射掉的波能越多
+  orbitalDepth: 0.24,   // 轨道流速的等效作用深度 m（船体吃水与稳向板的加权）
 };
 
+// 浮力站位：沿船长从艏(+1)到艉(-1)，乘 lwlHalf 得到体轴纵向坐标。
+const STATIONS = [1.0, 0.5, 0.0, -0.5, -1.0];
+// 各站的水线面占比（中部宽、两端窄，艉略宽于艏），已归一化到和为 1。
+// Σ wᵢ·sᵢ² 决定纵摇刚度，这组权重给出 ≈3.9 m⁴ 的水线面纵向惯性矩，与实船相当。
+const STATION_W = [0.105, 0.2375, 0.2875, 0.25, 0.12];
+
 // 平水环境（不传波浪场时使用）
-const FLAT_WAVE = { ovx: 0, ovz: 0, ax: 0, az: 0 };
+const FLAT_WAVE = { ovx: 0, ovz: 0, ax: 0, az: 0, immersion: 1, bowExcess: 0, bowRate: 0 };
 
 // 来流从弦尾方向打来（倒航）时把弦参考翻 180°，使对称翼在反向流中给出正确反号的
 // 升力 —— 否则 foilForce2D 在 ~160° 反流区落入失速拟合，侧力不反号，倒航舵不会反打。
@@ -96,6 +120,20 @@ export class BoatPhysics {
     this.capsized = false;
     this.rightProgress = 0;
     this.powerScale = 1;           // 帆效率外部缩放(航行规则处罚等),1 = 正常
+    // —— 垂向（浮体）状态，由 stepBuoyancy 推进 ——
+    this.wave = {
+      active: false,   // 是否正被波浪场驱动（渲染层据此决定用物理姿态还是回退近似）
+      heaveY: -this.mass / (RHO_WATER * this.p.awp), // 船体基准面相对静水面的高度 m
+      heaveRate: 0,
+      theta: 0,        // 纵摇角 rad（+ = 艏抬）
+      thetaRate: 0,
+      immersion: 1,    // 平均浸没率 0..1（1 = 正常吃水，0 = 整条船离开水面）
+      bowExcess: 0,    // 艏站超出平衡吃水的浸没深度 m（顶浪增阻用）
+      slamSpeed: 0,    // 砸水强度：艏部浸没变深的速度 m/s（音效/浪花用）
+      bowRate: 0,      // 艏站相对水面的垂向速度 m/s（有符号，波浪增阻用）
+      ovx: 0, ovz: 0,  // 波浪轨道流速（世界系，已按等效深度衰减，全船加权平均）
+      ax: 0, az: 0,    // 浪面坡度产生的水平加速度（世界系，全船加权平均）
+    };
     // —— 控制输入 ——
     this.ctl = { rudder: 0, sheet: 1, board: 1, hike: 0, autoHike: true, righting: false, autoTrim: false };
     // —— 诊断输出（HUD/AI/教学读取）——
@@ -105,6 +143,9 @@ export class BoatPhysics {
       driveN: 0, sideN: 0, rudderDeg: 0, inIrons: false, sternway: false,
       surf: 0, // 浪面坡度沿艏向的推进加速度 m/s²（+ = 正在被浪推，HUD 冲浪提示）
       currentKn: 0, currentSetDeg: 0, // 环境水流速度（节）与去向罗盘角（HUD 潮流指示）
+      pitchDeg: 0,   // 纵摇角（+ = 艏抬）
+      airborne: 0,   // 腾空程度 0..1（1 = 船体完全离开水面，舵效大幅下降）
+      slamSpeed: 0,  // 艏部砸水强度 m/s
     };
   }
 
@@ -122,21 +163,8 @@ export class BoatPhysics {
 
   // 主步进。wind: WindField；waves: WaveField（可选，平水时省略）；dt 内部再细分。
   step(wind, dt, waves = null) {
-    // 波浪环境每帧采样一次（波长 >> 单帧位移）：艏艉两点平均，
-    // 短于船长的碎浪自然被平均掉，只有长浪能推船。
-    const wv = this._waveEnv ??= { ovx: 0, ovz: 0, ax: 0, az: 0 };
-    if (waves) {
-      const fwdX = Math.sin(this.psi), fwdZ = -Math.cos(this.psi);
-      const a = waves.sample(this.x + fwdX * 1.35, this.z + fwdZ * 1.35, this._wsBow ??= {});
-      const b = waves.sample(this.x - fwdX * 1.35, this.z - fwdZ * 1.35, this._wsAft ??= {});
-      wv.ovx = (a.vx + b.vx) * 0.5;
-      wv.ovz = (a.vz + b.vz) * 0.5;
-      // 浪面坡度产生的沿坡向下水平加速度：a = -g·∇y = g·(nx,nz)/ny
-      wv.ax = G * 0.5 * (a.nx / a.ny + b.nx / b.ny);
-      wv.az = G * 0.5 * (a.nz / a.ny + b.nz / b.ny);
-    } else {
-      wv.ovx = wv.ovz = wv.ax = wv.az = 0;
-    }
+    // 波浪环境（轨道流速、浪面坡度、浸没率）随垂向动力学一起在 stepBuoyancy 里算出
+    this.stepBuoyancy(waves, dt);
     const SUB = 1 / 120;
     let t = dt;
     while (t > 1e-6) {
@@ -144,6 +172,123 @@ export class BoatPhysics {
       this._substep(wind, h);
       t -= h;
     }
+  }
+
+
+  // —— 浮体垂向动力学：升沉(heave) + 纵摇(pitch) ——
+  // 沿船长取 5 个站位采样波面，每站按线性化水线面浮力 ρ·g·Awp·wᵢ·浸没深度 给出
+  // 垂向力：合力驱动升沉，对重心的力矩驱动纵摇。顺带算出全船平均的轨道流速与
+  // 浪面坡度，供 _substep 的水动力使用。
+  //
+  // 与"把船贴在浪面上"的关键差别是船有自己的惯性和固有周期（升沉 ~0.53 s、
+  // 纵摇 ~0.60 s），于是：
+  //  - 短于船长的碎浪在各站之间相互抵消，船跨过去而不跟着抖；
+  //  - 冲上浪顶后各站浸没归零 → 浮力消失 → 腾空 → 落回砸水；
+  //  - 顶浪时艏站埋得深，超出平衡吃水的部分正对来流 → 额外阻力 → 顶浪掉速。
+  //
+  // 和 step() 分开，是因为联机的远端船只走渲染路径、不推进物理，但一样要在浪里
+  // 起伏：boat.js 会对本帧没跑过 step 的船补调本方法（见 Boat.render）。
+  stepBuoyancy(waves, dt) {
+    const p = this.p;
+    const b = this.wave;
+    const d0 = this.mass / (RHO_WATER * p.awp); // 平衡浸没深度 m（总浮力 = 重力）
+    const h = Math.min(Math.max(dt, 0), 0.25);  // 掉帧时不让垂向积分跨过固有周期
+    if (!waves) {
+      // 平水：垂向状态松弛回平衡位，并告诉渲染层不要用物理姿态
+      const k = 1 - Math.exp(-h * 6);
+      b.heaveY = lerp(b.heaveY, -d0, k);
+      b.theta = lerp(b.theta, 0, k);
+      b.heaveRate *= 1 - k;
+      b.thetaRate *= 1 - k;
+      b.immersion = 1;
+      b.bowExcess = b.slamSpeed = 0;
+      b.ovx = b.ovz = b.ax = b.az = 0;
+      b.active = false;
+      return;
+    }
+
+    // —— 波面采样：每帧一次就够（一帧内船的位移和波面的变化都远小于波长）——
+    const fwdX = Math.sin(this.psi), fwdZ = -Math.cos(this.psi);
+    const st = this._stations ??= STATIONS.map(() => ({ s: 0, y: 0, out: {} }));
+    let ovx = 0, ovz = 0, ax = 0, az = 0;
+    for (let i = 0; i < STATIONS.length; i++) {
+      const s = STATIONS[i] * p.lwlHalf;
+      // 轨道流速按等效作用深度衰减：碎浪在吃水处已经没剩多少，长浪几乎不衰减
+      const o = waves.sample(this.x + fwdX * s, this.z + fwdZ * s, st[i].out, p.orbitalDepth);
+      const wgt = STATION_W[i];
+      st[i].s = s;
+      st[i].y = o.y;
+      ovx += o.vx * wgt;
+      ovz += o.vz * wgt;
+      // 浪面坡度产生的沿坡向下水平加速度：a = -g·∇y = g·(nx,nz)/ny
+      ax += G * (o.nx / o.ny) * wgt;
+      az += G * (o.nz / o.ny) * wgt;
+    }
+    b.ovx = ovx; b.ovz = ovz; b.ax = ax; b.az = az;
+    b.active = true;
+
+    // —— 刚度与惯量 ——
+    const kBuoy = RHO_WATER * G * p.awp;   // 单位浸没深度的总浮力 N/m
+    const mEff = this.mass * p.kHeaveAdd;
+    const iEff = p.Iy * p.kPitchAdd;
+    // 注：滑行抬艏不在这里加力矩。抬艏会让前半船离水，纵摇恢复力矩随之消失
+    // （刚度崩溃），任何常量抬艏力矩都会把姿态一路顶到上限卡死。真实的滑行抬艏
+    // 是船底只有后半段贴水的几何姿态，不是力偶，所以放在渲染层做偏置。
+    const weight = this.mass * G;
+    const submMax = p.submMax;
+
+    const SUB = 1 / 120;
+    let t = h;
+    let submBow = b.bowExcess + d0;
+    while (t > 1e-6) {
+      const dtx = Math.min(SUB, t);
+      t -= dtx;
+      let fz = -weight;
+      let tau = 0;
+      let rawAvg = 0;
+      const sinT = Math.sin(b.theta);
+      for (let i = 0; i < STATIONS.length; i++) {
+        const s = st[i].s;
+        const hull = b.heaveY + s * sinT;    // 该站船体基准面的高度
+        const raw = st[i].y - hull;          // 水面高出基准面的量 = 浸没深度
+        // 软饱和：线性水线面浮力在深浸没时严重高估（船体是尖的，甲板以上没有型宽）
+        const subm = raw <= 0 ? 0 : submMax * (1 - Math.exp(-raw / submMax));
+        const f = kBuoy * STATION_W[i] * subm;
+        fz += f;
+        tau += f * s;                        // s>0(艏)浸没深 → 抬艏力矩
+        rawAvg += raw * STATION_W[i];
+        if (i === 0) submBow = subm;
+      }
+      fz -= p.cHeaveDamp * b.heaveRate + p.cHeaveDampQ * b.heaveRate * Math.abs(b.heaveRate);
+      tau -= p.cPitchDamp * b.thetaRate + p.cPitchDampQ * b.thetaRate * Math.abs(b.thetaRate);
+      b.heaveRate += (fz / mEff) * dtx;
+      b.thetaRate += (tau / iEff) * dtx;
+      b.heaveY += b.heaveRate * dtx;
+      const th = b.theta + b.thetaRate * dtx;
+      // 撞到姿态上限时把角速度一并吃掉，否则会贴着上限来回抽
+      if (th > 0.5) { b.theta = 0.5; b.thetaRate = Math.min(b.thetaRate, 0); }
+      else if (th < -0.5) { b.theta = -0.5; b.thetaRate = Math.max(b.thetaRate, 0); }
+      else b.theta = th;
+      // 浸没率以船体真实吃水为尺度，而不是线性化浮力那 4.5 cm 的等效浸没深度：
+      // 基准面齐平波面就算全浸，要整整浮起一个吃水才算完全离水。用等效浸没深度
+      // 做尺度会把"稍微跟不上浪面"误判成腾空，船体阻力被大片抹掉，结果浪里反而
+      // 比平水跑得快。
+      b.immersion = clamp((rawAvg + p.draft) / p.draft, 0, 1);
+    }
+    // 防漂移兜底：船体不可能离开中站波面几米远
+    const yRef = st[2].y;
+    if (b.heaveY > yRef + 2.5) { b.heaveY = yRef + 2.5; b.heaveRate = Math.min(b.heaveRate, 0); }
+    if (b.heaveY < yRef - 2.5) { b.heaveY = yRef - 2.5; b.heaveRate = Math.max(b.heaveRate, 0); }
+
+    const bowExcess = Math.max(0, submBow - d0);
+    // 砸水强度 = 艏部浸没变深的速度，入水瞬间最大（音效与浪花取用）
+    b.slamSpeed = Math.max(0, (bowExcess - b.bowExcess) / Math.max(h, 1e-4));
+    b.bowExcess = bowExcess;
+    // 艏站相对水面的垂向速度（有符号）：顶浪时船与浪相向而行，遭遇频率高、
+    // 艏部剧烈起落；顺浪时船跟着浪走，这个量小得多。波浪增阻按它的平方计。
+    const rawBow = st[0].y - (b.heaveY + st[0].s * Math.sin(b.theta));
+    b.bowRate = (rawBow - (this._rawBowPrev ?? rawBow)) / Math.max(h, 1e-4);
+    this._rawBowPrev = rawBow;
   }
 
   _substep(wind, dt) {
@@ -215,7 +360,16 @@ export class BoatPhysics {
     }
 
     // —— 波浪环境：水体本身在动（轨道流速），船沿浪面还受坡度推力 ——
-    const wv = this._waveEnv ?? FLAT_WAVE;
+    const wv = this.wave.active ? this.wave : FLAT_WAVE;
+    // 浸没率：冲上浪顶后船体离开水面，一切水动力随之消失 —— 这就是腾空时舵一点不
+    // 咬水、落回来才重新有反应的原因。稳向板和舵叶深插在水下（0.55 / 0.38 m），
+    // 船体离水时它们大半还在水里，所以衰减得比船体轻得多。
+    const imm = wv.immersion;
+    const immFoil = 0.45 + 0.55 * imm;
+    // 船体阻力只在真正整船腾空时才消失，不随浸没率线性缩放：顶浪时船在浪里
+    // 颠簸，平均浸没率会掉到 0.7 上下，但湿表面积其实不减反增（艏部埋进浪里）。
+    // 按平均浸没率打折会让"颠簸"变成减阻，顶浪反而比平水跑得快。
+    const immHull = smoothstep(0.02, 0.35, imm);
     // 水动力参照系 = 波浪轨道流速（吃水处衰减）+ 环境水流（整片水体平移，不衰减）。
     // 船位积分的是对地速度 u/v，故稳态下船会随水流漂移；表观风仍用对地速度（空气不随水动）。
     const cur = this.current;
@@ -226,10 +380,11 @@ export class BoatPhysics {
     let surfAcc = 0;
     let waveRollAcc = 0; // 浪面横向坡度加速度(未乘 cSurf),供横摇力矩
     {
-      const sax = toBodyX(wv.ax, wv.az) * p.cSurf;
-      const say = toBodyY(wv.ax, wv.az) * p.cSurf;
+      // 坡度推力本质是浮力的水平分量，船离水时它一起消失
+      const sax = toBodyX(wv.ax, wv.az) * p.cSurf * imm;
+      const say = toBodyY(wv.ax, wv.az) * p.cSurf * imm;
       surfAcc = sax;
-      waveRollAcc = toBodyY(wv.ax, wv.az);
+      waveRollAcc = toBodyY(wv.ax, wv.az) * imm;
       Fx += this.mass * sax;
       Fy += this.mass * say * 0.5; // 横向坡度推力打折：横摇-横漂耦合未建模
     }
@@ -241,7 +396,7 @@ export class BoatPhysics {
     {
       const flowX = -ru;
       const flowY = -(rv + this.yawRate * p.boardX);
-      const f = foilForce2D(flowX, flowY, chordForFlow(0, flowX, flowY), boardArea, RHO_WATER,
+      const f = foilForce2D(flowX, flowY, chordForFlow(0, flowX, flowY), boardArea * immFoil, RHO_WATER,
         (a) => foilCoeffs(a, boardAspect, 16));
       Fx += f.fx; Fy += f.fy;
       tauYaw += p.boardX * f.fy;
@@ -251,7 +406,7 @@ export class BoatPhysics {
     if (!this.capsized) {
       const flowX = -ru;
       const flowY = -(rv + this.yawRate * p.rudderX);
-      const f = foilForce2D(flowX, flowY, chordForFlow(this.rudder, flowX, flowY), p.rudderArea, RHO_WATER,
+      const f = foilForce2D(flowX, flowY, chordForFlow(this.rudder, flowX, flowY), p.rudderArea * immFoil, RHO_WATER,
         (a) => foilCoeffs(a, p.rudderAspect, 24));
       Fx += f.fx; Fy += f.fy;
       tauYaw += p.rudderX * f.fy;
@@ -268,9 +423,16 @@ export class BoatPhysics {
       const surfK = clamp(surfAcc / 0.5, 0, 1) * smoothstep(0.34, 0.48, fr);
       const bell = 4.8 * Math.exp(-Math.pow((fr - 0.44) / 0.15, 2)) * (1 - p.cSurfRelief * surfK);
       const heelPenalty = 1 + 0.7 * Math.sin(this.phi) * Math.sin(this.phi);
-      const R = (p.cViscous + p.cWave * bell + p.cPlane * plane) * heelPenalty * ru * Math.abs(ru);
+      const R = (p.cViscous + p.cWave * bell + p.cPlane * plane) * heelPenalty * immHull * ru * Math.abs(ru);
       Fx -= R;
-      Fy -= p.cSway * rv * Math.abs(rv) + 90 * rv;
+      Fy -= (p.cSway * rv * Math.abs(rv) + 90 * rv) * immHull;
+      // 埋首阻力：艏站浸没超过平衡吃水时，多出来的浸没面正对来流
+      if (ru > 0) Fx -= p.cSlam * wv.bowExcess * ru * ru;
+      // 波浪增阻：船在浪里上下起落做功，能量以辐射波的形式带走，表现为掉速。
+      // 顶浪时船与浪相向而行，遭遇频率高、艏部起落剧烈，这项显著；顺浪时船跟着
+      // 浪走，艏部相对水面几乎不动，这项自动趋近于零 —— 顶浪掉速、顺浪不掉的
+      // 真正来源，不是靠给两种航向分别写系数。
+      Fx -= p.cAddRes * wv.bowRate * wv.bowRate * Math.sign(ru || 1) * immHull;
       // 翻船时巨大阻水
       if (this.capsized) { Fx -= 260 * ru * Math.abs(ru) + 160 * ru; Fy -= 420 * rv; }
     }
@@ -376,6 +538,9 @@ export class BoatPhysics {
     o.rudderDeg = -this.rudder / DEG; // 转右为正，供 HUD
     o.inIrons = Math.abs(o.twaDeg) < 35 && this.u < 0.6 && !this.capsized;
     o.sternway = this.u < -0.05;
+    o.pitchDeg = this.wave.theta / DEG;
+    o.airborne = 1 - imm;
+    o.slamSpeed = this.wave.slamSpeed;
     o.currentKn = Math.hypot(cur.vx, cur.vz) / KN;
     o.currentSetDeg = (Math.atan2(cur.vx, -cur.vz) / DEG + 360) % 360; // 水流去向罗盘角
   }

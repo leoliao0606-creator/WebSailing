@@ -152,7 +152,7 @@ export class BoatEffects {
       this.samples.unshift({ x: sx, z: sz, rx, rz, age: 0, str: clamp01(spd / 3) * (0.6 + phys.out.planing * 0.4) });
       if (this.samples.length > WAKE_N) this.samples.pop();
     }
-    const yLift = 0.05 + this.waveField.waves[0].amp * 0.18;
+    const yLift = 0.05 + this.waveField.peakAmp * 0.18;
     const pos = this.wakeGeo.attributes.position;
     const uv = this.wakeGeo.attributes.uv;
     const al = this.wakeGeo.attributes.aAlpha;
@@ -178,7 +178,10 @@ export class BoatEffects {
     pos.needsUpdate = true; uv.needsUpdate = true; al.needsUpdate = true;
 
     // —— 艏浪花 ——
-    const sprayRate = spd > 2.6 ? (spd - 2.4) * (3 + phys.out.planing * 26) : 0;
+    // 速度带起的持续浪花 + 艏部砸进浪里那一下溅起的爆发
+    const slam = phys.wave?.slamSpeed ?? 0;
+    const sprayRate = (spd > 2.6 ? (spd - 2.4) * (3 + phys.out.planing * 26) : 0)
+      + (slam > 0.8 ? (slam - 0.8) * 55 : 0);
     this.spawnAcc += sprayRate * dt;
     const fwdX = Math.sin(phys.psi), fwdZ = -Math.cos(phys.psi);
     const rgtX = Math.cos(phys.psi), rgtZ = Math.sin(phys.psi);
@@ -195,7 +198,7 @@ export class BoatEffects {
       const kick = 0.5 + Math.random() * 1.3;
       p.vx = fwdX * spd * 0.45 + rgtX * side * kick;
       p.vz = fwdZ * spd * 0.45 + rgtZ * side * kick;
-      p.vy = 0.8 + Math.random() * 1.6 + phys.out.planing * 1.2;
+      p.vy = 0.8 + Math.random() * 1.6 + phys.out.planing * 1.2 + Math.min(slam, 2.5) * 0.9;
       p.max = p.life = 0.5 + Math.random() * 0.45;
     }
     const ppos = this.sprayGeo.attributes.position;

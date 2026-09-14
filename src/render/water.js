@@ -1,13 +1,22 @@
 // 写实水面：Gerstner 顶点位移（与 CPU 物理同参数同相位）+ 菲涅尔天空反射
 // + 太阳高光/闪烁 + 浪尖白沫 + 阵风暗斑（与 JS 风场噪声逐位一致，可"读风"）。
+//
+// 网格用径向布局（顶点沿半径指数分布，中心跟随相机）而非均匀方格：均匀方格要
+// 同时覆盖 1.7km 视距和分米级碎浪是做不到的（256 段铺 1700m = 6.6m 一格，连 21m
+// 的主浪都只有 3 个采样点，波峰被采成折线且随网格跳动）。径向布局让近处格距降到
+// 分米级，远场格距放到几十米，顶点总数反而更少。
+// 配套地，每个波按"在当地能被几个顶点采到"自动衰减，超出网格解析力的碎浪平滑
+// 消失（它们在远处本来也只该表现为粗糙的反射，那由片元着色器的法线扰动负责）。
 
 import * as THREE from 'three';
-import { WAVE_COUNT } from '../sim/waves.js';
+import { WAVE_COUNT, WAVE_STRIDE } from '../sim/waves.js';
 import { FOG_COLOR } from './sceneSetup.js';
 
 const VERT = /* glsl */ `
 uniform float uTime;
-uniform float uWaves[${WAVE_COUNT * 6}]; // dx,dz,k,w,amp,q
+uniform float uWaves[${WAVE_COUNT * WAVE_STRIDE}]; // dx,dz,k,w,amp,q,ph
+uniform float uGridR0;    // 径向网格最内环半径 m
+uniform float uGridK;     // 相邻环的相对间距 Δr/r（指数分布的增长率）
 varying vec3 vWorld;
 varying vec3 vNormal;
 varying float vCrest;
@@ -16,7 +25,9 @@ varying float vDist;
 void main() {
   vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
   float distCam = distance(wp, cameraPosition);
-  float fade = 1.0 - smoothstep(260.0, 900.0, distCam);
+  // 顶点到网格中心的半径决定当地格距（局部坐标原点即网格中心）
+  float ring = max(length(position.xz), uGridR0);
+  float cell = ring * uGridK;
 
   vec3 p = wp;
   vec3 tx = vec3(1.0, 0.0, 0.0);
@@ -25,10 +36,15 @@ void main() {
   float crestNorm = 0.0001;
 
   for (int i = 0; i < ${WAVE_COUNT}; i++) {
-    float dx = uWaves[i*6+0], dz = uWaves[i*6+1];
-    float k  = uWaves[i*6+2], w  = uWaves[i*6+3];
-    float A  = uWaves[i*6+4] * fade, Q = uWaves[i*6+5];
-    float ph = k * (dx * wp.x + dz * wp.z) - w * uTime;
+    float dx = uWaves[i*${WAVE_STRIDE}+0], dz = uWaves[i*${WAVE_STRIDE}+1];
+    float k  = uWaves[i*${WAVE_STRIDE}+2], w  = uWaves[i*${WAVE_STRIDE}+3];
+    float Q  = uWaves[i*${WAVE_STRIDE}+5], PH = uWaves[i*${WAVE_STRIDE}+6];
+    // 可解析度：一个波长被几个顶点采到。低于 ~4 点开始衰减，低于 2 点（奈奎斯特
+    // 极限）归零，否则短波在稀疏网格上会退化成随位置乱跳的噪声。
+    float lambda = 6.2831853 / k;
+    float res = 1.0 - smoothstep(0.22, 0.5, cell / lambda);
+    float A  = uWaves[i*${WAVE_STRIDE}+4] * res;
+    float ph = k * (dx * wp.x + dz * wp.z) - w * uTime + PH;
     float c = cos(ph), s = sin(ph);
     // Gerstner：水平向波峰聚拢 + 垂直起伏
     p.x += Q * A * dx * c;
@@ -119,7 +135,8 @@ void main() {
     float s1 = vnoise(vWorld.xz * 0.55 - uWindFlow * uTime * 0.55);
     float s2 = vnoise(vWorld.xz * 2.3 - uWindFlow * uTime * 1.4 + 13.7);
     s3 = vnoise(vWorld.xz * 7.1 + vec2(uTime * 0.4, -uTime * 0.33));
-    float str = (0.16 + 0.15 * gustPos) * (0.25 + 0.75 * detailFade);
+    // 顶点位移只做得动长浪；分米到米级的粗糙感全靠这层噪声法线，所以它要够强
+    float str = (0.23 + 0.17 * gustPos) * (0.32 + 0.68 * detailFade);
     str *= 1.0 - 0.5 * min(lull, 1.0);
     N = normalize(N + vec3(s1 - 0.5, 0.0, s2 - 0.5) * str + vec3(s3 - 0.5, 0.0, 0.5 - s3) * str * 0.5);
   }
@@ -165,23 +182,72 @@ void main() {
 }
 `;
 
-// 水面细节档位 -> 网格分段数（顶点位移的采样密度）
-const WATER_SEGMENTS = { low: 96, medium: 160, high: 256 };
+// 水面细节档位 -> 径向网格的环数与周向分段数
+const WATER_GRID = {
+  low: { rings: 104, sectors: 120 },
+  medium: { rings: 144, sectors: 160 },
+  high: { rings: 184, sectors: 192 },
+};
+const GRID_R0 = 1.2;    // 最内环半径 m
+const GRID_RMAX = 3000; // 最外环半径 m（远超雾的可见距离，用来填满地平线）
+
+// 径向网格：环半径按指数分布（相邻环的间距正比于半径），中心跟随相机。
+// 近处格距降到分米级（碎浪的形状出得来），远场格距放到几十米（只剩长浪，而它们
+// 本来就被 uWaves 的可解析度衰减和雾一起吃掉）。
+function buildRadialGrid(rings, sectors) {
+  const count = rings * sectors + 1; // +1 = 圆心
+  const pos = new Float32Array(count * 3);
+  const growth = Math.pow(GRID_RMAX / GRID_R0, 1 / (rings - 1));
+  let p = 3; // 圆心留在 (0,0,0)
+  for (let j = 0; j < rings; j++) {
+    const r = GRID_R0 * Math.pow(growth, j);
+    for (let s = 0; s < sectors; s++) {
+      const a = (s / sectors) * Math.PI * 2;
+      pos[p++] = Math.cos(a) * r;
+      pos[p++] = 0;
+      pos[p++] = Math.sin(a) * r;
+    }
+  }
+  // 索引：圆心扇形 + 每条环带两个三角形。材质用 DoubleSide，绕序无关紧要。
+  const tri = sectors + (rings - 1) * sectors * 2;
+  const idx = count > 65535 ? new Uint32Array(tri * 3) : new Uint16Array(tri * 3);
+  let q = 0;
+  for (let s = 0; s < sectors; s++) {
+    idx[q++] = 0;
+    idx[q++] = 1 + ((s + 1) % sectors);
+    idx[q++] = 1 + s;
+  }
+  for (let j = 0; j < rings - 1; j++) {
+    const base = 1 + j * sectors, next = base + sectors;
+    for (let s = 0; s < sectors; s++) {
+      const s1 = (s + 1) % sectors;
+      idx[q++] = base + s; idx[q++] = next + s1; idx[q++] = next + s;
+      idx[q++] = base + s; idx[q++] = base + s1; idx[q++] = next + s1;
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), GRID_RMAX);
+  // 相邻环的相对间距 Δr/r —— 顶点着色器用它把半径换算成当地格距
+  geo.userData.gridK = growth - 1;
+  return geo;
+}
 
 export class Water {
   constructor(waveField, sunDir) {
     this.waveField = waveField;
-    this.size = 1700;
-    this.segments = 256;
-    const geo = new THREE.PlaneGeometry(this.size, this.size, this.segments, this.segments);
-    geo.rotateX(-Math.PI / 2);
+    this.detail = 'high';
+    const geo = buildRadialGrid(WATER_GRID.high.rings, WATER_GRID.high.sectors);
 
-    this.wavePack = new Float32Array(WAVE_COUNT * 6);
+    this.wavePack = new Float32Array(WAVE_COUNT * WAVE_STRIDE);
     waveField.packUniforms(this.wavePack);
 
     this.uniforms = {
       uTime: { value: 0 },
       uWaves: { value: this.wavePack },
+      uGridR0: { value: GRID_R0 },
+      uGridK: { value: geo.userData.gridK },
       uSunDir: { value: sunDir.clone() },
       uSunColor: { value: new THREE.Color(1.0, 0.92, 0.78) },
       uZenith: { value: new THREE.Color(0.11, 0.29, 0.5) },
@@ -203,6 +269,7 @@ export class Water {
       vertexShader: VERT,
       fragmentShader: FRAG,
       uniforms: this.uniforms,
+      side: THREE.DoubleSide,
     });
 
     this.mesh = new THREE.Mesh(geo, this.material);
@@ -210,7 +277,6 @@ export class Water {
     // 在船体的舱内深度遮罩塞块(renderOrder 1,见 boatModel.js)之后绘制,
     // 使舱内水面片元被深度测试剔除
     this.mesh.renderOrder = 2;
-    this.snap = this.size / this.segments;
   }
 
   // 时段/天气预设:同步太阳方向、日照颜色与雾(与 sceneSetup.applySkyPreset 一致)
@@ -223,22 +289,23 @@ export class Water {
     }
   }
 
-  // 画质设置：重建不同分段数的网格（着色器/uniform 不变）
+  // 画质设置：重建不同密度的径向网格（着色器不变，格距 uniform 跟着换）
   setDetail(level) {
-    const seg = WATER_SEGMENTS[level] ?? WATER_SEGMENTS.high;
-    if (seg === this.segments) return;
-    this.segments = seg;
-    const geo = new THREE.PlaneGeometry(this.size, this.size, seg, seg);
-    geo.rotateX(-Math.PI / 2);
+    const key = WATER_GRID[level] ? level : 'high';
+    if (key === this.detail) return;
+    this.detail = key;
+    const g = WATER_GRID[key];
+    const geo = buildRadialGrid(g.rings, g.sectors);
     this.mesh.geometry.dispose();
     this.mesh.geometry = geo;
-    this.snap = this.size / seg;
+    this.uniforms.uGridK.value = geo.userData.gridK;
   }
 
-  // 每帧：跟随相机（网格对齐防抖动），同步波/风参数
+  // 每帧：跟随相机，同步波/风参数
   update(wind, centerX, centerZ) {
-    const s = this.snap;
-    this.mesh.position.set(Math.round(centerX / s) * s, 0, Math.round(centerZ / s) * s);
+    // 径向网格随相机连续平移即可：近处环距只有几厘米，网格滑动看不出来；
+    // 远处环距大但波幅已被可解析度衰减压掉，也不会抖。
+    this.mesh.position.set(centerX, 0, centerZ);
     this.uniforms.uTime.value = this.waveField.time;
     this.waveField.packUniforms(this.wavePack);
 

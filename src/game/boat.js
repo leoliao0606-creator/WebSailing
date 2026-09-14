@@ -130,6 +130,7 @@ export class Boat {
     this._prevPos.x = p.x;
     this._prevPos.z = p.z;
     p.step(wind, dt, this.waveField);
+    this._steppedThisFrame = true; // 告诉 render 不要重复推进垂向动力学
 
     if (islands) this._collideIslands(islands);
 
@@ -158,10 +159,24 @@ export class Boat {
     }
     this._prevCapsized = p.capsized;
 
+    // 艏部砸水：取入水速度的上升沿，避免同一次入水连响。冷却 0.35 s 是一个
+    // 纵摇周期的量级（固有周期 ~0.6 s），一次砸水只出一声。
+    const slam = p.wave?.slamSpeed ?? 0;
+    this._slamCool = Math.max(0, (this._slamCool ?? 0) - dt);
+    if (slam > 0.9 && slam > (this._prevSlam ?? 0) && this._slamCool === 0) {
+      if (audio && this.isPlayer) audio.hullSlam((slam - 0.9) / 1.6);
+      this._slamCool = 0.35;
+    }
+    this._prevSlam = slam;
+
   }
 
   // 联机远端船只只消费权威快照并渲染，不在 guest 上推进物理。
   render(time, dt) {
+    // 远端船不跑 simulate，但一样要在浪里起伏：升沉/纵摇由确定性的波浪场加船位
+    // 推出来，各端算得一致，所以不必占用快照带宽。
+    if (!this._steppedThisFrame) this.phys.stepBuoyancy?.(this.waveField, dt);
+    this._steppedThisFrame = false;
     this.visual.update(this.phys, this.waveField, time, dt);
     this.effects.update(this.phys, dt);
   }

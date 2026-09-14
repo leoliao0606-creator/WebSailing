@@ -265,6 +265,12 @@ export class AudioEngine {
 
   gybeThunk() { this._burst(240, 0.16, 0.42); }
   splash() { this._burst(520, 1.1, 0.4, this.sea); }
+  // 艏部砸进浪里的闷响：比 splash 低频、短促，音量随入水速度
+  hullSlam(strength) {
+    const s = Math.min(1, strength);
+    if (s < 0.15) return;
+    this._burst(190 + 120 * s, 0.22 + 0.16 * s, 0.30 * s * s, this.sea);
+  }
 
   // UI 点击音:短促低增益方波 blip
   click() { this.beep(660, 0.05, 0.12); }

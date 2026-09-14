@@ -19,6 +19,7 @@ export class CameraRig {
     this._tmp = new THREE.Vector3();
     this._up = new THREE.Vector3(0, 1, 0);
     this._upBoat = new THREE.Vector3();
+    this.lookY = 1.1; // 追尾视角注视点高度：阻尼跟随船的升沉
   }
 
   cycle() {
@@ -55,9 +56,13 @@ export class CameraRig {
       this.pos.x = damp(this.pos.x, px, k, dt);
       this.pos.y = damp(this.pos.y, py, k * 0.8, dt);
       this.pos.z = damp(this.pos.z, pz, k, dt);
+      // 注视点跟一部分船的升沉：跟满了画面会随船一起抖，完全不跟则船在浪里
+      // 上下时画面纹丝不动，起伏感全被抵消掉。像跟拍艇那样阻尼跟随。
+      const boatY = phys.wave?.active ? phys.wave.heaveY : 0;
+      this.lookY = damp(this.lookY, 1.1 + boatY * 0.65, 3.5, dt);
       this.look.set(
         phys.x + Math.sin(psi + backYaw) * 5,
-        1.1,
+        this.lookY,
         phys.z - Math.cos(psi + backYaw) * 5
       );
       this.camera.position.copy(this.pos);
