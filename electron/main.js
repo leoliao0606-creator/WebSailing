@@ -5,6 +5,7 @@
 
 import path from 'node:path';
 import process from 'node:process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -29,6 +30,7 @@ import {
 } from './rendererFiles.js';
 import { formatMenuString, menuStrings } from './menuStrings.js';
 import { createUpdater, detectUpdateContext, updateMode } from './updater.js';
+import { gpuStartupPlan } from './gpuPreference.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, '..');
@@ -56,6 +58,10 @@ if (!USER_DATA_OVERRIDE && !app.requestSingleInstanceLock()) {
 // 同一局域网内两个 Chromium 之间建 DataChannel 时，mDNS 混淆的候选地址在部分
 // 家庭路由/Linux 环境解析不出来；桌面版本来就只在局域网里用，直接暴露内网 IP。
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
+const gpuPlan = gpuStartupPlan({ platform: process.platform, env: process.env, argv: process.argv,
+  nvidiaAvailable: existsSync('/proc/driver/nvidia/gpus') });
+Object.assign(process.env, gpuPlan.env);
+for (const [key, value] of gpuPlan.switches) app.commandLine.appendSwitch(key, value);
 
 protocol.registerSchemesAsPrivileged([{
   scheme: APP_SCHEME,

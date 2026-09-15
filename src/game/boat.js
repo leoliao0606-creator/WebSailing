@@ -27,6 +27,7 @@ export function resolveBoatIdentity(opts = {}) {
 
 export class Boat {
   constructor(scene, waveField, opts = {}) {
+    this.visualOptions = { ...opts };
     this.phys = new BoatPhysics();
     this.visual = createBoatVisual(opts);
     scene.add(this.visual.group);
@@ -76,6 +77,17 @@ export class Boat {
     this.turnAcc = 0;
     this._rulesPrevPsi = psi;
     this._prevPos = { x, z };
+    this.effects.reset();
+  }
+
+  setVisualDetail(level) {
+    if (this.visual.modelDetail === level) return;
+    const previous = this.visual;
+    this.visual = createBoatVisual({ ...this.visualOptions, modelDetail: level });
+    this.scene.remove(previous.group);
+    previous.dispose();
+    this.scene.add(this.visual.group);
+    this.visual.update(this.phys, this.waveField, this.waveField.time, 1 / 60);
   }
 
   // 兼容离线键盘输入；联机路径可直接应用同一种可序列化意图。
@@ -216,6 +228,7 @@ export class Boat {
 
   dispose() {
     this.scene.remove(this.visual.group);
+    this.visual.dispose();
     this.effects.dispose();
   }
 }

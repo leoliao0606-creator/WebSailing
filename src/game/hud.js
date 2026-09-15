@@ -64,12 +64,24 @@ export class HUD {
       ctx.save();
       ctx.scale(this.dpr, this.dpr);
       ctx.fillStyle = 'rgba(8,18,28,0.55)';
-      roundRect(ctx, 12, 12, 74, 24, 6);
+      const panelWidth = Math.min(W / this.dpr - 24, 540);
+      roundRect(ctx, 12, 12, panelWidth, 83, 6);
       ctx.fill();
       ctx.fillStyle = (game.fps ?? 60) < 45 ? '#ffb04d' : '#a8e0a0';
       ctx.font = '600 13px system-ui';
       ctx.textAlign = 'left';
       ctx.fillText(`${(game.fps ?? 0).toFixed(0)} FPS`, 20, 29);
+      const renderer = game.renderer;
+      const particles = game.boats.reduce((n, b) => n + (b.effects.activeParticles ?? 0), 0);
+      const gpuMs = game.renderStats?.gpuMs;
+      ctx.fillStyle = '#c5dbe7';
+      ctx.font = '12px system-ui';
+      ctx.fillText(`${renderer.domElement.width} × ${renderer.domElement.height}  ·  ${(renderer.info.render.triangles / 1000).toFixed(0)}k △  ·  ${t('perf.particles', { n: particles })}`, 100, 29, panelWidth - 96);
+      ctx.fillText(`${t('perf.frame')} ${(1000 / Math.max(game.fps || 1, 1)).toFixed(1)} ms  ·  GPU ${gpuMs == null ? '—' : gpuMs.toFixed(2) + ' ms'}`, 20, 49);
+      const device = game.renderStats?.device;
+      ctx.fillStyle = device?.kind === 'software' ? '#ffb04d' : '#9fc4d8';
+      ctx.fillText(device?.name ?? t('perf.unavailable'), 20, 70, panelWidth - 16);
+      if (device?.kind === 'software') ctx.fillText(t('perf.software'), 20, 87);
       ctx.restore();
     }
     if (!this.visible || !game.player) return;

@@ -5,6 +5,12 @@ import { DEG, clamp, damp, dampAngle, lerp, wrapPi } from '../util/math.js';
 
 export const CAM_MODES = ['chase', 'onboard', 'drone'];
 
+// 鼠标灵敏度，弧度/像素。0.0025 ≈ 0.14°/像素：800 DPI 的鼠标横move 约 9 cm 转一圈，
+// 落在常见 FPS 的区间里。旧值 0.005 是按「按住才转」调的，改成常驻捕捉后太跳。
+// 嫌快/嫌慢改这两个数就行。
+const MOUSE_SENS_X = 0.0025;
+const MOUSE_SENS_Y = 0.002;
+
 export class CameraRig {
   constructor(camera) {
     this.camera = camera;
@@ -29,9 +35,11 @@ export class CameraRig {
 
   update(input, boat, waveField, dt, lookBack = false) {
     const phys = boat.phys;
-    // 鼠标环绕
-    this.orbitYaw -= input.orbitDX * 0.005;
-    this.orbitPitch = clamp(this.orbitPitch - input.orbitDY * 0.004, -0.5, 0.9);
+    // 鼠标环绕。水平取正号：视角方位角 = 船艏向 + orbitYaw，而船艏向增大就是向右
+    // 转，所以鼠标右移让 orbitYaw 增大，画面就跟着向右扫 —— 和 FPS 一致。
+    // 旧代码是减号，右移反而向左看。
+    this.orbitYaw += input.orbitDX * MOUSE_SENS_X;
+    this.orbitPitch = clamp(this.orbitPitch - input.orbitDY * MOUSE_SENS_Y, -0.5, 0.9);
     this.dist = clamp(this.dist * (1 + input.wheel * 0.0011), 4.5, 55);
     // 追尾模式：拖拽停止后自动回正
     const idle = performance.now() / 1000 - input.lastDragT;

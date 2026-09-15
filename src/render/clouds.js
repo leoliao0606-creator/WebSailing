@@ -1,87 +1,86 @@
-// 程序化云层:一张 fbm 软噪声贴图铺到若干公告板(Sprite),
-// 以相机为中心的移动云穹(始终环绕视野),随风缓慢平移并出界回绕。
-// 纯装饰,不参与光照/阴影。
-
+// 天空与环境反射共用的世界坐标云层：程序化云、迎光边缘、底部自遮蔽。
+// 不再用面对相机的半透明白色 Sprite；减少透明叠加，也避免转动镜头时云形改变。
 import * as THREE from 'three';
-import { fbm2, headingToDir } from '../util/math.js';
+import { CLOUD_BUDGETS } from './quality.js';
 
-const SPAN = 2200;   // 云穹半跨度 m(相对相机的方形范围)
-const Y_MIN = 240, Y_MAX = 520;
+export const CLOUD_GLSL = /* glsl */ `
+uniform vec2 uCloudOffset;
+uniform float uCloudCoverage;
+uniform float uCloudEnabled;
+uniform int uCloudOctaves;
+uniform vec3 uCloudLight;
+uniform vec3 uCloudShade;
+uniform vec3 uCloudSun;
 
-function makeCloudTexture() {
-  const c = document.createElement('canvas');
-  c.width = c.height = 128;
-  const g = c.getContext('2d');
-  const img = g.createImageData(128, 128);
-  for (let y = 0; y < 128; y++) {
-    for (let x = 0; x < 128; x++) {
-      // 中心浓、边缘淡的软团 × fbm 噪声,得到蓬松边界
-      const dx = (x - 64) / 64, dy = (y - 64) / 64;
-      const disc = Math.max(0, 1 - Math.hypot(dx, dy));
-      const n = fbm2(x * 0.06, y * 0.06, 4);
-      const a = Math.pow(disc, 1.3) * (0.35 + 0.65 * n);
-      const i = (y * 128 + x) * 4;
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = 255;
-      img.data[i + 3] = Math.max(0, Math.min(255, (a - 0.1) * 340)) | 0;
-    }
-  }
-  g.putImageData(img, 0, 0);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+float cloudNoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  vec4 h = vec4(dot(i, vec2(127.1,311.7)), dot(i+vec2(1,0), vec2(127.1,311.7)),
+                dot(i+vec2(0,1), vec2(127.1,311.7)), dot(i+vec2(1,1), vec2(127.1,311.7)));
+  h = fract(sin(h) * 43758.5453);
+  return mix(mix(h.x,h.y,f.x), mix(h.z,h.w,f.x), f.y);
 }
-
-export function createClouds(scene, count = 44) {
-  const tex = makeCloudTexture();
-  const group = new THREE.Group();
-  const sprites = [];
-  for (let i = 0; i < count; i++) {
-    const mat = new THREE.SpriteMaterial({
-      map: tex,
-      transparent: true,
-      opacity: 0.6 + Math.random() * 0.35,
-      depthWrite: false, // 半透明:不写深度;保留深度测试使其正确处于天空之前、被地形遮挡
-      fog: false,
-    });
-    const s = new THREE.Sprite(mat);
-    // 相对相机的偏移(每帧加到相机位置)
-    s.userData.ox = (Math.random() * 2 - 1) * SPAN;
-    s.userData.oz = (Math.random() * 2 - 1) * SPAN;
-    s.position.y = Y_MIN + Math.random() * (Y_MAX - Y_MIN);
-    const scale = 300 + Math.random() * 460;
-    s.scale.set(scale, scale * (0.5 + Math.random() * 0.2), 1);
-    group.add(s);
-    sprites.push(s);
+float cloudFbm(vec2 p, int octaves) {
+  float n = 0.0, a = 0.54, total = 0.0;
+  for (int i=0; i<6; i++) {
+    if (i >= octaves) break;
+    n += cloudNoise(p) * a;
+    total += a;
+    p = mat2(1.6, 1.2, -1.2, 1.6) * p + 17.3;
+    a *= 0.48;
   }
-  scene.add(group);
+  return n / total;
+}
+vec3 cloudRadiance(vec3 sky, vec3 ray, vec2 origin, int octaves) {
+  if (uCloudEnabled < 0.5 || ray.y < 0.015) return sky;
+  // 900 m 高云底，坐标为世界空间；倒影与天空采样同一层随风移动的云。
+  vec2 p = (origin + ray.xz * (900.0 / max(ray.y, 0.015))) * 0.0011 + uCloudOffset;
+  float n = cloudFbm(p, octaves);
+  float threshold = 0.72 - uCloudCoverage * 0.34;
+  float aa = min(0.16, fwidth(n));
+  float density = smoothstep(threshold - aa, threshold + 0.20 + aa, n);
+  float upSun = cloudFbm(p + uCloudSun.xz * 0.24, max(2, octaves - 1));
+  float edgeLight = clamp((n - upSun) * 5.0 + 0.48, 0.0, 1.0);
+  float thickness = smoothstep(0.05, 0.9, density);
+  vec3 cloud = mix(uCloudLight, uCloudShade, thickness * (0.78 - 0.44 * edgeLight));
+  float silver = pow(max(dot(ray, uCloudSun), 0.0), 12.0);
+  cloud += uCloudLight * silver * (1.0 - thickness) * 0.5;
+  float alpha = density * smoothstep(0.015, 0.12, ray.y);
+  return mix(sky, cloud, alpha);
+}
+`;
 
+export function createClouds() {
+  const uniforms = {
+    uCloudOffset: { value: new THREE.Vector2(0.3, 1.7) },
+    uCloudCoverage: { value: 0.48 },
+    uCloudEnabled: { value: 1 },
+    uCloudOctaves: { value: 5 },
+    uCloudLight: { value: new THREE.Color(1.9, 1.85, 1.75) },
+    uCloudShade: { value: new THREE.Color(0.32, 0.44, 0.62) },
+    uCloudSun: { value: new THREE.Vector3() },
+  };
   return {
-    group,
-    setDensity(n) {
-      for (let i = 0; i < sprites.length; i++) sprites[i].visible = i < n;
+    uniforms,
+    decorateSky(sky) {
+      Object.assign(sky.material.uniforms, uniforms, { uSkyGain: { value: 0.14 } });
+      sky.material.fragmentShader = `uniform float uSkyGain;\n${CLOUD_GLSL}\n${sky.material.fragmentShader}`
+        // Sky 原始 retColor 已做一次 gamma 提亮，再做色调映射会令晴空发白。
+        // 保持线性辐亮度，统一交给 renderer 做一次色调映射和输出色彩转换。
+        .replace('vec4( retColor, 1.0 )', 'vec4( cloudRadiance(texColor * uSkyGain, direction, cameraPosition.xz, uCloudOctaves), 1.0 )');
     },
-    // dt 秒,wind 提供 baseFromPsi,camera 提供中心;云随风平移并在相机四周方形回绕
-    update(dt, wind, camera) {
+    setEnabled(enabled) { uniforms.uCloudEnabled.value = enabled ? 1 : 0; },
+    setDetail(level) { uniforms.uCloudOctaves.value = CLOUD_BUDGETS[level] ?? 5; },
+    setWeather(preset, sunDir) {
+      uniforms.uCloudCoverage.value = preset.cloudCover;
+      uniforms.uCloudLight.value.set(preset.cloudLight).multiplyScalar(preset.cloudInt);
+      uniforms.uCloudShade.value.set(preset.cloudShade);
+      uniforms.uCloudSun.value.copy(sunDir);
+    },
+    update(dt, wind) {
       const from = wind?.baseFromPsi ?? 0;
-      const d = headingToDir(from);      // 指向上风;气流朝反方向流动
-      const vx = -d.x * 5, vz = -d.z * 5; // 高空云漂速 m/s
-      const cx = camera?.position.x ?? 0;
-      const cz = camera?.position.z ?? 0;
-      for (const s of sprites) {
-        let ox = s.userData.ox + vx * dt;
-        let oz = s.userData.oz + vz * dt;
-        if (ox > SPAN) ox -= SPAN * 2; else if (ox < -SPAN) ox += SPAN * 2;
-        if (oz > SPAN) oz -= SPAN * 2; else if (oz < -SPAN) oz += SPAN * 2;
-        s.userData.ox = ox;
-        s.userData.oz = oz;
-        s.position.x = cx + ox;
-        s.position.z = cz + oz;
-      }
-    },
-    dispose() {
-      scene.remove(group);
-      for (const s of sprites) s.material.dispose();
-      tex.dispose();
+      uniforms.uCloudOffset.value.x -= Math.sin(from) * dt * 0.0035;
+      uniforms.uCloudOffset.value.y += Math.cos(from) * dt * 0.0035;
     },
   };
 }

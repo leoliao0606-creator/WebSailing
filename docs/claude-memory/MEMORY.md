@@ -1,0 +1,4 @@
+- [公开文件用 GitHub noreply 邮箱](public-contact-uses-github-noreply.md) — 私人 Gmail 不进公开发布的文件
+- [WindChaser 发版流程](windchaser-release-flow.md) — 推 tag 出三平台包，但 CI 只出草稿，发布由用户点
+- [玩家指南 Artifact](windchaser-player-guide.md) — 零基础安装游玩文档，改它要传同一个 URL
+- [联机测试本机能跑通](multiplayer-e2e-runs-locally.md) — 先装 Playwright 的 Chromium，别再跳过它

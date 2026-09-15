@@ -125,5 +125,6 @@ export class GhostBoat {
 
   dispose() {
     this.scene.remove(this.visual.group);
+    this.visual.dispose();
   }
 }

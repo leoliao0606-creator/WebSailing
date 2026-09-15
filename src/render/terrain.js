@@ -3,6 +3,7 @@
 
 import * as THREE from 'three';
 import { fbm2, smoothstep, clamp01, lerp } from '../util/math.js';
+import { surfaceTexture } from './surfaceTextures.js';
 
 const ISLANDS = [
   { x: -780, z: -520, r: 190, h: 34, seed: 3 },
@@ -25,8 +26,8 @@ function islandHeight(ix, iz, isl) {
 
 export function createTerrain(scene) {
   const group = new THREE.Group();
-  const colSand = new THREE.Color(0xcfc09a);
-  const colGrass = new THREE.Color(0x5e7a45);
+  const colSand = new THREE.Color(0xe0d1a7);
+  const colGrass = new THREE.Color(0x638b45);
   const colRock = new THREE.Color(0x7d7a72);
   const colDark = new THREE.Color(0x47523a);
 
@@ -42,12 +43,13 @@ export function createTerrain(scene) {
       const wx = pos.getX(i) + isl.x, wz = pos.getZ(i) + isl.z;
       const h = islandHeight(wx, wz, isl);
       pos.setY(i, h);
-      const slope = fbm2(wx * 0.08, wz * 0.08, 2);
+      const slope = Math.hypot(islandHeight(wx + 1, wz, isl) - islandHeight(wx - 1, wz, isl),
+        islandHeight(wx, wz + 1, isl) - islandHeight(wx, wz - 1, isl)) * 0.5;
       if (h < 0.9) c.copy(colSand);
       else if (h < 2.2) c.copy(colSand).lerp(colGrass, smoothstep(0.9, 2.2, h));
       else {
         c.copy(colGrass).lerp(colDark, clamp01(slope * 0.9));
-        if (h > isl.h * 0.45) c.lerp(colRock, smoothstep(isl.h * 0.45, isl.h * 0.8, h));
+        c.lerp(colRock, Math.max(smoothstep(0.22, 0.55, slope), smoothstep(isl.h * 0.5, isl.h * 0.85, h)));
       }
       // 微噪声打破色带
       const v = 0.92 + fbm2(wx * 0.5, wz * 0.5, 2) * 0.16;
@@ -55,9 +57,16 @@ export function createTerrain(scene) {
     }
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.computeVertexNormals();
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0 });
+    // 以米为尺度平铺，岛屿大小不同也不会拉伸地表纹理。
+    const uv = geo.attributes.uv;
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, pos.getX(i) / 9, pos.getZ(i) / 9);
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true, roughness: 0.93, metalness: 0,
+      bumpMap: surfaceTexture('terrain'), bumpScale: 0.24,
+    });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(isl.x, 0, isl.z); // 顶点为局部网格，高度按世界坐标采样
+    mesh.receiveShadow = true;
     group.add(mesh);
 
     if (isl.lighthouse) group.add(createLighthouse(isl));
@@ -65,6 +74,11 @@ export function createTerrain(scene) {
   }
 
   scene.add(group);
+  group.traverse((object) => {
+    if (!object.isMesh) return;
+    object.castShadow = true;
+    object.receiveShadow = true;
+  });
   // 碰撞信息（水线半径近似）
   return ISLANDS.map((i) => ({ x: i.x, z: i.z, r: i.r * 0.82 }));
 }

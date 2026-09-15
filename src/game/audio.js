@@ -8,6 +8,13 @@
 // 的能量正是人耳最敏感、听久了最累的区段,用带通 + 低通串联把它削掉,
 // 听感才接近"水"而不是"电视雪花"。
 
+// 把一个频率夹在 [lo, hi]，并挡掉 NaN（上游给不出海况时不能把振荡器设成 NaN，
+// 那会让整条声音永久静音且没有任何报错）。
+function clamp01Hz(v, lo, hi) {
+  if (!Number.isFinite(v)) return lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
 export class AudioEngine {
   constructor() {
     this.ctx = null;
@@ -70,7 +77,8 @@ export class AudioEngine {
     this.windGain = ctx.createGain();
     this.windGain.gain.value = 0;
     this._noise().connect(this.windFilter).connect(this.windGain).connect(this.sfx);
-    this._lfo(0.23, 120, this.windFilter.frequency);
+    // 阵风的起落节奏:风越大阵风来得越密,频率在 update 里跟着视风速走。
+    this.windLFO = this._lfo(0.23, 120, this.windFilter.frequency);
 
     // —— 船体劈水声 ——
     // 带通(bandpass:只让中心频率附近的一段通过,两头都压掉)挑出中低频的
@@ -126,7 +134,8 @@ export class AudioEngine {
     this.swellGain = ctx.createGain();
     this.swellGain.gain.value = 0.2;
     this._noise().connect(swellF).connect(this.swellGain).connect(this.sea);
-    this._lfo(0.061, 0.07, this.swellGain.gain);
+    // 起伏周期在 update 里改成船与涌浪的遭遇频率,这里只给一个静水时的初值。
+    this.swellLFO = this._lfo(0.061, 0.07, this.swellGain.gain);
 
     // —— 拍岸冲刷:两个周期互不成整数倍的慢 LFO 叠加,避免机械的固定节拍 ——
     const surfBand = ctx.createBiquadFilter();
@@ -139,8 +148,11 @@ export class AudioEngine {
     this.surfGain = ctx.createGain();
     this.surfGain.gain.value = 0.085;
     this._noise().connect(surfBand).connect(surfTone).connect(this.surfGain).connect(this.sea);
-    this._lfo(0.083, 0.055, this.surfGain.gain);
-    this._lfo(0.037, 0.03, this.surfGain.gain);
+    // 拍岸是岸边的事,岸不会动,所以它的节奏只跟海况走、不跟船速走 ——
+    // 这正是「哪些声音该跟船速、哪些不该」的分界。两个倍率互不成整数比,
+    // 叠出来才是一组一组来的涌浪,而不是一个规则的节拍器。
+    this.surfLFO = [this._lfo(0.083, 0.055, this.surfGain.gain),
+      this._lfo(0.037, 0.03, this.surfGain.gain)];
 
     this._scheduleGull();
   }
@@ -218,13 +230,19 @@ export class AudioEngine {
     if (bus) bus.gain.value = v;
   }
 
-  // 每帧驱动（awsKn 视风节，luff 0..1，speedKn 船速，planing 0..1）
-  update(awsKn, luff, speedKn, planing) {
+  // 每帧驱动。
+  // awsKn 视风节，luff 0..1，speedKn 船速（节），planing 0..1，
+  // sea 里是海况节奏：encounterHz（船每秒迎面撞上几个风浪波峰）、
+  // swellHz（同一个量，但对长周期涌浪算）、waveHz（风浪自身频率，与船速无关）。
+  // 省略 sea 时退回一组静水下的基准值，接口对旧调用点保持可用。
+  update(awsKn, luff, speedKn, planing, sea = {}) {
     if (!this.started) return;
     const t = this.ctx.currentTime;
     const wind = Math.min(1, Math.pow(awsKn / 22, 1.6)) * 0.5;
     this.windGain.gain.setTargetAtTime(wind, t, 0.2);
     this.windFilter.frequency.setTargetAtTime(380 + awsKn * 22, t, 0.3);
+    // 阵风起落的快慢跟风速走:12 节时回到原来的 0.23 Hz,大风里阵风来得更密。
+    this.windLFO?.frequency.setTargetAtTime(clamp01Hz(0.12 + awsKn * 0.009, 0.1, 0.6), t, 1.0);
 
     // 音色随船速变亮,但带通中心封在 900 Hz 附近、低通封在 2.2 kHz,
     // 船再快也不会滑进 2–5 kHz 那段最扎耳朵的区间。速度按 12 节封顶,
@@ -235,7 +253,21 @@ export class AudioEngine {
     this.waterBand.frequency.setTargetAtTime(340 + sp * 47, t, 0.4);
     this.waterTone.frequency.setTargetAtTime(1400 + sp * 67, t, 0.4);
     this.waterSwashDepth.gain.setTargetAtTime(water * 0.3, t, 0.3);
-    this.waterSwash.frequency.setTargetAtTime(0.3 + sp * 0.06, t, 0.5);
+    // 冲刷起伏的周期:主项是遭遇频率 —— 水声一波一波,是因为浪一个一个从船身
+    // 过去,所以它既随船速变,也随航向变:顶浪时浪来得急,顺浪追着浪跑时一个浪
+    // 能骑很久。再叠一个正比于船速的分量(每跑过两个船长算一次),这样顺浪把
+    // 遭遇频率压到接近零时,水声不会退化成一条没有起伏的直线。
+    const enc = sea.encounterHz > 0 ? sea.encounterHz : 0.28;
+    const swash = clamp01Hz(enc * 0.95 + (speedKn * 0.5144) / 8.12, 0.14, 2.6);
+    this.waterSwash.frequency.setTargetAtTime(swash, t, 0.5);
+    // 涌浪闷响跟着船与涌浪的遭遇频率,原来是写死的 0.061 Hz(16 秒一轮),
+    // 不管船朝哪开、开多快都一个节拍。
+    this.swellLFO?.frequency.setTargetAtTime(clamp01Hz(sea.swellHz || 0.148, 0.03, 0.5), t, 1.5);
+    // 拍岸只跟海况走:风大浪长,拍岸就慢。两个倍率取成 12 节基准风下正好还原
+    // 原来的 0.083 / 0.037 Hz。
+    const wh = sea.waveHz > 0 ? sea.waveHz : 0.292;
+    this.surfLFO?.[0]?.frequency.setTargetAtTime(clamp01Hz(wh * 0.284, 0.03, 0.4), t, 2.0);
+    this.surfLFO?.[1]?.frequency.setTargetAtTime(clamp01Hz(wh * 0.127, 0.015, 0.2), t, 2.0);
 
     const luffAmt = luff * Math.min(1, awsKn / 12) * 0.5;
     this.luffGain.gain.setTargetAtTime(luffAmt * 0.5, t, 0.08);

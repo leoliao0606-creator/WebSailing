@@ -301,3 +301,5 @@ body.lobby-open #menu-online-lobby {
   .chat-panel { top: auto; bottom: 78px; max-height: 42vh; }
   .chat-log { min-height: 36px; }
 }
+
+.quality-note { grid-column: 1 / -1; margin: -2px 0 8px; color: #9eb7c8; font-size: 13px; line-height: 1.6; }

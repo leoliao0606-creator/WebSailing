@@ -234,3 +234,54 @@ test('未 start 时设置音量只记住数值,不抛错', () => {
   assert.equal(e.volSea, 0.25);
   e.update(12, 0, 5, 0); // 未启动应直接返回
 });
+
+test('水声起伏的周期跟遭遇频率走:顶浪密、顺浪疏', (t) => {
+  const e = startEngine(t);
+  // 同一条船速下只改遭遇频率(船每秒迎面撞上几个波峰),顶浪应该比顺浪节奏更密。
+  e.update(14, 0, 6, 0, { encounterHz: 0.52, swellHz: 0.16, waveHz: 0.30 });
+  const upwind = e.waterSwash.frequency.value;
+  e.update(14, 0, 6, 0, { encounterHz: 0.13, swellHz: 0.08, waveHz: 0.30 });
+  const downwind = e.waterSwash.frequency.value;
+  assert.ok(upwind > downwind * 1.3, `顶浪 ${upwind} 与顺浪 ${downwind} 没拉开差距`);
+});
+
+test('水声起伏的周期也随船速加密,静止和全速不是同一个节拍', (t) => {
+  const e = startEngine(t);
+  e.update(14, 0, 0.2, 0, { encounterHz: 0.3, swellHz: 0.15, waveHz: 0.3 });
+  const slow = e.waterSwash.frequency.value;
+  e.update(14, 0, 10, 1, { encounterHz: 0.3, swellHz: 0.15, waveHz: 0.3 });
+  const fast = e.waterSwash.frequency.value;
+  assert.ok(fast > slow * 1.5, `静止 ${slow} 与全速 ${fast} 差得太少,听上去还是固定周期`);
+});
+
+test('涌浪闷响跟遭遇频率,拍岸只跟海况、不跟船速', (t) => {
+  const e = startEngine(t);
+  e.update(14, 0, 3, 0, { encounterHz: 0.3, swellHz: 0.20, waveHz: 0.30 });
+  const swellFast = e.swellLFO.frequency.value;
+  const surfA = e.surfLFO.map((o) => o.frequency.value);
+  // 只把船速拉满、海况原样:拍岸不该动,涌浪闷响也只跟 swellHz 走。
+  e.update(14, 0, 12, 1, { encounterHz: 0.3, swellHz: 0.20, waveHz: 0.30 });
+  assert.equal(e.swellLFO.frequency.value, swellFast);
+  assert.deepEqual(e.surfLFO.map((o) => o.frequency.value), surfA);
+  // 换海况:浪变长 -> 拍岸变慢。
+  e.update(14, 0, 12, 1, { encounterHz: 0.3, swellHz: 0.20, waveHz: 0.19 });
+  const surfB = e.surfLFO.map((o) => o.frequency.value);
+  assert.ok(surfB[0] < surfA[0] && surfB[1] < surfA[1], '浪变长了拍岸却没变慢');
+  // 12 节基准风(风浪自身频率 0.292 Hz)下要还原改动前的 0.083 / 0.037 Hz
+  e.update(14, 0, 5, 0, { encounterHz: 0.3, swellHz: 0.2, waveHz: 0.292 });
+  assert.ok(Math.abs(e.surfLFO[0].frequency.value - 0.083) < 0.004);
+  assert.ok(Math.abs(e.surfLFO[1].frequency.value - 0.037) < 0.004);
+});
+
+test('阵风起落的快慢随风速变,海况字段缺失或是 NaN 时不把振荡器设成静音', (t) => {
+  const e = startEngine(t);
+  e.update(8, 0, 3, 0);
+  const light = e.windLFO.frequency.value;
+  e.update(26, 0, 3, 0);
+  assert.ok(e.windLFO.frequency.value > light, '大风里阵风没有来得更密');
+  // NaN 传进振荡器频率会让这一路永久静音,而且不报任何错,所以必须挡住。
+  e.update(14, 0, 5, 0, { encounterHz: NaN, swellHz: NaN, waveHz: NaN });
+  for (const o of [e.waterSwash, e.swellLFO, ...e.surfLFO, e.windLFO]) {
+    assert.ok(Number.isFinite(o.frequency.value), `${o.kind} 的频率变成了 ${o.frequency.value}`);
+  }
+});

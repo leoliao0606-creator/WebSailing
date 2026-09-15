@@ -5,6 +5,8 @@ import { formatTime } from '../util/math.js';
 import { loadBest } from './race.js';
 import { t, setLang, getLang, detectLang, LANGS } from '../i18n.js';
 import { MultiplayerLobby } from './multiplayerLobby.js';
+import { QUALITY_PRESETS } from '../render/quality.js';
+export { QUALITY_PRESETS } from '../render/quality.js';
 
 const DEFAULTS = {
   windKn: 12,
@@ -25,7 +27,12 @@ const DEFAULTS = {
   quality: 'high',      // low/medium/high/ultra/custom
   resScale: 1.0,        // 渲染分辨率缩放（× devicePixelRatio）
   shadowQ: 'high',      // off/medium/high/ultra
-  waterDetail: 'high',  // low/medium/high
+  waterDetail: 'high',  // low/medium/high/ultra
+  cloudDetail: 'high',
+  textureDetail: 'high',
+  modelDetail: 'high',
+  effectsDetail: 'high',
+  graphicsVersion: 3,
   effects: true,        // 浪花/尾流粒子
   clouds: true,         // 程序化云层
   skyPreset: 'golden',  // 时段/天气:golden/noon/dusk/overcast
@@ -58,14 +65,6 @@ export function simulationControlSettings(mode, settings) {
   return mode === 'multiplayer-race' ? MULTIPLAYER_CONTROL_SETTINGS : settings;
 }
 
-// 画质预设 -> 细项。改任何细项后预设显示为 custom。
-export const QUALITY_PRESETS = {
-  low:    { resScale: 0.7,  shadowQ: 'off',    waterDetail: 'low',    effects: false, clouds: false },
-  medium: { resScale: 0.85, shadowQ: 'medium', waterDetail: 'medium', effects: true,  clouds: true },
-  high:   { resScale: 1.0,  shadowQ: 'high',   waterDetail: 'high',   effects: true,  clouds: true },
-  ultra:  { resScale: 1.3,  shadowQ: 'ultra',  waterDetail: 'high',   effects: true,  clouds: true },
-};
-
 export function loadSettings() {
   let stored = {};
   try {
@@ -74,12 +73,19 @@ export function loadSettings() {
   // JSON.parse 成功不代表拿到的是对象:'null'、'5'、'"abc"' 都是合法 JSON,
   // catch 挡不住它们。下面几处 'xxx' in stored 只能用在对象上,不挡一下会抛
   // TypeError;坏值又一直留在 localStorage 里,刷新页面照样崩,玩家自己恢复不了。
-  if (!stored || typeof stored !== 'object') stored = {};
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
   const s = { ...DEFAULTS, ...stored };
-  // 旧版只有 quality 预设：迁移到细项
-  if (QUALITY_PRESETS[s.quality] && !('shadowQ' in stored)) {
+  // 旧版命名预设迁移到新预算；自定义细项原样保留。
+  if (QUALITY_PRESETS[s.quality] && (stored.graphicsVersion !== 3 || !('shadowQ' in stored))) {
     Object.assign(s, QUALITY_PRESETS[s.quality]);
   }
+  s.graphicsVersion = 3;
+  for (const key of ['waterDetail', 'cloudDetail', 'textureDetail', 'modelDetail', 'effectsDetail']) {
+    if (!Object.hasOwn(QUALITY_PRESETS, s[key])) s[key] = DEFAULTS[key];
+  }
+  if (!['off', 'medium', 'high', 'ultra'].includes(s.shadowQ)) s.shadowQ = DEFAULTS.shadowQ;
+  if (!['low', 'medium', 'high', 'ultra', 'custom'].includes(s.quality)) s.quality = 'custom';
+  s.resScale = Number.isFinite(s.resScale) ? Math.min(1.5, Math.max(0.5, s.resScale)) : 1;
   s.lang ??= detectLang();
   setLang(s.lang);
   return s;
@@ -218,12 +224,21 @@ export class Menu {
           <select id="s-quality">
             ${['low', 'medium', 'high', 'ultra', 'custom'].map((v) => opt(v, s.quality, t('q.' + v))).join('')}
           </select></label>
+        <p class="quality-note" id="s-quality-note">${t('q.note.' + s.quality)}</p>
         <label><span>${t('set.resScale')} <output id="o-res">${Math.round(s.resScale * 100)}</output>%</span>
           <input type="range" id="s-res" min="50" max="150" step="5" value="${s.resScale * 100}"></label>
         <label>${t('set.shadow')}
           <select id="s-shadow">${['off', 'medium', 'high', 'ultra'].map((v) => opt(v, s.shadowQ, t('sh.' + v))).join('')}</select></label>
         <label>${t('set.water')}
-          <select id="s-water">${['low', 'medium', 'high'].map((v) => opt(v, s.waterDetail, t('w.' + v))).join('')}</select></label>
+          <select id="s-water">${['low', 'medium', 'high', 'ultra'].map((v) => opt(v, s.waterDetail, t('q.' + v))).join('')}</select></label>
+        <label>${t('set.cloudDetail')}
+          <select id="s-cloud-detail">${['low', 'medium', 'high', 'ultra'].map((v) => opt(v, s.cloudDetail, t('q.' + v))).join('')}</select></label>
+        <label>${t('set.textureDetail')}
+          <select id="s-texture">${['low', 'medium', 'high', 'ultra'].map((v) => opt(v, s.textureDetail, t('q.' + v))).join('')}</select></label>
+        <label>${t('set.modelDetail')}
+          <select id="s-model">${['low', 'medium', 'high', 'ultra'].map((v) => opt(v, s.modelDetail, t('q.' + v))).join('')}</select></label>
+        <label>${t('set.effectsDetail')}
+          <select id="s-effects-detail">${['low', 'medium', 'high', 'ultra'].map((v) => opt(v, s.effectsDetail, t('q.' + v))).join('')}</select></label>
         <label>${t('set.sky')}
           <select id="s-sky">${['golden', 'noon', 'dusk', 'overcast'].map((v) => opt(v, s.skyPreset, t('sky.' + v))).join('')}</select></label>
         <label class="check"><input type="checkbox" id="s-fx" ${s.effects ? 'checked' : ''}> ${t('set.effects')}</label>
@@ -247,19 +262,26 @@ export class Menu {
 
     // 预设 -> 细项联动
     el.querySelector('#s-quality').addEventListener('change', (e) => {
+      el.querySelector('#s-quality-note').textContent = t('q.note.' + e.target.value);
       const p = QUALITY_PRESETS[e.target.value];
       if (!p) return;
       el.querySelector('#s-res').value = p.resScale * 100;
       el.querySelector('#o-res').textContent = Math.round(p.resScale * 100);
       el.querySelector('#s-shadow').value = p.shadowQ;
       el.querySelector('#s-water').value = p.waterDetail;
+      el.querySelector('#s-cloud-detail').value = p.cloudDetail;
+      el.querySelector('#s-texture').value = p.textureDetail;
+      el.querySelector('#s-model').value = p.modelDetail;
+      el.querySelector('#s-effects-detail').value = p.effectsDetail;
       el.querySelector('#s-fx').checked = p.effects;
       el.querySelector('#s-clouds').checked = p.clouds;
+      el.querySelector('#s-dynres').checked = p.dynamicRes;
     });
     // 改细项 -> 预设变自定义
-    for (const id of ['#s-res', '#s-shadow', '#s-water', '#s-fx', '#s-clouds']) {
+    for (const id of ['#s-res', '#s-shadow', '#s-water', '#s-cloud-detail', '#s-texture', '#s-model', '#s-effects-detail', '#s-fx', '#s-clouds', '#s-dynres']) {
       el.querySelector(id).addEventListener('change', () => {
         el.querySelector('#s-quality').value = 'custom';
+        el.querySelector('#s-quality-note').textContent = t('q.note.custom');
       });
     }
 
@@ -303,6 +325,10 @@ export class Menu {
     st.resScale = Number(el.querySelector('#s-res').value) / 100;
     st.shadowQ = el.querySelector('#s-shadow').value;
     st.waterDetail = el.querySelector('#s-water').value;
+    st.cloudDetail = el.querySelector('#s-cloud-detail').value;
+    st.textureDetail = el.querySelector('#s-texture').value;
+    st.modelDetail = el.querySelector('#s-model').value;
+    st.effectsDetail = el.querySelector('#s-effects-detail').value;
     st.skyPreset = el.querySelector('#s-sky').value;
     st.effects = el.querySelector('#s-fx').checked;
     st.clouds = el.querySelector('#s-clouds').checked;

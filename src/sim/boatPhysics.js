@@ -17,6 +17,29 @@ import { RHO_AIR, RHO_WATER, sailCoeffs, sailLuff, foilCoeffs, foilForce2D } fro
 const G = 9.81;
 
 // ILCA(Laser) 级单人稳向板参数
+// 主风浪分量相对峰值波长的比例、主涌浪波长 m —— 与 waves.js 的 WIND_WAVES /
+// SWELL_WAVES 里波幅最大的那一档保持一致。音效只需要「浪多久来一个」这一个尺度，
+// 不必把全部 12 个分量都算一遍。
+const PEAK_LEN_REL = 0.87;
+const SWELL_LEN = 71;
+
+// 遭遇频率(encounter frequency)：船每秒迎面撞上几个波峰，单位赫兹。
+// 深水波相速 c = √(gλ/2π)，波自身频率 f = c/λ = √(g/(2πλ))。
+// 船的世界速度 V 在波传播方向 t 上的分量记作 V·t，则
+//   f_e = | f − (V·t)/λ |
+// 顶浪时 V·t < 0，两项相加 → 浪来得又急又密；顺浪追着波跑时 V·t → c，
+// f_e → 0 → 一个浪能骑很久，这就是滑浪。
+function encounterHz(len, travelPsi, vw) {
+  const lam = Math.max(1, len);
+  const tx = Math.sin(travelPsi), tz = -Math.cos(travelPsi);
+  return Math.abs(waveOwnHz(lam) - (vw.x * tx + vw.z * tz) / lam);
+}
+
+// 波自身的频率 Hz（与船无关）：岸边拍浪的节奏只由海况决定，船开多快都一样。
+function waveOwnHz(len) {
+  return Math.sqrt(G / (2 * Math.PI * Math.max(1, len)));
+}
+
 export const BOAT = {
   lwl: 4.06,            // 水线长 m
   massHull: 82,         // 船体+索具 kg
@@ -44,7 +67,8 @@ export const BOAT = {
   stabFadeB: 78,        // 稳性归零角°（超过即翻）
   Iz: 265,              // 艏摇转动惯量（含附加）kg·m²
   Ix: 105,              // 横摇转动惯量 kg·m²
-  kSurgeAdd: 1.04,      // 附加质量系数
+  kSurgeAdd: 1.12,      // 前进有效惯性系数（船 + 随船加速的那部分水）。小艇纵向附加质量
+                        // 约为排水量的 5~15%；取 1.12 让换舷时带得动动量穿过无动力区。
   kSwayAdd: 1.4,
   cViscous: 3.9,        // 黏性阻力 N/(m/s)²
   cWave: 4.4,           // 兴波阻力系数
@@ -52,11 +76,18 @@ export const BOAT = {
   cAstern: 68,          // 倒航形状阻力 N/(m/s)²：方形船尾正面破水，是钝体而非
                         // 流线型。按船尾水线宽 ~1.2 m × 吃水 0.13 m、钝体 CD≈0.9 估。
   cSway: 320,           // 横向船体阻力 N/(m/s)²
-  cYawDampL: 240,       // 艏摇线性阻尼
-  cYawDampQ: 520,
+  cYawDampL: 85,        // 船壳剩余艏摇阻尼；稳向板和舵已单独计算转动诱导阻力
+  cYawDampQ: 300,       // 艏摇二次阻尼 N·m/(rad/s)²。按船体侧面沿船长积分估算：
+                        // τ = 2∫₀^2.03 ½ρ·CD·draft·(ωx)²·x dx，取 CD≈0.5、吃水 0.13 m
+                        // 得 ≈280。原来的 520 把板和舵的转动阻力又算了一遍。
   cRollDampL: 70,
   cRollDampQ: 260,
-  cHeelYaw: 30,         // 横倾诱导艏摇（抢风舵/broach 来源；右倾→左转力矩）
+  cHeelYaw: 110,        // 横倾诱导艏摇 N·m/(rad·(m/s)²)：船横倾后浸没水线变得不对称，
+                        // 把船头推向上风。这是「不扶舵就自己朝上风偏、倾得越狠偏得越快」
+                        // 的主项，也是 broach 的来源（右倾→左转力矩）。
+                        // 正比于 φ·u|u|，所以调向掉速到接近停船时它自然消失，
+                        // 不会像只按帆力算的 cRigHeelYaw 那样把船锁在顶风区。
+  cRigHeelYaw: 0.5,     // 横倾抢风力矩的有效力臂占 hCE 的比例（见 _substep 中的推导）
   windageArea: 1.1,     // 船体+船员受风面积 m²
   rudderRateDeg: 85,    // 舵机速率 °/s
   boomRateDeg: 150,     // 帆杠摆动速率 °/s
@@ -64,6 +95,8 @@ export const BOAT = {
   boardRate: 0.6,
   capsizeDeg: 80,       // 判定翻船角
   rightingTime: 3.0,    // 按住扶正到位所需秒数
+  capsizeRestDeg: 93,   // 翻船后平躺的姿态角°（帆平铺水面）
+  rightedDeg: 20,       // 扶正结束时的姿态角°：人刚爬回船上，船还带着一点余倾
   cOrbital: 0.85,       // 波浪轨道流速对水动力的耦合系数（深度衰减已由 orbitalDepth 承担）
   cSurf: 1.0,           // 浪面坡度推力增益（冲浪/顶浪的来源）
   cSurfRelief: 0.5,     // 冲浪时船体卸载：自身波系叠加浪面，兴波阻力下降比例
@@ -136,6 +169,9 @@ export class BoatPhysics {
       bowRate: 0,      // 艏站相对水面的垂向速度 m/s（有符号，波浪增阻用）
       ovx: 0, ovz: 0,  // 波浪轨道流速（世界系，已按等效深度衰减，全船加权平均）
       ax: 0, az: 0,    // 浪面坡度产生的水平加速度（世界系，全船加权平均）
+      encounterHz: 0,  // 主风浪的遭遇频率 Hz（音效节奏用）
+      swellHz: 0,      // 主涌浪的遭遇频率 Hz
+      waveHz: 0,       // 主风浪自身的频率 Hz（不含船速，拍岸节奏用）
     };
     // —— 控制输入 ——
     this.ctl = { rudder: 0, sheet: 1, board: 1, hike: 0, autoHike: true, righting: false, autoTrim: false };
@@ -144,11 +180,14 @@ export class BoatPhysics {
       awaDeg: 0, awsKn: 0, twaDeg: 0, twsKn: 0, boomDeg: 0, alphaDeg: 0, luff: 1,
       heelDeg: 0, speedKn: 0, vmgKn: 0, leewayDeg: 0, fr: 0, planing: 0,
       driveN: 0, sideN: 0, rudderDeg: 0, inIrons: false, sternway: false,
+      sailYawNm: 0, heelYawNm: 0, rudderYawNm: 0, yawDampingNm: 0,
       surf: 0, // 浪面坡度沿艏向的推进加速度 m/s²（+ = 正在被浪推，HUD 冲浪提示）
       currentKn: 0, currentSetDeg: 0, // 环境水流速度（节）与去向罗盘角（HUD 潮流指示）
       pitchDeg: 0,   // 纵摇角（+ = 艏抬）
       airborne: 0,   // 腾空程度 0..1（1 = 船体完全离开水面，舵效大幅下降）
       slamSpeed: 0,  // 艏部砸水强度 m/s
+      encounterHz: 0, swellHz: 0, // 迎面遇到风浪 / 涌浪的频率 Hz（音效节奏用）
+      waveHz: 0,     // 风浪自身的频率 Hz（不含船速）
     };
   }
 
@@ -206,6 +245,7 @@ export class BoatPhysics {
       b.immersion = 1;
       b.bowExcess = b.slamSpeed = 0;
       b.ovx = b.ovz = b.ax = b.az = 0;
+      b.encounterHz = b.swellHz = b.waveHz = 0;
       b.active = false;
       return;
     }
@@ -228,6 +268,11 @@ export class BoatPhysics {
       az += G * (o.nz / o.ny) * wgt;
     }
     b.ovx = ovx; b.ovz = ovz; b.ax = ax; b.az = az;
+    // 音效节奏用的两个遭遇频率。波浪顺风传播，所以传播方位角 = 来向 + π。
+    const vw = this.worldVel(this._vwEnc ??= {});
+    b.encounterHz = encounterHz(waves.peakLen * PEAK_LEN_REL, waves.windPsi + Math.PI, vw);
+    b.swellHz = encounterHz(SWELL_LEN, waves.swellPsi + Math.PI, vw);
+    b.waveHz = waveOwnHz(waves.peakLen * PEAK_LEN_REL);
     b.active = true;
 
     // —— 刚度与惯量 ——
@@ -343,6 +388,7 @@ export class BoatPhysics {
 
     // —— 力累加（体轴）——
     let Fx = 0, Fy = 0, tauYaw = 0, tauRoll = 0;
+    let sailYaw = 0, rudderYaw = 0, rigHeelYaw = 0;
 
     // 帆（翻船后帆平躺水面，不产生气动力）
     let alphaSail = 0, luff = 1;
@@ -354,9 +400,18 @@ export class BoatPhysics {
       luff = sailLuff(f.alpha);
       // 压力中心位置（帆杠摆出时外移，顺风时驱动力偏舷 → 拱头力矩）
       const ceX = p.mastX - Math.cos(this.boom) * p.ceAlongBoom;
-      const ceY = Math.sin(this.boom) * p.ceAlongBoom * 0.85;
+      const ceY = Math.sin(this.boom) * p.ceAlongBoom * Math.cos(this.phi);
       Fx += f.fx; Fy += f.fy;
-      tauYaw += ceX * f.fy - ceY * f.fx;
+      sailYaw = ceX * f.fy - ceY * f.fx;
+      tauYaw += sailYaw;
+      // 横倾诱导抢风舵：桅杆随船倾倒，帆压力中心在水平面内横移 hCE·sin(φ) 到低舷，
+      // 而抵抗它的船体阻力仍在中线附近，两者构成一个力偶。右倾 → 推力偏右舷 →
+      // 船头被推向左（上风）。这就是横倾越大舵越“抢风”的来源，也是不用舵、
+      // 只靠压舷改变倾角就能转向的原理。
+      // 力臂打 cRigHeelYaw 折：全额 hCE 是侧向力（升力）的压力中心高度，而驱动
+      // 分量沿桅杆的分布重心更低——三角帆下半部弦长大、出力占比高。
+      rigHeelYaw = -p.cRigHeelYaw * p.hCE * Math.sin(this.phi) * f.fx;
+      tauYaw += rigHeelYaw;
       tauRoll += f.fy * p.hCE * Math.cos(this.phi);
       // 帆抖动的寄生阻力已含在 CD 里
     }
@@ -418,7 +473,8 @@ export class BoatPhysics {
       const f = foilForce2D(flowX, flowY, chordForFlow(this.rudder, flowX, flowY), p.rudderArea * immFoil, RHO_WATER,
         (a) => foilCoeffs(a, p.rudderAspect, 24));
       Fx += f.fx; Fy += f.fy;
-      tauYaw += p.rudderX * f.fy;
+      rudderYaw = p.rudderX * f.fy;
+      tauYaw += rudderYaw;
       tauRoll += f.fy * -p.rudderDepth;
     }
 
@@ -451,9 +507,11 @@ export class BoatPhysics {
     }
 
     // 横倾诱导艏摇（船体不对称 → 抢风舵；横倾越大越强，broach 的来源）
-    tauYaw += -p.cHeelYaw * this.phi * ru * Math.abs(ru);
+    const heelYaw = -p.cHeelYaw * this.phi * ru * Math.abs(ru);
+    tauYaw += heelYaw;
     // 艏摇阻尼
-    tauYaw -= p.cYawDampL * this.yawRate + p.cYawDampQ * this.yawRate * Math.abs(this.yawRate);
+    const yawDamping = -p.cYawDampL * this.yawRate - p.cYawDampQ * this.yawRate * Math.abs(this.yawRate);
+    tauYaw += yawDamping;
 
     // —— 正顺风上风侧微倾 ——
     // 现实里正顺风要把船向上风侧压一点：平衡舵感、减小横摇、也是 death-roll 的种子。
@@ -498,20 +556,28 @@ export class BoatPhysics {
     }
     if (this.capsized) {
       const side = Math.sign(this.phi) || 1;
-      // 平躺姿态弹簧
-      tauRoll += (side * 93 * DEG - this.phi) * 2600 - this.phiRate * 2200;
-      if (ctl.righting) {
-        this.rightProgress += dt / p.rightingTime;
-        tauRoll += -side * 950 * Math.min(1, this.rightProgress * 1.4);
-        if (this.rightProgress >= 1) {
-          this.capsized = false;
-          this.phi = side * 25 * DEG;
-          this.phiRate = 0;
-          this.u *= 0.2; this.v *= 0.2;
-          this.sheet = 1; this.ctl.sheet = 1; // 扶正后缭绳放空
-        }
-      } else {
-        this.rightProgress = Math.max(0, this.rightProgress - dt * 0.6);
+      // 扶正进度：按住前进，松开回退。先推进它，姿态目标角再由它算出来。
+      this.rightProgress = ctl.righting
+        ? Math.min(1, this.rightProgress + dt / p.rightingTime)
+        : Math.max(0, this.rightProgress - dt * 0.6);
+      // 姿态目标角随进度从平躺连续摆到近乎扶正，而不是「到点了才把 phi 一把设过去」。
+      // 旧写法是固定 93° 的弹簧加一个封顶 950 N·m 的反向力矩：950/2600 只够把船
+      // 从 93° 拉到 74°，剩下的 50° 全靠 rightProgress≥1 那一帧瞬移补上，
+      // 看上去就是扶正到一半突然跳起来。
+      const s = this.rightProgress * this.rightProgress * (3 - 2 * this.rightProgress);
+      const span = (p.rightedDeg - p.capsizeRestDeg) * DEG;
+      const target = side * (p.capsizeRestDeg * DEG + span * s);
+      // 目标角自身的角速度（smoothstep 对进度求导 = 6s(1-s)，进度对时间求导见上）。
+      const dProg = ctl.righting ? 1 / p.rightingTime : -0.6;
+      const targetRate = side * span * 6 * this.rightProgress * (1 - this.rightProgress) * dProg;
+      // 阻尼取「相对目标角速度」而不是绝对角速度：否则弹簧一边拉、阻尼一边按住，
+      // 匀速段会留下正比于目标速度的固定滞后，跟不上就又要靠瞬移收尾。
+      tauRoll += (target - this.phi) * 2600 - (this.phiRate - targetRate) * 2200;
+      if (this.rightProgress >= 1) {
+        // 此刻 phi 已经在 rightedDeg 附近、角速度接近零，直接交还给常规稳性即可。
+        this.capsized = false;
+        this.u *= 0.2; this.v *= 0.2;
+        this.sheet = 1; this.ctl.sheet = 1; // 扶正后缭绳放空
       }
     }
 
@@ -548,12 +614,19 @@ export class BoatPhysics {
     o.surf = surfAcc;
     o.driveN = Fx;
     o.sideN = Fy;
+    o.sailYawNm = sailYaw;
+    o.heelYawNm = heelYaw + rigHeelYaw;
+    o.rudderYawNm = rudderYaw;
+    o.yawDampingNm = yawDamping;
     o.rudderDeg = -this.rudder / DEG; // 转右为正，供 HUD
     o.inIrons = Math.abs(o.twaDeg) < 35 && this.u < 0.6 && !this.capsized;
     o.sternway = this.u < -0.05;
     o.pitchDeg = this.wave.theta / DEG;
     o.airborne = 1 - imm;
     o.slamSpeed = this.wave.slamSpeed;
+    o.encounterHz = this.wave.encounterHz;
+    o.swellHz = this.wave.swellHz;
+    o.waveHz = this.wave.waveHz;
     o.currentKn = Math.hypot(cur.vx, cur.vz) / KN;
     o.currentSetDeg = (Math.atan2(cur.vx, -cur.vz) / DEG + 360) % 360; // 水流去向罗盘角
   }

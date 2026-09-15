@@ -7,7 +7,8 @@ import { WaveField } from './sim/waves.js';
 import { WindField } from './sim/wind.js';
 import { ShadowedWind, shadowFactorAt } from './sim/windShadow.js';
 import { createScene } from './render/sceneSetup.js';
-import { createClouds } from './render/clouds.js';
+import { applyTextureQuality } from './render/quality.js';
+import { RenderStats } from './render/renderStats.js';
 import { Water } from './render/water.js';
 import { createTerrain, createBuoy } from './render/terrain.js';
 import { Input } from './game/input.js';
@@ -60,19 +61,28 @@ const MULTIPLAYER_STYLES = [
 export class App {
   constructor() {
     const canvas = document.getElementById('app');
-    const { renderer, scene, camera, sunDir, sunLight, followShadow, applySkyPreset } = createScene(canvas);
-    Object.assign(this, { renderer, scene, camera, sunLight, followShadow, applySkyPreset });
+    const { renderer, scene, camera, sunDir, sunLight, followShadow, applySkyPreset, clouds } = createScene(canvas);
+    Object.assign(this, { renderer, scene, camera, sunLight, followShadow, applySkyPreset, clouds });
     this.sunDir = sunDir;
+    this.renderStats = new RenderStats(renderer);
+    canvas.addEventListener('webglcontextrestored', () => { this.renderStats = new RenderStats(renderer); });
 
     this.settings = loadSettings();
     this.waveField = new WaveField();
     this.wind = new WindField();
     this.shadowWind = new ShadowedWind(this.wind); // 叠加船间风影的风场代理
-    this.water = new Water(this.waveField, sunDir);
+    this.water = new Water(this.waveField, sunDir, clouds.uniforms);
     scene.add(this.water.mesh);
     this.islands = createTerrain(scene);
 
     this.input = new Input(canvas);
+    // 指针锁定被收走（玩家按了 Esc）就等于要退出操控。浏览器规定按 Esc 一定解锁，
+    // 而且那一下 keydown 不会发给页面，所以必须在这里、而不是靠热键来响应。
+    this.input.onLockLost = () => {
+      this.input.pressedSet.delete('escape');
+      this.input.keys.delete('escape');
+      if (this.mode !== 'menu' && !this.paused) this.pause();
+    };
     this.cameraRig = new CameraRig(camera);
     this.audio = new AudioEngine();
     this.hud = new HUD();
@@ -137,6 +147,10 @@ export class App {
     this.audio.setChannelVolume('sfx', s.volSfx);
 
     // —— 画质 ——
+    if (!s.showFps) this.renderStats.reset();
+    // 切档后从该档完整分辨率重新评估，避免继承上个档位降下来的模糊画面。
+    this._dynFactor = 1;
+    this._dynT = 0;
     this._applyPixelRatio();
     const shadowOn = s.shadowQ !== 'off';
     if (this.renderer.shadowMap.enabled !== shadowOn) {
@@ -154,17 +168,22 @@ export class App {
       this.sunLight.shadow.map = null;
     }
     this.water.setDetail(s.waterDetail);
-    for (const b of this.boats) b.effects.setEnabled(s.effects);
+    applyTextureQuality(this.scene, s.textureDetail, this.renderer.capabilities.getMaxAnisotropy());
+    for (const b of this.boats) {
+      this._applyBoatQuality(b);
+      b.effects.setEnabled(s.effects);
+    }
 
-    // —— 云层(可开关;低画质预设默认关)——
-    if (s.clouds && !this.clouds) this.clouds = createClouds(this.scene);
-    else if (!s.clouds && this.clouds) { this.clouds.dispose(); this.clouds = null; }
+    this.clouds.setEnabled(s.clouds);
+    this.clouds.setDetail(s.cloudDetail);
 
     // —— 时段/天气预设(纯本地视觉,联机不同步)——
-    if (this._skyApplied !== s.skyPreset) {
-      this._skyApplied = s.skyPreset;
+    const skyKey = `${s.skyPreset}:${s.clouds}:${s.cloudDetail}`;
+    if (this._skyApplied !== skyKey) {
+      this._skyApplied = skyKey;
       const preset = this.applySkyPreset(s.skyPreset);
       this.water.setSky(this.sunDir, preset);
+      this.water.setEnvironment(this.scene.environment);
     }
   }
 
@@ -336,6 +355,7 @@ export class App {
         nameKey: member.isHuman ? 'name.player' : (AI_STYLES[member.aiIndex % AI_STYLES.length]?.nameKey ?? 'name.ai1'),
       });
       boat.effects.setEnabled(this.settings.effects);
+      this._applyBoatQuality(boat);
       boat.isHuman = member.isHuman;
       boat.aiIndex = member.aiIndex ?? null;
       const { lateral, downwind: startDownwind } = startGrid[index];
@@ -387,6 +407,7 @@ export class App {
     this._newWindDirection();
     const demo = new Boat(this.scene, this.waveField, { ...AI_STYLES[0], isPlayer: false });
     demo.effects.setEnabled(this.settings.effects);
+    this._applyBoatQuality(demo);
     const w = this.wind.baseFromPsi;
     demo.place(40, -30, wrapPi(w + 100 * DEG), 2.5);
     this.boats = [demo];
@@ -425,6 +446,7 @@ export class App {
       const st = AI_STYLES[i % AI_STYLES.length];
       const ai = new Boat(this.scene, this.waveField, { ...st, isPlayer: false });
       ai.effects.setEnabled(this.settings.effects);
+      this._applyBoatQuality(ai);
       ai.aiIndex = i;
       const slot = mkSlot(-15 - i * 22, 45 + i * 8);
       ai.place(slot.x, slot.z, wrapPi(course.windPsi + 80 * DEG), 1);
@@ -465,6 +487,7 @@ export class App {
     const heading = psi ?? wrapPi(this.wind.baseFromPsi + 100 * DEG);
     const p = new Boat(this.scene, this.waveField, { isPlayer: true, sailNumber: 8, nameKey: 'name.you' });
     p.effects.setEnabled(this.settings.effects);
+    this._applyBoatQuality(p);
     p.place(x, z, heading, 1.5);
     this.player = p;
     this.boats.push(p);
@@ -480,6 +503,12 @@ export class App {
     this.applySettings();
     this.menu.show('menu-main');
     this.menu.refreshBest();
+  }
+
+  _applyBoatQuality(boat) {
+    boat.setVisualDetail(this.settings.modelDetail);
+    boat.effects.setDetail(this.settings.effectsDetail);
+    applyTextureQuality(boat.visual.group, this.settings.textureDetail, this.renderer.capabilities.getMaxAnisotropy());
   }
 
   restartMode() {
@@ -513,6 +542,19 @@ export class App {
       this.tutorialMark.position.set(pos.x, 0, pos.z);
       this.scene.add(this.tutorialMark);
     }
+  }
+
+  // 什么时候该锁住指针：在玩、没暂停、屏幕上没有任何菜单页。
+  // 每帧对一次即可 —— 结算界面、大厅这类不经过 pause() 的弹出也要能放开指针。
+  // 只在「该锁」这个状态从假变真时才真的去请求，否则浏览器拒绝一次就会每帧刷错。
+  _syncPointerLock() {
+    const menuOpen = !!this.menu?.root?.classList?.contains('active');
+    const want = this.mode !== 'menu' && !this.paused && !menuOpen;
+    if (want === this.input.wantLock) {
+      if (!want) this.input.releaseLock();
+      return;
+    }
+    this.input.setLockWanted(want);
   }
 
   // —— 全局按键 ——
@@ -557,8 +599,8 @@ export class App {
       this._dynT = 0;
       if (this.settings.dynamicRes) {
         const ref = Math.min(60, this._fpsCap);
-        if (this.fps < ref * 0.82 && this._dynFactor > 0.55) {
-          this._dynFactor = Math.max(0.55, this._dynFactor - 0.1);
+        if (this.fps < ref * 0.82 && this._dynFactor > 0.75) {
+          this._dynFactor = Math.max(0.75, this._dynFactor - 0.05);
           this._applyPixelRatio();
         } else if (this.fps > ref * 0.96 && this._dynFactor < 1) {
           this._dynFactor = Math.min(1, this._dynFactor + 0.05);
@@ -571,6 +613,7 @@ export class App {
     }
 
     this._hotkeys();
+    this._syncPointerLock();
 
     if (this.mode === 'multiplayer-race' && this.multiplayerController) {
       this.multiplayerController.setLocalPaused(this.paused);
@@ -601,7 +644,9 @@ export class App {
       const w = this.waveField.sample(this.tutorialMark.position.x, this.tutorialMark.position.z);
       this.tutorialMark.position.y = w.y;
     }
+    if (this.settings.showFps) this.renderStats.begin();
     this.renderer.render(this.scene, this.camera);
+    if (this.settings.showFps) this.renderStats.end();
     this.hud.draw(this, Math.max(dt, 1e-4));
     this.input.endFrame();
   }
@@ -713,7 +758,7 @@ export class App {
 
     // 音效
     const o = this.player.phys.out;
-    this.audio.update(o.awsKn, o.luff * (Math.abs(o.twaDeg) < 160 ? 1 : 0), o.speedKn, o.planing);
+    this.audio.update(o.awsKn, o.luff * (Math.abs(o.twaDeg) < 160 ? 1 : 0), o.speedKn, o.planing, o);
 
     // 搁浅提示
     if (this.player.grounded) {
@@ -814,6 +859,7 @@ export class App {
       output.luff * (Math.abs(output.twaDeg) < 160 ? 1 : 0),
       output.speedKn,
       output.planing,
+      output, // 海况节奏:encounterHz / swellHz / waveHz 都在诊断输出里
     );
   }
 

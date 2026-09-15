@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { loadSettings } from '../src/game/menu.js';
+import { loadSettings, QUALITY_PRESETS } from '../src/game/menu.js';
 
 // loadSettings 会读 localStorage,并调用 setLang（要用到 document）。
 // Node 里这两个都不存在,临时装上桩(stub:替身实现),测完还原。
@@ -59,3 +59,50 @@ for (const raw of ['null', '5', '"abc"', 'true']) {
     assert.equal(s.shadowQ, 'high');
   });
 }
+
+test('旧超高预设升级为独立海面与云层预算，不继续使用旧的高档海面', () => {
+  const s = withStoredSettings(JSON.stringify({
+    quality: 'ultra', resScale: 1.3, shadowQ: 'ultra', waterDetail: 'high',
+  }), loadSettings);
+  assert.equal(s.waterDetail, 'ultra');
+  assert.equal(s.cloudDetail, 'ultra');
+  assert.equal(s.textureDetail, 'ultra');
+  // 守的是「旧存档被新预设整体覆盖」，具体倍率跟着 QUALITY_PRESETS 走，
+  // 写死数字的话以后调一次画质预算就要改一次测试。
+  assert.equal(s.resScale, QUALITY_PRESETS.ultra.resScale);
+  assert.equal(s.dynamicRes, false);
+  assert.equal(s.graphicsVersion, 3);
+});
+
+test('迁移不覆盖玩家自定义画质、天气或音量', () => {
+  const s = withStoredSettings(JSON.stringify({
+    quality: 'custom', resScale: 0.8, shadowQ: 'off', waterDetail: 'medium',
+    clouds: false, dynamicRes: false, skyPreset: 'dusk', volume: 0.25,
+  }), loadSettings);
+  assert.equal(s.resScale, 0.8);
+  assert.equal(s.shadowQ, 'off');
+  assert.equal(s.waterDetail, 'medium');
+  assert.equal(s.clouds, false);
+  assert.equal(s.dynamicRes, false);
+  assert.equal(s.skyPreset, 'dusk');
+  assert.equal(s.volume, 0.25);
+});
+
+test('四档画质保存后重载保持细项一致', () => {
+  for (const [quality, preset] of Object.entries(QUALITY_PRESETS)) {
+    const s = withStoredSettings(JSON.stringify({ quality, ...preset, graphicsVersion: 3 }), loadSettings);
+    for (const [key, value] of Object.entries(preset)) assert.equal(s[key], value, `${quality}.${key}`);
+  }
+});
+
+test('损坏的画质细项不能产生无效分辨率或不存在的材质档位', () => {
+  const s = withStoredSettings(JSON.stringify({
+    quality: 'custom', resScale: 'bad', waterDetail: 'toString', cloudDetail: null,
+    textureDetail: 'invalid', shadowQ: 'invalid',
+  }), loadSettings);
+  assert.equal(s.resScale, 1);
+  assert.equal(s.waterDetail, 'high');
+  assert.equal(s.cloudDetail, 'high');
+  assert.equal(s.textureDetail, 'high');
+  assert.equal(s.shadowQ, 'high');
+});

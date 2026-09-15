@@ -11,8 +11,11 @@
 import * as THREE from 'three';
 import { WAVE_COUNT, WAVE_STRIDE } from '../sim/waves.js';
 import { FOG_COLOR } from './sceneSetup.js';
+import { WATER_BUDGETS } from './quality.js';
 
 const VERT = /* glsl */ `
+#include <common>
+#include <shadowmap_pars_vertex>
 uniform float uTime;
 uniform float uWaves[${WAVE_COUNT * WAVE_STRIDE}]; // dx,dz,k,w,amp,q,ph
 uniform float uGridR0;    // 径向网格最内环半径 m
@@ -67,6 +70,9 @@ void main() {
   vCrest = crest / crestNorm;
   vWorld = p;
   vDist = distCam;
+  vec4 worldPosition = vec4(p, 1.0);
+  vec3 transformedNormal = normalize(mat3(viewMatrix) * vNormal);
+  #include <shadowmap_vertex>
   gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
 }
 `;
@@ -74,10 +80,20 @@ void main() {
 const FRAG = /* glsl */ `
 precision highp float;
 precision highp int;
+#include <common>
+#include <packing>
+#include <lights_pars_begin>
+#include <shadowmap_pars_fragment>
+#include <shadowmask_pars_fragment>
+#include <cube_uv_reflection_fragment>
+uniform sampler2D uEnvironment;
+uniform vec2 uCloudOffset;
+uniform vec2 uEnvironmentOffset;
 
 uniform float uTime;
 uniform vec3 uSunDir;
 uniform vec3 uSunColor;
+uniform float uSunGlint;
 uniform vec3 uZenith;
 uniform vec3 uHorizon;
 uniform vec3 uDeep;
@@ -130,15 +146,35 @@ void main() {
 
   // 表面细波纹扰动法线（近处强,阵风区更碎,风窝处趋于镜面）
   vec3 N = normalize(vNormal);
-  float s3;
+  float s3 = 0.5;
   {
     float s1 = vnoise(vWorld.xz * 0.55 - uWindFlow * uTime * 0.55);
     float s2 = vnoise(vWorld.xz * 2.3 - uWindFlow * uTime * 1.4 + 13.7);
-    s3 = vnoise(vWorld.xz * 7.1 + vec2(uTime * 0.4, -uTime * 0.33));
+    #if WATER_DETAIL >= 1
+      s3 = vnoise(vWorld.xz * 7.1 + vec2(uTime * 0.4, -uTime * 0.33));
+    #endif
     // 顶点位移只做得动长浪；分米到米级的粗糙感全靠这层噪声法线，所以它要够强
-    float str = (0.23 + 0.17 * gustPos) * (0.32 + 0.68 * detailFade);
+    float str = (0.16 + 0.14 * gustPos) * (0.22 + 0.78 * detailFade);
     str *= 1.0 - 0.5 * min(lull, 1.0);
     N = normalize(N + vec3(s1 - 0.5, 0.0, s2 - 0.5) * str + vec3(s3 - 0.5, 0.0, 0.5 - s3) * str * 0.5);
+    // 风向细浪使用解析斜率；像素覆盖多条纹时平滑淡出，避免远处闪烁。
+    #if WATER_DETAIL >= 1
+      vec2 along = normalize(uWindFlow + vec2(0.001));
+      vec2 across = vec2(-along.y, along.x);
+      vec2 ripplePos = vec2(dot(vWorld.xz, along), dot(vWorld.xz, across));
+      vec2 slopes = vec2(0.0);
+      float freq = 5.8;
+      float amp = 0.038;
+      for (int layer = 0; layer < WATER_DETAIL + 1; layer++) {
+        float phase = ripplePos.x * freq + sin(ripplePos.y * freq * 0.37 + uTime * 0.3) - uTime * sqrt(9.81 * freq);
+        float resolved = 1.0 - smoothstep(0.8, 3.0, fwidth(phase));
+        slopes += vec2(cos(phase), sin(phase * 0.79 + ripplePos.y * freq * 0.6)) * amp * resolved;
+        freq *= 2.17;
+        amp *= 0.57;
+      }
+      N = normalize(N + vec3(along.x * slopes.x + across.x * slopes.y, 0.0,
+                             along.y * slopes.x + across.y * slopes.y) * (0.5 + detailFade) * (1.0 + gustPos));
+    #endif
   }
 
   float NdV = max(dot(N, V), 0.0);
@@ -148,29 +184,43 @@ void main() {
   vec3 R = reflect(-V, N);
   R.y = abs(R.y);
   vec3 skyCol = mix(uHorizon, uZenith, pow(max(R.y, 0.0), 0.6));
+  #if WATER_DETAIL >= 2
+    // 采样预先按粗糙度过滤的天空贴图，避免把高频云边直接采成水面白色细线。
+    // 云层高度为 900 m、噪声尺度 0.0011，投影偏移使云的倒影继续随风移动。
+    vec2 cloudShift = (uCloudOffset - uEnvironmentOffset + vWorld.xz * 0.0011) / 0.99;
+    vec3 reflectionDir = normalize(vec3(R.xz + cloudShift * R.y, R.y).xzy);
+    float roughness = 0.24 + 0.12 * min(gustPos, 1.0) + 0.08 * (1.0 - detailFade);
+    skyCol = textureCubeUV(uEnvironment, reflectionDir, roughness).rgb;
+  #endif
   // 阵风区更"毛糙" -> 反射明显变暗(读风的主要线索);风窝处反射更亮更平
   skyCol *= 1.0 - 0.30 * smoothstep(0.02, 0.55, gust) * uGustAmp * 2.5;
   skyCol *= 1.0 + 0.10 * min(lull, 1.0);
   // 太阳眩光路径 + 噪声调制的碎闪
   float sunR = max(dot(R, uSunDir), 0.0);
-  vec3 sunGlint = uSunColor * (pow(sunR, 1100.0) * 90.0 + pow(sunR, 90.0) * 0.9);
-  sunGlint += uSunColor * pow(sunR, 260.0) * 2.4 * (0.3 + 0.7 * s3) * detailFade;
+  vec3 sunGlint = uSunColor * (pow(sunR, 900.0) * 22.0 + pow(sunR, 90.0) * 0.35);
+  sunGlint += uSunColor * pow(sunR, 260.0) * 1.2 * (0.3 + 0.7 * s3) * detailFade;
+  float shadow = getShadowMask();
+  sunGlint *= shadow * uSunGlint;
 
   // 水体色：深水 + 浪尖次表面散射;阵风区水体也略深
   float sunN = max(dot(N, normalize(uSunDir + vec3(0.0, 0.35, 0.0))), 0.0);
   float sss = vCrest * (0.35 + 0.65 * sunN);
   vec3 bodyCol = mix(uDeep, uScatter, clamp(sss, 0.0, 1.0));
   bodyCol *= 1.0 - 0.14 * min(gustPos, 1.0);
+  bodyCol *= mix(0.64, 1.0, shadow) * (0.8 + 0.2 * sunN);
 
   vec3 col = mix(bodyCol, skyCol, fresnel) + sunGlint * (0.35 + 0.65 * fresnel);
 
   // 浪尖白沫（风大才出现），叠噪声破碎感;阵风扫过处白沫更密
   float foamN = vnoise(vWorld.xz * 0.9 + uWindFlow * uTime * 0.25) * 0.6 +
                 vnoise(vWorld.xz * 3.1 - uWindFlow * uTime * 0.5) * 0.4;
+  #if WATER_DETAIL >= 2
+    foamN *= 0.8 + 0.3 * vnoise(vWorld.xz * 12.0 - uWindFlow * uTime * 0.6);
+  #endif
   float cap = smoothstep(1.18 - uWhitecap * 0.55, 1.38 - uWhitecap * 0.5,
                          vCrest + foamN * 0.62 + 0.09 * max(gust, 0.0));
   cap *= 0.55 + 0.45 * detailFade;
-  col = mix(col, vec3(0.92, 0.95, 0.96), cap * 0.85);
+  col = mix(col, vec3(0.82, 0.91, 0.94) * mix(0.65, 1.0, shadow), cap * 0.85);
 
   // 雾（与场景 FogExp2 一致）
   float fogF = 1.0 - exp(-uFogDensity * uFogDensity * vDist * vDist);
@@ -183,13 +233,9 @@ void main() {
 `;
 
 // 水面细节档位 -> 径向网格的环数与周向分段数
-const WATER_GRID = {
-  low: { rings: 104, sectors: 120 },
-  medium: { rings: 144, sectors: 160 },
-  high: { rings: 184, sectors: 192 },
-};
+const WATER_GRID = WATER_BUDGETS;
 const GRID_R0 = 1.2;    // 最内环半径 m
-const GRID_RMAX = 3000; // 最外环半径 m（远超雾的可见距离，用来填满地平线）
+const GRID_RMAX = 16000; // 清透天气仍需填满地平线；指数网格保持近场密度。
 
 // 径向网格：环半径按指数分布（相邻环的间距正比于半径），中心跟随相机。
 // 近处格距降到分米级（碎浪的形状出得来），远场格距放到几十米（只剩长浪，而它们
@@ -235,7 +281,7 @@ function buildRadialGrid(rings, sectors) {
 }
 
 export class Water {
-  constructor(waveField, sunDir) {
+  constructor(waveField, sunDir, cloudUniforms) {
     this.waveField = waveField;
     this.detail = 'high';
     const geo = buildRadialGrid(WATER_GRID.high.rings, WATER_GRID.high.sectors);
@@ -244,12 +290,17 @@ export class Water {
     waveField.packUniforms(this.wavePack);
 
     this.uniforms = {
+      ...THREE.UniformsUtils.clone(THREE.UniformsLib.lights),
+      uCloudOffset: cloudUniforms.uCloudOffset,
+      uEnvironment: { value: null },
+      uEnvironmentOffset: { value: new THREE.Vector2() },
       uTime: { value: 0 },
       uWaves: { value: this.wavePack },
       uGridR0: { value: GRID_R0 },
       uGridK: { value: geo.userData.gridK },
       uSunDir: { value: sunDir.clone() },
       uSunColor: { value: new THREE.Color(1.0, 0.92, 0.78) },
+      uSunGlint: { value: 1 },
       uZenith: { value: new THREE.Color(0.11, 0.29, 0.5) },
       uHorizon: { value: new THREE.Color(0.68, 0.79, 0.86) },
       uDeep: { value: new THREE.Color(0.010, 0.056, 0.098) },
@@ -269,14 +320,31 @@ export class Water {
       vertexShader: VERT,
       fragmentShader: FRAG,
       uniforms: this.uniforms,
+      lights: true,
+      defines: { WATER_DETAIL: WATER_GRID.high.detail, ENVMAP_TYPE_CUBE_UV: '',
+        CUBEUV_TEXEL_WIDTH: 1 / 768, CUBEUV_TEXEL_HEIGHT: 1 / 1024, CUBEUV_MAX_MIP: '8.0' },
       side: THREE.DoubleSide,
     });
 
     this.mesh = new THREE.Mesh(geo, this.material);
     this.mesh.frustumCulled = false;
+    this.mesh.receiveShadow = true;
     // 在船体的舱内深度遮罩塞块(renderOrder 1,见 boatModel.js)之后绘制,
     // 使舱内水面片元被深度测试剔除
     this.mesh.renderOrder = 2;
+  }
+
+  setEnvironment(texture) {
+    this.uniforms.uEnvironment.value = texture;
+    this.uniforms.uEnvironmentOffset.value.copy(this.uniforms.uCloudOffset.value);
+    const { width, height } = texture.image;
+    const defines = this.material.defines;
+    if (defines.CUBEUV_TEXEL_WIDTH !== 1 / width || defines.CUBEUV_TEXEL_HEIGHT !== 1 / height) {
+      defines.CUBEUV_TEXEL_WIDTH = 1 / width;
+      defines.CUBEUV_TEXEL_HEIGHT = 1 / height;
+      defines.CUBEUV_MAX_MIP = Math.log2(height / 4).toFixed(1);
+      this.material.needsUpdate = true;
+    }
   }
 
   // 时段/天气预设:同步太阳方向、日照颜色与雾(与 sceneSetup.applySkyPreset 一致)
@@ -284,12 +352,17 @@ export class Water {
     this.uniforms.uSunDir.value.copy(sunDir);
     if (preset) {
       this.uniforms.uSunColor.value.set(preset.waterSun);
+      this.uniforms.uSunGlint.value = preset.sunGlint;
+      this.uniforms.uZenith.value.set(preset.zenith);
+      this.uniforms.uHorizon.value.set(preset.horizon);
+      this.uniforms.uDeep.value.set(preset.deep);
+      this.uniforms.uScatter.value.set(preset.scatter);
       this.uniforms.uFogColor.value.set(preset.fog);
       this.uniforms.uFogDensity.value = preset.fogD;
     }
   }
 
-  // 画质设置：重建不同密度的径向网格（着色器不变，格距 uniform 跟着换）
+  // 画质设置：同时切换径向网格密度与片元细节，物理波场保持不变。
   setDetail(level) {
     const key = WATER_GRID[level] ? level : 'high';
     if (key === this.detail) return;
@@ -299,6 +372,8 @@ export class Water {
     this.mesh.geometry.dispose();
     this.mesh.geometry = geo;
     this.uniforms.uGridK.value = geo.userData.gridK;
+    this.material.defines.WATER_DETAIL = g.detail;
+    this.material.needsUpdate = true;
   }
 
   // 每帧：跟随相机，同步波/风参数

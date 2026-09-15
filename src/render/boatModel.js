@@ -3,6 +3,12 @@
 // 姿态：rotation YXZ = (纵摇, -艏向, -横倾)。
 
 import * as THREE from 'three';
+import { surfaceTexture } from './surfaceTextures.js';
+import { MODEL_BUDGETS } from './quality.js';
+import { createSailor } from './sailorModel.js';
+import { addBoatFittings, createMainsheet } from './boatFittings.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { createSeededRandom } from '../sim/random.js';
 import { DEG, clamp, lerp, damp } from '../util/math.js';
 
 const LOA = 4.2;
@@ -16,14 +22,22 @@ const P_SHEER = [0.27, 0.26, 0.255, 0.26, 0.27, 0.285, 0.30, 0.325, 0.35, 0.385]
 
 function profileAt(arr, t) {
   const f = clamp(t, 0, 1) * (arr.length - 1);
-  const i = Math.floor(f), r = f - i;
-  const a = arr[i], b = arr[Math.min(i + 1, arr.length - 1)];
-  const s = r * r * (3 - 2 * r);
-  return a + (b - a) * s;
+  const i = Math.min(Math.floor(f), arr.length - 2), r = f - i;
+  const a = arr[i], b = arr[i + 1];
+  // 单调三次型线保留各站斜率，避免每个控制站强制变平造成波浪形舷缘。
+  const slope = j => {
+    if (j === 0) return arr[1] - arr[0];
+    if (j === arr.length - 1) return arr[j] - arr[j - 1];
+    const left = arr[j] - arr[j - 1], right = arr[j + 1] - arr[j];
+    return left * right <= 0 ? 0 : 2 * left * right / (left + right);
+  };
+  const r2 = r * r, r3 = r2 * r;
+  return (2*r3-3*r2+1)*a + (r3-2*r2+r)*slope(i)
+    + (-2*r3+3*r2)*b + (r3-r2)*slope(i+1);
 }
 
-function buildHull(topColor = 0xf4f1e8, bottomColor = 0x35566b) {
-  const NS = 26, M = 15;
+function buildHull(topColor, bottomColor, budget) {
+  const NS = budget.hull, M = budget.cross;
   const positions = [], colors = [], indices = [];
   const cTop = new THREE.Color(topColor);
   const cBot = new THREE.Color(bottomColor);
@@ -86,8 +100,8 @@ function buildHull(topColor = 0xf4f1e8, bottomColor = 0x35566b) {
   return geo;
 }
 
-function buildDeck() {
-  const NS = 26, M = 10;
+function buildDeck(budget) {
+  const NS = budget.hull, M = budget.cross;
   const positions = [], uvs = [], indices = [];
   for (let i = 0; i <= NS; i++) {
     const t = i / NS;
@@ -127,9 +141,11 @@ function smooth01(x) {
 
 // 帆布纹理：底色 + 扇形拼幅缝线 + 帆骨袋 + 观察窗 + 红色星芒 + 帆号
 function makeSailTexture(sailNumber, accent = '#c03a2b') {
+  const random = createSeededRandom(`sail-${sailNumber}`);
   const c = document.createElement('canvas');
-  c.width = c.height = 512;
+  c.width = c.height = 1024;
   const g = c.getContext('2d');
+  g.scale(2, 2); // 保持原 512 单位布局，提高清晰度和缝线边缘质量。
   // 底色带轻微纵向渐变(帆顶略亮,更有透光感)
   const bg = g.createLinearGradient(0, 0, 0, 512);
   bg.addColorStop(0, '#faf8f1');
@@ -138,8 +154,8 @@ function makeSailTexture(sailNumber, accent = '#c03a2b') {
   g.fillRect(0, 0, 512, 512);
   // 布纹微噪声
   for (let i = 0; i < 2600; i++) {
-    g.fillStyle = `rgba(${180 + Math.random() * 40 | 0},${178 + Math.random() * 40 | 0},${168 + Math.random() * 40 | 0},0.05)`;
-    g.fillRect(Math.random() * 512, Math.random() * 512, 2, 2);
+    g.fillStyle = `rgba(${180 + random() * 40 | 0},${178 + random() * 40 | 0},${168 + random() * 40 | 0},0.05)`;
+    g.fillRect(random() * 512, random() * 512, 2, 2);
   }
   // 扇形拼幅缝线:从帆尾角(纹理右下)放射,微弯更像切割帆
   // 纹理坐标:u=弦向(0 桅杆 -> 1 后缘),v=高度(0 帆脚 -> 1 帆顶),v 朝上画布 y 反向
@@ -191,6 +207,7 @@ function makeSailTexture(sailNumber, accent = '#c03a2b') {
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 4;
+  tex.userData.ownedByBoat = true;
   return tex;
 }
 
@@ -198,6 +215,8 @@ export function createBoatVisual(opts = {}) {
   const hullColor = opts.hullColor ?? 0xf4f1e8;
   const sailNumber = opts.sailNumber ?? 8;
   const accent = opts.accent ?? '#c03a2b';
+  const modelDetail = Object.hasOwn(MODEL_BUDGETS, opts.modelDetail) ? opts.modelDetail : 'high';
+  const budget = MODEL_BUDGETS[modelDetail];
 
   const group = new THREE.Group();
 
@@ -205,10 +224,14 @@ export function createBoatVisual(opts = {}) {
   const hullMat = new THREE.MeshPhysicalMaterial({
     color: 0xffffff, vertexColors: true, roughness: 0.22, clearcoat: 0.7, clearcoatRoughness: 0.25,
   });
-  const hull = new THREE.Mesh(buildHull(hullColor, 0x35566b), hullMat);
+  const hull = new THREE.Mesh(buildHull(hullColor, 0x35566b, budget), hullMat);
   hull.castShadow = true;
-  const deckMat = new THREE.MeshStandardMaterial({ color: 0xe6dfcd, roughness: 0.6 });
-  const deck = new THREE.Mesh(buildDeck(), deckMat);
+  hull.receiveShadow = true;
+  const deckMat = new THREE.MeshStandardMaterial({
+    color: 0xe5e3d8, roughness: 0.72,
+    bumpMap: surfaceTexture('deck'), bumpScale: 0.009,
+  });
+  const deck = new THREE.Mesh(buildDeck(budget), deckMat);
   deck.castShadow = true;
   deck.receiveShadow = true;
   group.add(hull, deck);
@@ -236,7 +259,7 @@ export function createBoatVisual(opts = {}) {
         pts.push(new THREE.Vector3(profileAt(P_BEAM, t) * inset, profileAt(P_SHEER, t) + yOff, -xb));
       }
       const curve = new THREE.CatmullRomCurve3(pts);
-      const railR = new THREE.Mesh(new THREE.TubeGeometry(curve, 40, radius, 6), mat);
+      const railR = new THREE.Mesh(new THREE.TubeGeometry(curve, budget.hull, radius, Math.max(6,budget.radial/2)), mat);
       const railL = railR.clone();
       railL.scale.x = -1;
       return [railR, railL];
@@ -250,7 +273,7 @@ export function createBoatVisual(opts = {}) {
   // —— 桅杆（含风向标）——
   const mastZ = -1.28;
   const sparMat = new THREE.MeshStandardMaterial({ color: 0xb9bdc2, roughness: 0.4, metalness: 0.75 });
-  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.042, 5.5, 10), sparMat);
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.042, 5.5, budget.radial), sparMat);
   mast.position.set(0, 2.85, mastZ);
   mast.castShadow = true;
   group.add(mast);
@@ -275,14 +298,14 @@ export function createBoatVisual(opts = {}) {
   boomGroup.position.set(0, 0, mastZ);
   group.add(boomGroup);
 
-  const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 2.5, 8), sparMat);
+  const boom = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 2.5, budget.radial), sparMat);
   boom.geometry.rotateX(Math.PI / 2);
   boom.position.set(0, 0.98, 1.3);
   boom.castShadow = true;
   boomGroup.add(boom);
 
   // 帆网格
-  const SAIL_R = 13, SAIL_C = 9;
+  const SAIL_R = budget.sailRows, SAIL_C = budget.sailCols;
   const sailGeo = new THREE.BufferGeometry();
   {
     const n = (SAIL_R + 1) * (SAIL_C + 1);
@@ -300,13 +323,16 @@ export function createBoatVisual(opts = {}) {
       }
     sailGeo.setIndex(idx);
   }
-  const sailMat = new THREE.MeshStandardMaterial({
+  const sailMat = new THREE.MeshPhysicalMaterial({
     map: makeSailTexture(sailNumber, accent),
-    side: THREE.DoubleSide, roughness: 0.75,
-    emissive: 0xffffff, emissiveIntensity: 0.07, // 帆布透光感
+    side: THREE.DoubleSide, roughness: 0.86,
+    bumpMap: surfaceTexture('sail'), bumpScale: 0.0025,
+    sheen: 0.25, sheenRoughness: 0.85, sheenColor: 0xfff4df,
+    emissive: 0xfff1d8, emissiveIntensity: 0.025,
   });
   const sail = new THREE.Mesh(sailGeo, sailMat);
   sail.castShadow = true;
+  sail.receiveShadow = true;
   boomGroup.add(sail);
 
   // —— 帆面纤维带(telltales):贴流时向后飘直,空帆/失速时乱抖,弱风下垂 ——
@@ -327,9 +353,9 @@ export function createBoatVisual(opts = {}) {
   });
 
   // —— 稳向板（可升降）——
-  const boardMat = new THREE.MeshStandardMaterial({ color: 0xd9c98f, roughness: 0.45 });
+  const boardMat = new THREE.MeshPhysicalMaterial({ color: 0xe1e0d2, roughness: 0.32, clearcoat: 0.4 });
   const boardGroup = new THREE.Group();
-  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.045, 1.2, 0.3), boardMat);
+  const blade = new THREE.Mesh(new RoundedBoxGeometry(0.045, 1.2, 0.3, 3, 0.022), boardMat);
   blade.geometry.translate(0, -0.6, 0);
   boardGroup.add(blade);
   boardGroup.position.set(0, 0.45, -0.18);
@@ -338,70 +364,44 @@ export function createBoatVisual(opts = {}) {
   // —— 舵 + 舵柄 ——
   const rudderGroup = new THREE.Group();
   rudderGroup.position.set(0, 0.22, 2.08);
-  const rblade = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.95, 0.26), boardMat);
+  const rblade = new THREE.Mesh(new RoundedBoxGeometry(0.035, 0.95, 0.26, 3, 0.017), boardMat);
   rblade.geometry.translate(0, -0.45, 0.05);
-  const rhead = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.28, 0.3),
-    new THREE.MeshStandardMaterial({ color: 0x3c3c3c, roughness: 0.6 }));
+  const rhead = new THREE.Mesh(new RoundedBoxGeometry(0.065, 0.23, 0.27, 3, 0.03),
+    new THREE.MeshStandardMaterial({ color: 0x48545d, roughness: 0.35, metalness: 0.75 }));
   rhead.position.y = 0.1;
-  const tiller = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.024, 1.2, 6), sparMat);
+  const tiller = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.024, 1.2, budget.radial), sparMat);
   tiller.geometry.rotateX(Math.PI / 2);
   tiller.position.set(0, 0.26, -0.62);
   tiller.rotation.x = -0.12;
   rudderGroup.add(rblade, rhead, tiller);
+  const pivot = new THREE.Mesh(new THREE.CylinderGeometry(0.029, 0.029, 0.084, budget.radial), sparMat);
+  pivot.rotation.z = Math.PI / 2;
+  pivot.position.set(0, 0.1, 0.025);
+  rudderGroup.add(pivot);
   group.add(rudderGroup);
 
-  // —— 船员:分段人偶(髋/大腿/小腿/躯干/颈/头/双臂),每帧按压舷姿态摆位 ——
-  const crew = new THREE.Group();
-  const wetsuit = new THREE.MeshStandardMaterial({ color: 0x2b3038, roughness: 0.8 });
-  const vestM = new THREE.MeshStandardMaterial({ color: 0xc23f2e, roughness: 0.7 });
-  const skinM = new THREE.MeshStandardMaterial({ color: 0xd9a37e, roughness: 0.7 });
-  const hip = new THREE.Mesh(new THREE.CapsuleGeometry(0.115, 0.18, 4, 8), wetsuit);
-  hip.rotation.x = Math.PI / 2; // 骨盆沿前后向,连接两侧髋关节
-  hip.position.y = 0.06;
-
-  // 四肢:单位胶囊按两端点摆位拉伸(近似 IK,姿态由 update 每帧解出)
-  const _limbDir = new THREE.Vector3();
-  function makeLimb(mat, radius, span) {
-    const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, span, 4, 8), mat);
-    crew.add(mesh);
-    return { mesh, total: span + radius * 2 };
-  }
-  function placeLimb(limb, ax, ay, az, bx, by, bz) {
-    _limbDir.set(bx - ax, by - ay, bz - az);
-    const len = Math.max(_limbDir.length(), 1e-4);
-    limb.mesh.position.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
-    limb.mesh.quaternion.setFromUnitVectors(AXIS_Y, _limbDir.divideScalar(len));
-    limb.mesh.scale.set(1, len / limb.total, 1);
-  }
-  const thighL = makeLimb(wetsuit, 0.072, 0.2);
-  const thighR = makeLimb(wetsuit, 0.072, 0.2);
-  const shinL = makeLimb(wetsuit, 0.052, 0.22);
-  const shinR = makeLimb(wetsuit, 0.052, 0.22);
-  const armAftU = makeLimb(vestM, 0.045, 0.16); // 后臂(舵手臂)上段
-  const armAftF = makeLimb(skinM, 0.036, 0.16); // 后臂前段
-  const armFwdU = makeLimb(vestM, 0.045, 0.16); // 前臂(缭绳臂)上段
-  const armFwdF = makeLimb(skinM, 0.036, 0.16); // 前臂前段
-
-  const torso = new THREE.Group();
-  const torsoMesh = new THREE.Mesh(new THREE.CapsuleGeometry(0.145, 0.3, 4, 10), vestM);
-  torsoMesh.position.y = 0.24;
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.09, 8), skinM);
-  neck.position.y = 0.44;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.1, 12, 10), skinM);
-  head.position.y = 0.56;
-  const cap = new THREE.Mesh(new THREE.SphereGeometry(0.105, 12, 6, 0, Math.PI * 2, 0, 1.25), new THREE.MeshStandardMaterial({ color: 0xf0ede4, roughness: 0.8 }));
-  cap.position.y = 0.585;
-  torso.add(torsoMesh, neck, head, cap);
-  torso.position.y = 0.08;
-  crew.add(hip, torso);
-  crew.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+  // 水手模型独立构建，动作仍使用本文件的压舷/操帆姿态。
+  const sailor = createSailor(budget.radial);
+  const { crew, torso, placeLimb } = sailor;
+  torso.rotation.order = 'ZXY'; // 压舷倾斜在船坐标内施加，面朝舱内的转身不会反转倾斜方向。
+  const { thighL, thighR, shinL, shinR, armAftU, armAftF, armFwdU, armFwdF } = sailor.limbs;
   group.add(crew);
-
-  // —— 缭绳 ——
-  const sheetGeo = new THREE.BufferGeometry();
-  sheetGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
-  const sheetLine = new THREE.Line(sheetGeo, new THREE.LineBasicMaterial({ color: 0x222222 }));
-  group.add(sheetLine);
+  if (budget.fittings) addBoatFittings(group, boomGroup, budget.radial);
+  const mainsheet = createMainsheet();
+  group.add(mainsheet.mesh);
+  const tillerExtension = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, 1, 10),
+    new THREE.MeshStandardMaterial({ color: 0x25313b, roughness: 0.45 }));
+  const handSheet = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 1, 6),
+    new THREE.MeshStandardMaterial({ color: 0xd7d4b9, roughness: 0.9 }));
+  group.add(tillerExtension, handSheet);
+  const linkA = new THREE.Vector3(), linkB = new THREE.Vector3(), linkDir = new THREE.Vector3();
+  function placeLink(mesh, ax, ay, az, bx, by, bz) {
+    linkA.set(ax, ay, az); linkB.set(bx, by, bz); linkDir.subVectors(linkB, linkA);
+    const length = Math.max(0.0001, linkDir.length());
+    mesh.position.copy(linkA).add(linkB).multiplyScalar(0.5);
+    mesh.quaternion.setFromUnitVectors(AXIS_Y, linkDir.divideScalar(length));
+    mesh.scale.y = length;
+  }
 
   // —— 每帧姿态更新 ——
   const sailPos = sailGeo.attributes.position;
@@ -472,7 +472,7 @@ export function createBoatVisual(opts = {}) {
       }
     }
     sailPos.needsUpdate = true;
-    // 帆形位置每帧更新,但法线重算(遍历 13×9 网格)按间隔降频降低远处/AI 船开销
+    // 帆形位置每帧更新，按距离降低远处/AI 船的法线更新频率。
     if (sailNormals.frame++ % sailNormals.interval === 0) sailGeo.computeVertexNormals();
 
     // 纤维带:与帆面同一套成形公式取根部位置,再向后缘拖出摆动的短飘带
@@ -511,23 +511,24 @@ export function createBoatVisual(opts = {}) {
     crew.position.set(crewXSm, 0.3, 0.42);
     const lean = hikeK * 1.05;
     torso.rotation.z = -lean;
-    torso.rotation.y = -side * 0.7;
+    torso.rotation.y = side > 0 ? Math.PI - 0.7 : 0.7;
     // 双脚锚在船中线附近的压舷带(crew 组内坐标须抵消 crewXSm)
     const footX = -side * 0.08 - crewXSm;
     const bendUp = (1 - Math.abs(hikeK)) * 0.14;
-    for (const [thigh, shin, fz] of [[thighL, shinL, -0.12], [thighR, shinR, 0.06]]) {
+    for (const [index, thigh, shin, fz] of [[0, thighL, shinL, -0.13], [1, thighR, shinR, 0.11]]) {
       const hipX = 0, hipY = 0.06;
       const fx = footX, fy = -0.2;
       const kx = (hipX + fx) * 0.5, ky = (hipY + fy) * 0.5 + bendUp, kz = fz + 0.02;
       placeLimb(thigh, hipX, hipY, fz, kx, ky, kz);
       placeLimb(shin, kx, ky, kz, fx, fy, fz + 0.04);
+      sailor.placeBoot(index, fx, fy, fz + 0.04, -side);
     }
     // 肩点锚在躯干上:取躯干局部肩位(胶囊上端、体侧 ±z 表面),经躯干实际
     // 旋转/位移变换到 crew 局部 —— 无论躯干如何外倾、转体,双臂始终连在肩上,
     // 不再因肩点与躯干变换脱节而“手臂飞离身体”。
-    _sh.set(0, 0.38, 0.13).applyEuler(torso.rotation).add(torso.position);
+    _sh.set(0, 0.5, -side * 0.2).applyEuler(torso.rotation).add(torso.position);
     const aSx = _sh.x, aSy = _sh.y, aSz = _sh.z; // 后肩(舵手臂)
-    _sh.set(0, 0.38, -0.13).applyEuler(torso.rotation).add(torso.position);
+    _sh.set(0, 0.5, side * 0.2).applyEuler(torso.rotation).add(torso.position);
     const fSx = _sh.x, fSy = _sh.y, fSz = _sh.z; // 前肩(缭绳臂)
     // 后手持舵柄延伸杆(收在体侧、略朝艉);前手拉缭绳(朝艏、近中线)
     const aftHandX = aSx - side * 0.05, aftHandY = 0.06, aftHandZ = 0.32;
@@ -535,20 +536,39 @@ export function createBoatVisual(opts = {}) {
     let ex = (aSx + aftHandX) * 0.5 + side * 0.06, ey = (aSy + aftHandY) * 0.5 + 0.02, ez = (aSz + aftHandZ) * 0.5;
     placeLimb(armAftU, aSx, aSy, aSz, ex, ey, ez);
     placeLimb(armAftF, ex, ey, ez, aftHandX, aftHandY, aftHandZ);
+    sailor.placeHand(0, ex, ey, ez, aftHandX, aftHandY, aftHandZ);
     ex = (fSx + fwdHandX) * 0.5 + side * 0.05; ey = (fSy + fwdHandY) * 0.5; ez = (fSz + fwdHandZ) * 0.5;
     placeLimb(armFwdU, fSx, fSy, fSz, ex, ey, ez);
     placeLimb(armFwdF, ex, ey, ez, fwdHandX, fwdHandY, fwdHandZ);
-    crew.visible = !phys.capsized;
+    sailor.placeHand(1, ex, ey, ez, fwdHandX, fwdHandY, fwdHandZ);
+    // 扶正过半就让船员重新出现：他此刻正踩着稳向板把船压起来，人已经在船边了。
+    // 一直藏到扶正结束再整个人凭空冒出来，是原来那一下突兀感的另一半。
+    crew.visible = !phys.capsized || phys.rightProgress > 0.5;
+    // 舵柄延伸杆和缭绳接到手掌，换舷 / 压舷时仍保持握持关系。
+    _boomEnd.set(0, 0.33, -1.2).applyAxisAngle(AXIS_Y, -phys.rudder).add(rudderGroup.position);
+    placeLink(tillerExtension, _boomEnd.x, _boomEnd.y, _boomEnd.z,
+      crewXSm + aftHandX, 0.3 + aftHandY, 0.42 + aftHandZ);
+    placeLink(handSheet, 0, 0.27, 0.95,
+      crewXSm + fwdHandX, 0.3 + fwdHandY, 0.42 + fwdHandZ);
+    tillerExtension.visible = handSheet.visible = crew.visible;
 
     // 缭绳：帆杠末端 -> 舱底(boomGroup 原点在桅杆处,故 bz 再加 mastZ)
     _boomEnd.set(0, 0.95, 2.45).applyAxisAngle(AXIS_Y, phys.boom);
     const bx = _boomEnd.x, by = _boomEnd.y, bz = _boomEnd.z + mastZ;
-    const sp = sheetGeo.attributes.position;
-    sp.setXYZ(0, bx, by, bz);
-    sp.setXYZ(1, bx * 0.5, (by + 0.25) * 0.55, (bz + 0.9) * 0.5);
-    sp.setXYZ(2, 0, 0.22, 0.9);
-    sp.needsUpdate = true;
+    mainsheet.update(bx, by, bz);
   }
 
-  return { group, update, boomGroup, crew, sailNormals };
+  function dispose() {
+    const geometries = new Set(), materials = new Set(), textures = new Set();
+    group.traverse(o => {
+      if (o.geometry) geometries.add(o.geometry);
+      for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+        if (!m) continue;
+        materials.add(m);
+        if (m.map?.userData.ownedByBoat) textures.add(m.map);
+      }
+    });
+    for (const resource of [...geometries, ...materials, ...textures]) resource.dispose();
+  }
+  return { group, update, boomGroup, crew, sailNormals, modelDetail, dispose };
 }
