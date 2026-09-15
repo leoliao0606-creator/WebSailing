@@ -39,15 +39,24 @@ function driftRollAmplitude({ windKn, headingDeg, seconds = 60 }) {
   const dt = 1 / 60;
   let maxAbs = 0;
   let finite = true;
+  let minImmersion = 1;
+  let maxSlope = 0;
   for (let t = 0; t < seconds; t += dt) {
     waves.update(dt);
     phys.step(wind, dt, waves);
     phys.psi = headingDeg * DEG; // 锁定艏向，隔离横摇响应
     phys.yawRate = 0;
     if (!Number.isFinite(phys.phi) || !Number.isFinite(phys.u)) { finite = false; break; }
-    if (t > 10) maxAbs = Math.max(maxAbs, Math.abs(phys.phi)); // 跳过初始瞬态
+    if (t > 10) {
+      maxAbs = Math.max(maxAbs, Math.abs(phys.phi)); // 跳过初始瞬态
+      minImmersion = Math.min(minImmersion, phys.wave.immersion);
+      // 船位处波面沿南北向的坡度。艏向 90°(朝东)时它就是船的横向坡度，
+      // 也就是浮力回复力矩想把船摆平到的那个角度 —— 横摇的物理参照。
+      const o = waves.sample(phys.x, phys.z);
+      maxSlope = Math.max(maxSlope, Math.abs(Math.atan2(o.nz, o.ny)));
+    }
   }
-  return { maxDeg: maxAbs / DEG, finite };
+  return { maxDeg: maxAbs / DEG, finite, minImmersion, maxSlopeDeg: maxSlope / DEG };
 }
 
 test('15kn 横浪静漂:横摇明显(>3°)且 60 秒内有界(<45°)', () => {
@@ -66,10 +75,28 @@ test('顶浪横摇小于横浪(波组围绕风向散布,顶浪仍有侧向分量
     `顶浪 ${head.maxDeg.toFixed(1)}° 应小于横浪 ${beam.maxDeg.toFixed(1)}°`);
 });
 
-test('25kn 大浪横摇增强但仍有界', () => {
+test('25kn 大浪:横摇与波面坡度同量级,不会被甩出水面再砸回来放大', () => {
   const r = driftRollAmplitude({ windKn: 25, headingDeg: 90 });
-  const mild = driftRollAmplitude({ windKn: 12, headingDeg: 90 });
   assert.ok(r.finite);
-  assert.ok(r.maxDeg > mild.maxDeg, '大风浪应摇得更凶');
   assert.ok(r.maxDeg < 80, `不应仅因波浪翻船,实测 ${r.maxDeg.toFixed(1)}°`);
+  // 长浪里小艇是跟着浪面倾斜走的,横摇应当与波面横向坡度同量级。
+  // 这里不再断言「25 节一定比 12 节摇得更凶」:这个波谱里 peakAmp 和 peakLen
+  // 一起长,陡度几乎不随风速变(真实充分成长海况也是如此),25 节的浪反而更长
+  // 更缓、离横摇固有周期 2.3 s 更远,共振更弱。原来 25 节摇得更凶,是因为升沉
+  // 阻尼在船离水后仍然生效,船沉不下去、被浪甩在上面再砸回来 —— 那是数值假象。
+  assert.ok(r.maxDeg > r.maxSlopeDeg * 0.3,
+    `横摇 ${r.maxDeg.toFixed(1)}° 远小于波面坡度 ${r.maxSlopeDeg.toFixed(1)}°,船对浪没反应了`);
+  assert.ok(r.maxDeg < r.maxSlopeDeg * 2.5,
+    `横摇 ${r.maxDeg.toFixed(1)}° 远超波面坡度 ${r.maxSlopeDeg.toFixed(1)}°,多半又在腾空砸水`);
+});
+
+test('静漂的船不会被浪甩出水面:升沉阻尼必须随浸没率消失', () => {
+  // 回归:阻尼原来无条件施加,腾空时受力只剩「-重力 - 水阻尼」,船收敛到
+  // 一个 0.5 m/s 的终端下沉速度,比浪顶落下去还慢,于是整条船被留在空中,
+  // 浸没率一连几秒归零 —— 船体阻力全消失、舵效只剩 45%,大风调向死在顶风点。
+  for (const windKn of [12, 25]) {
+    const r = driftRollAmplitude({ windKn, headingDeg: 90 });
+    assert.ok(r.minImmersion > 0.15,
+      `${windKn} 节静漂时浸没率掉到 ${r.minImmersion.toFixed(2)},船被甩离了水面`);
+  }
 });

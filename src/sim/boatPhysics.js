@@ -307,8 +307,14 @@ export class BoatPhysics {
         rawAvg += raw * STATION_W[i];
         if (i === 0) submBow = subm;
       }
-      fz -= p.cHeaveDamp * b.heaveRate + p.cHeaveDampQ * b.heaveRate * Math.abs(b.heaveRate);
-      tau -= p.cPitchDamp * b.thetaRate + p.cPitchDampQ * b.thetaRate * Math.abs(b.thetaRate);
+      // 浸没率要在阻尼之前算出来：升沉/纵摇阻尼来自水，船离开水面就没有了。
+      // 无条件施加的话，腾空的船不做自由落体，而是收敛到一个「水阻尼下的终端
+      // 速度」—— 解 cHeaveDamp·v + cHeaveDampQ·v² = mg 得 0.50 m/s。浪顶落下去
+      // 的速度比这还快，船就被甩在浪上面下不来，浸没率一连几秒归零：船体阻力
+      // 整个消失、舵效只剩 immFoil 的 45%，大风里抢风调向正好死在顶风点上。
+      const wet = clamp((rawAvg + p.draft) / p.draft, 0, 1);
+      fz -= (p.cHeaveDamp * b.heaveRate + p.cHeaveDampQ * b.heaveRate * Math.abs(b.heaveRate)) * wet;
+      tau -= (p.cPitchDamp * b.thetaRate + p.cPitchDampQ * b.thetaRate * Math.abs(b.thetaRate)) * wet;
       b.heaveRate += (fz / mEff) * dtx;
       b.thetaRate += (tau / iEff) * dtx;
       b.heaveY += b.heaveRate * dtx;
@@ -321,7 +327,7 @@ export class BoatPhysics {
       // 基准面齐平波面就算全浸，要整整浮起一个吃水才算完全离水。用等效浸没深度
       // 做尺度会把"稍微跟不上浪面"误判成腾空，船体阻力被大片抹掉，结果浪里反而
       // 比平水跑得快。
-      b.immersion = clamp((rawAvg + p.draft) / p.draft, 0, 1);
+      b.immersion = wet;
     }
     // 防漂移兜底：船体不可能离开中站波面几米远
     const yRef = st[2].y;

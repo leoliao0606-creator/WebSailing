@@ -105,7 +105,14 @@ export class Boat {
     const rate = want !== 0 ? 2.6 : 3.4;
     this.rudderCmd += clamp(want - this.rudderCmd, -rate * dt, rate * dt);
     if (want === 0 && Math.abs(this.rudderCmd) < 0.04) this.rudderCmd = 0;
-    ctl.rudder = this.rudderCmd;
+    // 倒航时水从艉向艏流过舵叶，舵效整个反向（见 boatPhysics 的 chordForFlow）。
+    // A/D 表达的是「我要往哪边转」的意图，不是舵柄的物理位置，所以舵该打向哪边
+    // 由水流方向决定 —— 和 helm.js 里 AI 舵手用的是同一套处理。不这么做的话，
+    // 大风抢风调向一旦掉速到倒航，玩家按着的舵会把船推回原来那一舷，永远过不了
+    // 顶风点：实测 28 节有浪时 12 次调向只有 3 次成功，补上之后 12 次全成。
+    // 用 u 平滑过渡而不是拿 out.sternway 硬切：u 会在零附近反复跨阈值，
+    // 硬切会让舵指令高频翻转；平滑过渡在 u≈0 处让舵回中，而那里舵本来就没效力。
+    ctl.rudder = this.rudderCmd * clamp(p.u / 0.25, -1, 1);
 
     // 缭绳
     const sheetDir = (intent.sheetOut ? 1 : 0) - (intent.sheetIn ? 1 : 0);
